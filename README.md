@@ -1,7 +1,5 @@
 <h1 align="center">lowcat</h1>
 
----
-
 Low Category, or for short **lowcat** is a 
 lightweight and cross-platform sound library app that runs locally.
 
