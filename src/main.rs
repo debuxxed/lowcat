@@ -1,4 +1,5 @@
 mod backend;
+mod library;
 mod model;
 mod ui;
 
