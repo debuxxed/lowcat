@@ -1,6 +1,6 @@
 use gpui::{
-    AppContext, ClickEvent, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Window, div,
+    AppContext, ClickEvent, Context, Entity, InteractiveElement, IntoElement, ParentElement,
+    Render, SharedString, StatefulInteractiveElement, Styled, Window, div, red, relative,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Selectable, Sizable, StyledExt,
@@ -9,16 +9,19 @@ use gpui_component::{
 };
 
 use crate::library::Library;
-use crate::model::Category;
+use crate::ui::CONTENT_PX;
 
 pub struct Toolbar {
     library: Entity<Library>,
     search_input: Entity<InputState>,
+    hovered_chip: Option<String>,
+    alt_down: bool,
 }
 
 impl Toolbar {
     pub fn new(library: Entity<Library>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search..."));
+        search_input.update(cx, |state, cx| state.focus(window, cx));
 
         cx.subscribe(&search_input, |this, state, event: &InputEvent, cx| {
             if let InputEvent::Change = event {
@@ -33,15 +36,21 @@ impl Toolbar {
         Self {
             library,
             search_input,
+            hovered_chip: None,
+            alt_down: false,
+        }
+    }
+
+    pub fn set_alt_down(&mut self, alt_down: bool, cx: &mut Context<Self>) {
+        if self.alt_down != alt_down {
+            self.alt_down = alt_down;
+            cx.notify();
         }
     }
 }
 
 impl Render for Toolbar {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let active = self.library.read(cx).active();
-
-        // Active filter chips: (key, value) pairs flattened from the active selection.
         let chips: Vec<(String, String)> = {
             let state = self.library.read(cx).active_state();
             state
@@ -50,67 +59,92 @@ impl Render for Toolbar {
                 .flat_map(|(key, values)| values.iter().map(move |v| (key.clone(), v.clone())))
                 .collect()
         };
+        let chip_delete_bg = red().opacity(0.18);
 
-        let mut toggle = div().h_flex().gap_1();
-        for category in Category::ALL {
-            toggle = toggle.child(
-                Button::new(SharedString::from(category.label()))
-                    .label(category.label())
-                    .small()
-                    .selected(category == active)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.library
-                            .update(cx, |lib, cx| lib.set_category(category, cx));
-                    })),
-            );
-        }
-
-        let mut search = div()
+        let search = div()
             .h_flex()
-            .flex_1()
+            .h_6()
+            .w(relative(0.25))
+            .flex_shrink_0()
             .items_center()
             .gap_1()
             .px_2()
-            .py_1()
             .rounded_md()
             .bg(cx.theme().secondary)
             .border_1()
             .border_color(cx.theme().border)
-            .child(Icon::new(IconName::Search).small());
+            .child(Icon::new(IconName::Search).small())
+            .child(Input::new(&self.search_input).appearance(false).flex_1());
+
+        let mut chip_row = div()
+            .h_flex()
+            .h_6()
+            .flex_1()
+            .min_w_0()
+            .items_center()
+            .gap_1()
+            .overflow_x_hidden();
 
         for (key, value) in chips {
-            let key_owned = key.clone();
-            let value_owned = value.clone();
-            search = search.child(
+            let chip_id = format!("chip:{key}:{value}");
+            let chip_bg = if self.alt_down && self.hovered_chip.as_deref() == Some(chip_id.as_str())
+            {
+                chip_delete_bg
+            } else {
+                cx.theme().muted
+            };
+
+            chip_row = chip_row.child(
                 div()
-                    .id(SharedString::from(format!("chip:{key}:{value}")))
+                    .id(SharedString::from(chip_id.clone()))
+                    .flex_shrink_0()
                     .px_1p5()
                     .rounded_md()
                     .text_xs()
-                    .bg(cx.theme().muted)
+                    .bg(chip_bg)
                     .text_color(cx.theme().muted_foreground)
+                    .cursor_pointer()
                     .child(SharedString::from(value.clone()))
+                    .on_hover(cx.listener({
+                        let chip_id = chip_id.clone();
+                        move |this, hovered: &bool, _, cx| {
+                            if *hovered {
+                                this.hovered_chip = Some(chip_id.clone());
+                            } else if this.hovered_chip.as_deref() == Some(chip_id.as_str()) {
+                                this.hovered_chip = None;
+                            }
+                            cx.notify();
+                        }
+                    }))
                     .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                         if event.modifiers().alt {
-                            let key = key_owned.clone();
-                            let value = value_owned.clone();
                             this.library.update(cx, |lib, cx| {
-                                lib.remove_value(&key, &value, cx);
+                                lib.remove_value(&key.clone(), &value.clone(), cx);
                             });
                         }
                     })),
             );
         }
 
-        search = search.child(Input::new(&self.search_input).appearance(false).flex_1());
+        let filters_open = self.library.read(cx).filters_open();
+        let filter_button = Button::new("filter-toggle")
+            .icon(IconName::Settings2)
+            .label("Filter")
+            .small()
+            .selected(filters_open)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.library.update(cx, |lib, cx| lib.toggle_filters(cx));
+            }));
 
         div()
             .h_flex()
             .w_full()
             .items_center()
             .gap_2()
-            .p_2()
-            .child(toggle)
+            .py_2()
+            .px(CONTENT_PX)
+            .child(filter_button)
+            .child(chip_row)
             .child(search)
     }
 }

@@ -1,9 +1,11 @@
 use gpui::{
-    Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled, Window, div,
+    Context, Entity, InteractiveElement as _, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement as _, Styled, Window, div,
 };
-use gpui_component::{ActiveTheme as _, StyledExt, checkbox::Checkbox};
+use gpui_component::{ActiveTheme as _, StyledExt};
 
 use crate::library::Library;
+use crate::ui::CONTENT_PX;
 
 pub struct FilterPanel {
     library: Entity<Library>,
@@ -20,13 +22,16 @@ impl Render for FilterPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.library.read(cx).active_state();
 
-        let mut row = div()
+        let mut panel = div()
             .h_flex()
+            .flex_wrap()
+            .items_center()
             .w_full()
-            .gap_4()
-            .p_2()
-            .border_b_1()
-            .border_color(cx.theme().border);
+            .px(CONTENT_PX)
+            .py_1()
+            .mb_2()
+            .gap_x_4()
+            .gap_y_2();
 
         for (key, values) in &state.schema {
             let checked: Vec<String> = state
@@ -35,22 +40,46 @@ impl Render for FilterPanel {
                 .map(|s| s.iter().cloned().collect())
                 .unwrap_or_default();
 
-            let mut column = div().v_flex().gap_1().child(
+            let mut group = div().h_flex().flex_wrap().items_center().gap_1().child(
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(SharedString::from(key.clone())),
+                    .child(SharedString::from(format!("{}:", key))),
             );
 
             for value in values {
-                let is_checked = checked.contains(value);
+                let is_active = checked.contains(value);
                 let key_owned = key.clone();
                 let value_owned = value.clone();
-                column = column.child(
-                    Checkbox::new(SharedString::from(format!("{key}:{value}")))
-                        .label(SharedString::from(value.clone()))
-                        .checked(is_checked)
-                        .on_click(cx.listener(move |this, _checked: &bool, _, cx| {
+
+                let (border, bg, fg) = if is_active {
+                    (
+                        cx.theme().primary,
+                        cx.theme().primary.opacity(0.15),
+                        cx.theme().primary,
+                    )
+                } else {
+                    (
+                        cx.theme().border,
+                        cx.theme().transparent,
+                        cx.theme().foreground,
+                    )
+                };
+
+                group = group.child(
+                    div()
+                        .id(SharedString::from(format!("{key}:{value}")))
+                        .px_2()
+                        .py_0p5()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(border)
+                        .bg(bg)
+                        .text_xs()
+                        .text_color(fg)
+                        .cursor_pointer()
+                        .child(SharedString::from(value.clone()))
+                        .on_click(cx.listener(move |this, _, _, cx| {
                             let key = key_owned.clone();
                             let value = value_owned.clone();
                             this.library.update(cx, |lib, cx| {
@@ -60,9 +89,9 @@ impl Render for FilterPanel {
                 );
             }
 
-            row = row.child(column);
+            panel = panel.child(group);
         }
 
-        row
+        panel
     }
 }

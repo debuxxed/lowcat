@@ -1,6 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+pub const TAG_GENRE: &str = "GENRE";
+pub const TAG_MOOD: &str = "MOOD";
+pub const TAG_TYPE: &str = "TYPE";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Category {
     Music,
@@ -14,6 +18,29 @@ impl Category {
         match self {
             Category::Music => "Music",
             Category::Sfx => "SFX",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|category| *category == self)
+            .unwrap();
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+
+    pub fn previous(self) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|category| *category == self)
+            .unwrap();
+        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    pub fn tag_keys(self) -> &'static [&'static str] {
+        match self {
+            Category::Music => &[TAG_GENRE, TAG_MOOD],
+            Category::Sfx => &[TAG_TYPE],
         }
     }
 }
@@ -31,6 +58,27 @@ pub struct CategoryState {
     pub selected: BTreeMap<String, BTreeSet<String>>,
     pub search: String,
     pub results: Vec<FileRecord>,
+}
+
+pub fn canonical_tag_key(key: &str) -> Option<&'static str> {
+    if key.eq_ignore_ascii_case(TAG_GENRE) {
+        Some(TAG_GENRE)
+    } else if key.eq_ignore_ascii_case(TAG_MOOD) {
+        Some(TAG_MOOD)
+    } else if key.eq_ignore_ascii_case(TAG_TYPE) {
+        Some(TAG_TYPE)
+    } else {
+        None
+    }
+}
+
+pub fn tag_label(key: &str) -> &str {
+    match canonical_tag_key(key) {
+        Some(TAG_GENRE) => "Genre",
+        Some(TAG_MOOD) => "Mood",
+        Some(TAG_TYPE) => "Type",
+        _ => key,
+    }
 }
 
 /// A record matches iff its name contains `search` (case-insensitive) AND, for every
@@ -99,15 +147,31 @@ mod tests {
     fn all_checked_values_within_a_key_must_be_present() {
         let r = rec("a.ogg", &[("Mood", &["Dark", "Tense"])]);
         assert!(record_matches(&r, "", &sel(&[("Mood", &["Dark"])])));
-        assert!(record_matches(&r, "", &sel(&[("Mood", &["Dark", "Tense"])])));
-        assert!(!record_matches(&r, "", &sel(&[("Mood", &["Dark", "Uplifting"])])));
+        assert!(record_matches(
+            &r,
+            "",
+            &sel(&[("Mood", &["Dark", "Tense"])])
+        ));
+        assert!(!record_matches(
+            &r,
+            "",
+            &sel(&[("Mood", &["Dark", "Uplifting"])])
+        ));
     }
 
     #[test]
     fn checked_values_across_keys_are_anded() {
         let r = rec("a.ogg", &[("Genre", &["Electronic"]), ("Mood", &["Dark"])]);
-        assert!(record_matches(&r, "", &sel(&[("Genre", &["Electronic"]), ("Mood", &["Dark"])])));
-        assert!(!record_matches(&r, "", &sel(&[("Genre", &["Electronic"]), ("Mood", &["Tense"])])));
+        assert!(record_matches(
+            &r,
+            "",
+            &sel(&[("Genre", &["Electronic"]), ("Mood", &["Dark"])])
+        ));
+        assert!(!record_matches(
+            &r,
+            "",
+            &sel(&[("Genre", &["Electronic"]), ("Mood", &["Tense"])])
+        ));
     }
 
     #[test]
