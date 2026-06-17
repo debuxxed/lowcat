@@ -7,7 +7,8 @@ use gpui::{
     App, AppContext as _, ClickEvent, Context, Entity, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, SharedString,
-    StatefulInteractiveElement as _, Styled, Window, div, prelude::FluentBuilder as _, px, red,
+    StatefulInteractiveElement as _, Styled, Window, div, hsla, prelude::FluentBuilder as _, px,
+    red,
 };
 use gpui_component::{
     ActiveTheme as _, Sizable, StyledExt,
@@ -69,6 +70,8 @@ impl FileTable {
             let gap_width = if value_width > 0. { TAG_GAP_WIDTH } else { 0. };
             let action_width = if is_editing {
                 TAG_EDITOR_WIDTH
+            } else if record.is_convertible() {
+                0.
             } else {
                 TAG_ADD_BUTTON_WIDTH
             };
@@ -187,9 +190,8 @@ impl FileTable {
 
         let path = pending.path.clone();
         self.clear_pending_drag();
-        self.library.update(cx, |lib, cx| {
-            lib.begin_internal_file_drag_with_anchor(path.clone(), Some(event.position), cx)
-        });
+        self.library
+            .update(cx, |lib, cx| lib.begin_internal_file_drag(path.clone(), cx));
         let (drag_finished_tx, mut drag_finished_rx) = mpsc::unbounded::<()>();
         let library = self.library.clone();
         cx.spawn(async move |_, cx| {
@@ -232,10 +234,18 @@ impl Render for FileTable {
             .map(|key| Self::tag_column_width(state, key, editing))
             .collect();
         let chip_delete_bg = red().opacity(0.18);
+        let convertible_bg = hsla(0.095, 1., 0.55, 0.12);
+        let convertible_hover_bg = hsla(0.095, 1., 0.55, 0.2);
 
         let mut body = TableBody::new();
         for record in &state.results {
             let path = record.path.clone();
+            let convertible = record.is_convertible();
+            let row_hover_bg = if convertible {
+                convertible_hover_bg
+            } else {
+                cx.theme().table_hover
+            };
             let name = div()
                 .w_full()
                 .min_w_0()
@@ -248,7 +258,8 @@ impl Render for FileTable {
                 .flex()
                 .flex_row()
                 .w_full()
-                .hover(|s| s.bg(cx.theme().table_hover))
+                .when(convertible, |s| s.bg(convertible_bg))
+                .hover(move |s| s.bg(row_hover_bg))
                 .on_click(cx.listener(move |_, event: &ClickEvent, _, _| {
                     if event.click_count() == 2 {
                         open_in_default_app(&open_path);
@@ -348,7 +359,7 @@ impl Render for FileTable {
                             }))
                             .child(Input::new(&self.tag_input).appearance(false).xsmall()),
                     );
-                } else {
+                } else if !convertible {
                     let (key, path) = (key.clone(), path.clone());
                     cell = cell.child(
                         div()
@@ -419,7 +430,7 @@ impl Render for FileTable {
 }
 
 fn open_in_default_app(path: &Path) {
-    if let Err(err) = opener::open(path) {
+    if let Err(err) = open::that(path) {
         eprintln!("failed to open {}: {err}", path.display());
     }
 }

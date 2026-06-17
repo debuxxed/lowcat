@@ -49,7 +49,20 @@ impl Category {
 pub struct FileRecord {
     pub name: String,
     pub path: PathBuf,
+    pub support: FileSupport,
     pub tags: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileSupport {
+    Native,
+    Convertible,
+}
+
+impl FileRecord {
+    pub fn is_convertible(&self) -> bool {
+        self.support == FileSupport::Convertible
+    }
 }
 
 #[derive(Default)]
@@ -115,6 +128,7 @@ mod tests {
         FileRecord {
             name: name.to_string(),
             path: PathBuf::from(name),
+            support: FileSupport::Native,
             tags: tags
                 .iter()
                 .map(|(k, vs)| (k.to_string(), vs.iter().map(|v| v.to_string()).collect()))

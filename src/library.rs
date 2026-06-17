@@ -2,9 +2,10 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use gpui::{Context, Pixels, Point};
+use futures::{StreamExt as _, channel::mpsc};
+use gpui::{AppContext as _, Context};
 
-use crate::backend::Backend;
+use crate::backend::{Backend, import_requires_conversion, import_to_folder};
 use crate::model::{Category, CategoryState, FileRecord, tag_label};
 
 #[path = "config.rs"]
@@ -18,13 +19,32 @@ pub struct Library {
     settings_path: PathBuf,
     filters_open: bool,
     internal_file_drag: Option<InternalFileDrag>,
+    importing: bool,
+    import_progress: Option<ImportProgress>,
 }
 
 #[derive(Clone)]
 struct InternalFileDrag {
     category: Category,
     path: PathBuf,
-    anchor: Option<Point<Pixels>>,
+}
+
+#[derive(Clone)]
+pub struct ImportProgress {
+    pub file_name: String,
+    pub progress: f32,
+}
+
+struct ImportBatchResult {
+    category: Category,
+    imported: bool,
+    moved_from: Option<Category>,
+}
+
+enum ImportProgressEvent {
+    Start { file_name: String },
+    Progress(f32),
+    Finish,
 }
 
 impl Library {
@@ -42,6 +62,8 @@ impl Library {
             settings_path,
             filters_open: false,
             internal_file_drag: None,
+            importing: false,
+            import_progress: None,
         };
         this.init();
         this
@@ -62,6 +84,10 @@ impl Library {
 
     pub fn filters_open(&self) -> bool {
         self.filters_open
+    }
+
+    pub fn import_progress(&self) -> Option<&ImportProgress> {
+        self.import_progress.as_ref()
     }
 
     pub fn toggle_filters(&mut self, cx: &mut Context<Self>) {
@@ -129,33 +155,16 @@ impl Library {
         }
     }
 
-    pub fn begin_internal_file_drag_with_anchor(
-        &mut self,
-        path: PathBuf,
-        anchor: Option<Point<Pixels>>,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn begin_internal_file_drag(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.internal_file_drag = Some(InternalFileDrag {
             category: self.active,
             path: canonical_or_original(path),
-            anchor,
         });
         cx.notify();
     }
 
-    #[cfg(test)]
-    pub fn begin_internal_file_drag(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        self.begin_internal_file_drag_with_anchor(path, None, cx);
-    }
-
     pub fn internal_file_drag_active(&self) -> bool {
         self.internal_file_drag.is_some()
-    }
-
-    pub fn internal_file_drag_anchor(&self) -> Option<Point<Pixels>> {
-        self.internal_file_drag
-            .as_ref()
-            .and_then(|drag| drag.anchor)
     }
 
     pub fn clear_internal_file_drag(&mut self, cx: &mut Context<Self>) {
@@ -176,25 +185,79 @@ impl Library {
             cx.notify();
             return;
         }
+        if paths.is_empty() || self.importing {
+            cx.notify();
+            return;
+        }
 
-        let mut imported = false;
-        for path in paths {
-            if self.backend.import(category, &path).is_ok() {
-                imported = true;
+        self.importing = true;
+        self.import_progress = None;
+        cx.notify();
+
+        let Some(folder) = self
+            .settings
+            .category_folder(category)
+            .map(Path::to_path_buf)
+        else {
+            self.finish_import(
+                ImportBatchResult {
+                    category,
+                    imported: false,
+                    moved_from: internal_origin,
+                },
+                cx,
+            );
+            return;
+        };
+        let (progress_tx, mut progress_rx) = mpsc::unbounded();
+
+        cx.spawn(async move |this, cx| {
+            while let Some(event) = progress_rx.next().await {
+                this.update(cx, |lib, cx| {
+                    lib.apply_import_progress(event, cx);
+                })
+                .ok();
             }
-        }
-        if imported {
-            let _ = self.refresh_category_state(category);
-            if let Some(origin) = internal_origin
-                && origin != category
-            {
-                let _ = self.backend.refresh_category(origin);
-                let _ = self.refresh_category_state(origin);
+        })
+        .detach();
+
+        let import_task = cx.background_spawn(async move {
+            let mut imported = false;
+            for path in paths {
+                let file_name = file_name(&path);
+                let converting = import_requires_conversion(&path);
+                let mut conversion_started = false;
+                let result = import_to_folder(&folder, &path, |progress| {
+                    if converting && !conversion_started {
+                        conversion_started = true;
+                        let _ = progress_tx.unbounded_send(ImportProgressEvent::Start {
+                            file_name: file_name.clone(),
+                        });
+                    }
+                    let _ = progress_tx.unbounded_send(ImportProgressEvent::Progress(progress));
+                });
+                if conversion_started {
+                    let _ = progress_tx.unbounded_send(ImportProgressEvent::Finish);
+                }
+                if result.is_ok_and(|result| result.converted || !converting) {
+                    imported = true;
+                }
             }
-            cx.notify();
-        } else if internal_origin.is_some() {
-            cx.notify();
-        }
+            ImportBatchResult {
+                category,
+                imported,
+                moved_from: internal_origin,
+            }
+        });
+
+        cx.spawn(async move |this, cx| {
+            let result = import_task.await;
+            this.update(cx, |lib, cx| {
+                lib.finish_import(result, cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub fn set_category_folder(
@@ -259,6 +322,45 @@ impl Library {
         cx.notify();
     }
 
+    fn apply_import_progress(&mut self, event: ImportProgressEvent, cx: &mut Context<Self>) {
+        match event {
+            ImportProgressEvent::Start { file_name } => {
+                self.import_progress = Some(ImportProgress {
+                    file_name,
+                    progress: 0.,
+                });
+            }
+            ImportProgressEvent::Progress(progress) => {
+                if let Some(import_progress) = self.import_progress.as_mut() {
+                    import_progress.progress = progress;
+                }
+            }
+            ImportProgressEvent::Finish => {
+                self.import_progress = None;
+            }
+        }
+        cx.notify();
+    }
+
+    fn finish_import(&mut self, result: ImportBatchResult, cx: &mut Context<Self>) {
+        self.importing = false;
+        self.import_progress = None;
+        if result.imported {
+            let _ = self.backend.refresh_category(result.category);
+            let _ = self.refresh_category_state(result.category);
+            if let Some(origin) = result.moved_from
+                && origin != result.category
+            {
+                let _ = self.backend.refresh_category(origin);
+                let _ = self.refresh_category_state(origin);
+            }
+        } else if result.moved_from.is_some() {
+            cx.notify();
+            return;
+        }
+        cx.notify();
+    }
+
     fn refresh_category_state(&mut self, category: Category) -> io::Result<()> {
         let (search, selected) = if let Some(state) = self.states.get(&category) {
             (state.search.clone(), state.selected.clone())
@@ -292,6 +394,13 @@ impl Library {
     }
 }
 
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("import")
+        .to_string()
+}
+
 fn canonical_or_original(path: PathBuf) -> PathBuf {
     path.canonicalize().unwrap_or(path)
 }
@@ -315,6 +424,7 @@ fn display_record(record: FileRecord) -> FileRecord {
     FileRecord {
         name: record.name,
         path: record.path,
+        support: record.support,
         tags: display_schema(record.tags),
     }
 }
@@ -322,7 +432,6 @@ fn display_record(record: FileRecord) -> FileRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::AppContext as _;
     use std::fs;
     use std::process::{Command, Stdio};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -443,6 +552,31 @@ mod tests {
     }
 
     #[gpui::test]
+    fn active_results_keep_convertible_files_first(cx: &mut gpui::TestAppContext) {
+        let settings_path = settings_path("convertible-first");
+        let (music_dir, _) = settings_with_folders(&settings_path);
+        fixture(&music_dir, "aaa.flac", &[("GENRE", "Ambient")]);
+        fixture(&music_dir, "zzz.wav", &[]);
+
+        let library = cx.new(|_| Library::new_with_settings_path(settings_path));
+        let results = library.read_with(cx, |lib, _| {
+            lib.active_state()
+                .results
+                .iter()
+                .map(|record| (record.name.clone(), record.is_convertible()))
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(
+            results,
+            vec![
+                ("zzz.wav".to_string(), true),
+                ("aaa.flac".to_string(), false)
+            ]
+        );
+    }
+
+    #[gpui::test]
     fn same_category_internal_drop_is_noop(cx: &mut gpui::TestAppContext) {
         let settings_path = settings_path("same-category-drop");
         let (music_dir, _) = settings_with_folders(&settings_path);
@@ -474,6 +608,7 @@ mod tests {
         library.update(cx, |lib, cx| {
             lib.import_files(Category::Sfx, vec![music_file.clone()], cx)
         });
+        cx.run_until_parked();
 
         assert!(!music_file.exists());
         assert!(sfx_dir.join("move.flac").is_file());

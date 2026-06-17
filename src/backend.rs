@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,12 +10,16 @@ use lofty::file::AudioFile;
 use lofty::flac::FlacFile;
 use lofty::ogg::{OpusFile, VorbisComments};
 
-use crate::model::{Category, FileRecord, canonical_tag_key, record_matches};
+use crate::model::{Category, FileRecord, FileSupport, canonical_tag_key, record_matches};
 
 #[derive(Default)]
 pub struct Backend {
     folders: BTreeMap<Category, PathBuf>,
     files: BTreeMap<Category, Vec<FileRecord>>,
+}
+
+pub struct ImportResult {
+    pub converted: bool,
 }
 
 impl Backend {
@@ -50,18 +54,27 @@ impl Backend {
         for entry in fs::read_dir(folder)? {
             let entry = entry?;
             let path = entry.path();
-            if !entry.file_type()?.is_file() || !is_library_file(&path) {
+            if !entry.file_type()?.is_file() {
                 continue;
             }
-            if let Ok(record) = read_record(category, &path) {
+
+            let support = if is_library_file(&path) {
+                FileSupport::Native
+            } else if probe_is_audio(&path) {
+                FileSupport::Convertible
+            } else {
+                continue;
+            };
+
+            if let Ok(record) = read_record(category, &path, support) {
                 records.push(record);
             }
         }
 
         records.sort_by(|a, b| {
-            a.name
-                .to_lowercase()
-                .cmp(&b.name.to_lowercase())
+            b.is_convertible()
+                .cmp(&a.is_convertible())
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
                 .then_with(|| a.name.cmp(&b.name))
                 .then_with(|| a.path.cmp(&b.path))
         });
@@ -145,61 +158,75 @@ impl Backend {
     /// other readable audio is converted to `.opus`. The source is only removed
     /// after the destination has been written and verified, so a failed import
     /// never deletes the source. Returns an error if the category has no folder.
+    #[allow(dead_code)]
     pub fn import(&mut self, category: Category, source: &Path) -> io::Result<()> {
         let folder = self.folders.get(&category).cloned().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "category has no configured folder")
         })?;
-        if !folder.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "category folder does not exist",
-            ));
-        }
-        if !source.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "source is not a file",
-            ));
-        }
-        if !probe_is_audio(source) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "source is not readable audio",
-            ));
-        }
-
-        let convert = !is_library_file(source);
-        let extension = if convert {
-            "opus".to_string()
-        } else {
-            extension(source).unwrap_or_else(|| "opus".to_string())
-        };
-        let stem = source
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("import");
-
-        let final_path = unique_destination(&folder, stem, &extension);
-        let temp_path = temp_destination(&folder, &extension);
-
-        let produced = if convert {
-            convert_to_opus(source, &temp_path)
-        } else {
-            fs::copy(source, &temp_path).map(|_| ())
-        };
-        if let Err(error) = produced.and_then(|()| verify_exists(&temp_path)) {
-            let _ = fs::remove_file(&temp_path);
-            return Err(error);
-        }
-
-        if let Err(error) = fs::rename(&temp_path, &final_path) {
-            let _ = fs::remove_file(&temp_path);
-            return Err(error);
-        }
-
-        fs::remove_file(source)?;
+        import_to_folder(&folder, source, |_| {})?;
         self.refresh_category(category)
     }
+}
+
+pub fn import_to_folder(
+    folder: &Path,
+    source: &Path,
+    mut on_conversion_progress: impl FnMut(f32),
+) -> io::Result<ImportResult> {
+    if !folder.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "category folder does not exist",
+        ));
+    }
+    if !source.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "source is not a file",
+        ));
+    }
+    if !probe_is_audio(source) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "source is not readable audio",
+        ));
+    }
+
+    let convert = !is_library_file(source);
+    let extension = if convert {
+        "opus".to_string()
+    } else {
+        extension(source).unwrap_or_else(|| "opus".to_string())
+    };
+    let stem = source
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("import");
+
+    let final_path = unique_destination(folder, stem, &extension);
+    let temp_path = temp_destination(folder, &extension);
+
+    let produced = if convert {
+        convert_to_opus(source, &temp_path, &mut on_conversion_progress)
+    } else {
+        fs::copy(source, &temp_path).map(|_| ())
+    };
+    if let Err(error) = produced.and_then(|()| verify_exists(&temp_path)) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+
+    if let Err(error) = fs::rename(&temp_path, &final_path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+
+    fs::remove_file(source)?;
+    Ok(ImportResult { converted: convert })
+}
+
+pub fn import_requires_conversion(path: &Path) -> bool {
+    !is_library_file(path)
 }
 
 fn probe_is_audio(path: &Path) -> bool {
@@ -220,20 +247,76 @@ fn probe_is_audio(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn convert_to_opus(source: &Path, dest: &Path) -> io::Result<()> {
-    let status = Command::new("ffmpeg")
-        .args(["-hide_banner", "-loglevel", "error", "-i"])
+fn convert_to_opus(
+    source: &Path,
+    dest: &Path,
+    on_progress: &mut impl FnMut(f32),
+) -> io::Result<()> {
+    let duration_us = media_duration_us(source);
+    on_progress(0.);
+    let mut child = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-progress",
+            "pipe:1",
+            "-nostats",
+            "-i",
+        ])
         .arg(source)
         .args(["-vn", "-c:a", "libopus", "-y"])
         .arg(dest)
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .status()?;
+        .spawn()?;
+    if let Some(stdout) = child.stdout.take() {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(value) = parse_ffmpeg_progress(&line, duration_us) {
+                on_progress(value);
+            }
+        }
+    }
+    let status = child.wait()?;
     if status.success() {
+        on_progress(100.);
         Ok(())
     } else {
         Err(io::Error::other("ffmpeg conversion failed"))
     }
+}
+
+fn media_duration_us(path: &Path) -> Option<f64> {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let seconds = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<f64>()
+        .ok()?;
+    (seconds.is_finite() && seconds > 0.).then_some(seconds * 1_000_000.)
+}
+
+fn parse_ffmpeg_progress(line: &str, duration_us: Option<f64>) -> Option<f32> {
+    let duration_us = duration_us?;
+    let (key, raw) = line.split_once('=')?;
+    let elapsed_us = match key {
+        "out_time_us" | "out_time_ms" => raw.parse::<f64>().ok()?,
+        _ => return None,
+    };
+    Some(((elapsed_us / duration_us) * 100.).clamp(0., 100.) as f32)
 }
 
 fn verify_exists(path: &Path) -> io::Result<()> {
@@ -295,7 +378,7 @@ fn is_library_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn read_record(category: Category, path: &Path) -> io::Result<FileRecord> {
+fn read_record(category: Category, path: &Path, support: FileSupport) -> io::Result<FileRecord> {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -305,6 +388,7 @@ fn read_record(category: Category, path: &Path) -> io::Result<FileRecord> {
     Ok(FileRecord {
         name,
         path: path.to_path_buf(),
+        support,
         tags,
     })
 }
@@ -482,10 +566,11 @@ mod tests {
     }
 
     #[test]
-    fn scans_only_opus_and_flac_non_recursively() {
+    fn scans_native_and_convertible_audio_non_recursively() {
         let dir = unique_dir("extensions");
         fixture(&dir, "top.opus", &[]);
         fixture(&dir, "top.flac", &[]);
+        fixture(&dir, "convertible.wav", &[]);
         fs::write(dir.join("skip.wav"), b"not audio").unwrap();
         fs::create_dir_all(dir.join("nested")).unwrap();
         fixture(&dir.join("nested"), "nested.flac", &[]);
@@ -495,8 +580,24 @@ mod tests {
 
         assert_eq!(
             names(backend.filter(Category::Music, "", &BTreeMap::new())),
-            vec!["top.flac", "top.opus"]
+            vec!["convertible.wav", "top.flac", "top.opus"]
         );
+    }
+
+    #[test]
+    fn convertible_records_are_marked() {
+        let dir = unique_dir("convertible-mark");
+        fixture(&dir, "native.flac", &[]);
+        fixture(&dir, "convertible.wav", &[]);
+
+        let mut backend = Backend::new();
+        backend.set_category_folder(Category::Music, dir).unwrap();
+        let records = backend.filter(Category::Music, "", &BTreeMap::new());
+
+        assert_eq!(records[0].name, "convertible.wav");
+        assert_eq!(records[0].support, FileSupport::Convertible);
+        assert_eq!(records[1].name, "native.flac");
+        assert_eq!(records[1].support, FileSupport::Native);
     }
 
     #[test]
@@ -534,18 +635,26 @@ mod tests {
     }
 
     #[test]
-    fn records_are_sorted_by_display_name() {
+    fn records_sort_convertible_first_then_by_display_name() {
         let dir = unique_dir("sorting");
         fixture(&dir, "zeta.flac", &[]);
         fixture(&dir, "alpha.flac", &[]);
         fixture(&dir, "Beta.opus", &[]);
+        fixture(&dir, "omega.wav", &[]);
+        fixture(&dir, "delta.wav", &[]);
 
         let mut backend = Backend::new();
         backend.set_category_folder(Category::Music, dir).unwrap();
 
         assert_eq!(
             names(backend.filter(Category::Music, "", &BTreeMap::new())),
-            vec!["alpha.flac", "Beta.opus", "zeta.flac"]
+            vec![
+                "delta.wav",
+                "omega.wav",
+                "alpha.flac",
+                "Beta.opus",
+                "zeta.flac"
+            ]
         );
     }
 

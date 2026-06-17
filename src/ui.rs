@@ -5,10 +5,10 @@ mod toolbar;
 
 use gpui::{
     App, AppContext, Context, Entity, ExternalPaths, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, ModifiersChangedEvent, MouseMoveEvent, ParentElement, Pixels, Point,
-    Render, SharedString, Styled, Window, actions, div, prelude::FluentBuilder, px, rgba,
+    IntoElement, KeyDownEvent, ModifiersChangedEvent, ParentElement, Pixels, Render, SharedString,
+    Styled, Window, actions, div, prelude::FluentBuilder, px, rgba,
 };
-use gpui_component::{ActiveTheme as _, StyledExt};
+use gpui_component::{ActiveTheme as _, Sizable as _, StyledExt, progress::Progress};
 
 use crate::model::Category;
 use crate::ui::titlebar::TITLEBAR_LEFT_OFFSET;
@@ -31,9 +31,6 @@ pub struct UI {
     filter_panel: Entity<FilterPanel>,
     table: Entity<FileTable>,
     focus_handle: FocusHandle,
-    drop_hover_category: Option<Category>,
-    drop_hover_anchor: Option<Point<Pixels>>,
-    drop_hover_anchor_consumed: bool,
 }
 
 impl UI {
@@ -51,82 +48,12 @@ impl UI {
             table: cx.new(|cx| FileTable::new(library.clone(), window, cx)),
             library,
             focus_handle,
-            drop_hover_category: None,
-            drop_hover_anchor: None,
-            drop_hover_anchor_consumed: false,
         }
     }
 }
 
 impl UI {
-    fn category_at_position(position: Point<Pixels>, window: &Window) -> Option<Category> {
-        let x = (position.x - TITLEBAR_LEFT_OFFSET).as_f32();
-        let width = (window.viewport_size().width - TITLEBAR_LEFT_OFFSET).as_f32();
-        if x < 0. || width <= 0. {
-            return None;
-        }
-
-        let column_width = width / Category::ALL.len() as f32;
-        if column_width <= 0. {
-            return None;
-        }
-
-        let index = ((x / column_width).floor() as usize).min(Category::ALL.len() - 1);
-        Category::ALL.get(index).copied()
-    }
-
-    fn consume_anchor_hover(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
-        let anchor = self.library.read(cx).internal_file_drag_anchor();
-        if self.drop_hover_anchor != anchor {
-            self.drop_hover_anchor = anchor;
-            self.drop_hover_anchor_consumed = false;
-        }
-
-        let Some(anchor) = anchor else {
-            self.drop_hover_anchor_consumed = false;
-            return false;
-        };
-
-        let dx = position.x.as_f32() - anchor.x.as_f32();
-        let dy = position.y.as_f32() - anchor.y.as_f32();
-        if dx.hypot(dy) > 0.5 {
-            return false;
-        }
-
-        if self.drop_hover_anchor_consumed {
-            return true;
-        }
-
-        self.drop_hover_anchor_consumed = true;
-        false
-    }
-
-    fn update_drop_hover(
-        &mut self,
-        position: Point<Pixels>,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.consume_anchor_hover(position, cx) {
-            return;
-        }
-
-        let category = self
-            .library
-            .read(cx)
-            .internal_file_drag_active()
-            .then(|| Self::category_at_position(position, window))
-            .flatten();
-        if self.drop_hover_category != category {
-            self.drop_hover_category = category;
-            cx.notify();
-        }
-    }
-
     fn cancel_file_drag(&mut self, cx: &mut Context<Self>) {
-        self.drop_hover_category = None;
-        self.drop_hover_anchor = None;
-        self.drop_hover_anchor_consumed = false;
         self.table
             .update(cx, |table, cx| table.cancel_file_drag(cx));
         cx.notify();
@@ -135,18 +62,11 @@ impl UI {
     /// Full-window overlay that fades in while OS files are dragged over the
     /// window, aligned with the titlebar categories.
     fn render_drop_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let internal_drag_active = self.library.read(cx).internal_file_drag_active();
-        let overlay_opacity = if internal_drag_active { 1. } else { 0. };
         let base_bg = rgba(0x70707066);
         let highlight_bg = rgba(0x9a9a9aa6);
         let mut columns = div().h_flex().size_full().pl(TITLEBAR_LEFT_OFFSET);
         for category in Category::ALL {
-            let bg = if self.drop_hover_category == Some(category) {
-                highlight_bg
-            } else {
-                base_bg
-            };
-            let mut column = div()
+            let column = div()
                 .id(SharedString::from(format!(
                     "drop-overlay:{}",
                     category.label()
@@ -158,65 +78,105 @@ impl UI {
                 .justify_center()
                 .border_l_1()
                 .border_color(rgba(0xffffff22))
-                .bg(bg)
+                .bg(base_bg)
                 .text_color(cx.theme().foreground)
-                .child(SharedString::from(category.label()));
-
-            if !internal_drag_active {
-                column = column.drag_over::<ExternalPaths>(move |style, paths, _, _| {
-                    if !internal_drag_active && !paths.paths().is_empty() {
-                        style.bg(rgba(0x9a9a9aa6))
-                    } else {
+                .child(SharedString::from(category.label()))
+                .drag_over::<ExternalPaths>(move |style, paths, _, _| {
+                    if paths.paths().is_empty() {
                         style
+                    } else {
+                        style.bg(highlight_bg)
                     }
                 });
-            }
 
             columns = columns.child(column.on_drop(cx.listener(
                 move |this, paths: &ExternalPaths, _, cx| {
                     let paths = paths.paths().to_vec();
-                    this.drop_hover_category = None;
-                    this.drop_hover_anchor = None;
-                    this.drop_hover_anchor_consumed = false;
                     this.library
                         .update(cx, |lib, cx| lib.import_files(category, paths, cx));
                 },
             )));
         }
 
-        let mut overlay = div()
+        let overlay = div()
             .id("drop-overlay")
             .absolute()
             .top_0()
             .left_0()
             .size_full()
-            .opacity(overlay_opacity)
+            .opacity(0.)
             // `drag_over` alone does not register a hitbox. An empty `hover`
             // keeps the overlay detectable without changing layout.
-            .hover(|style| style)
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
-                this.update_drop_hover(event.position, window, cx);
-            }));
-
-        if !internal_drag_active {
-            overlay = overlay.drag_over::<ExternalPaths>(move |style, _, _, _| {
-                if internal_drag_active {
-                    style
-                } else {
-                    style.opacity(1.)
-                }
-            });
-        }
+            .hover(|style| style);
 
         overlay
-            .on_drop(cx.listener(|this, _: &ExternalPaths, _, cx| {
-                this.drop_hover_category = None;
-                this.drop_hover_anchor = None;
-                this.drop_hover_anchor_consumed = false;
-                this.library
-                    .update(cx, |lib, cx| lib.clear_internal_file_drag(cx));
-            }))
+            .drag_over::<ExternalPaths>(|style, _, _, _| style.opacity(1.))
+            .on_drop(cx.listener(|_, _: &ExternalPaths, _, _| {}))
             .child(columns)
+    }
+
+    fn render_import_progress_modal(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let progress = self
+            .library
+            .read(cx)
+            .import_progress()
+            .cloned()
+            .expect("progress modal only renders while import progress exists");
+        let percent = progress.progress.round() as u32;
+
+        div()
+            .id("import-progress-overlay")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .bg(rgba(0x00000099))
+            .hover(|style| style)
+            .child(
+                div()
+                    .size_full()
+                    .h_flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w(px(360.))
+                            .max_w(px(520.))
+                            .v_flex()
+                            .gap_3()
+                            .p_4()
+                            .rounded(px(8.))
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .bg(cx.theme().popover)
+                            .shadow_lg()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .child("Converting to Opus"),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(progress.file_name),
+                            )
+                            .child(
+                                Progress::new("import-progress")
+                                    .small()
+                                    .value(progress.progress),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(SharedString::from(format!("{percent}%"))),
+                            ),
+                    ),
+            )
     }
 }
 
@@ -229,6 +189,8 @@ impl Focusable for UI {
 impl Render for UI {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let filters_open = self.library.read(cx).filters_open();
+        let internal_drag_active = self.library.read(cx).internal_file_drag_active();
+        let import_progress_active = self.library.read(cx).import_progress().is_some();
         let drop_overlay = self.render_drop_overlay(cx);
 
         div()
@@ -236,11 +198,6 @@ impl Render for UI {
             .relative()
             .size_full()
             .v_flex()
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
-                if event.dragging() {
-                    this.update_drop_hover(event.position, window, cx);
-                }
-            }))
             .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _, cx| {
                 this.toolbar.update(cx, |toolbar, cx| {
                     toolbar.set_alt_down(event.modifiers.alt, cx)
@@ -267,6 +224,9 @@ impl Render for UI {
             .child(self.toolbar.clone())
             .when(filters_open, |el| el.child(self.filter_panel.clone()))
             .child(self.table.clone())
-            .child(drop_overlay)
+            .when(!internal_drag_active, |el| el.child(drop_overlay))
+            .when(import_progress_active, |el| {
+                el.child(self.render_import_progress_modal(cx))
+            })
     }
 }
