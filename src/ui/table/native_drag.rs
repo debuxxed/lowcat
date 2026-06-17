@@ -44,9 +44,6 @@ mod macos {
             Options::default(),
         )
         .is_ok()
-
-        // std::thread::sleep(std::time::Duration::from_secs(3));
-        // true
     }
 
     fn absolute_files(paths: Vec<PathBuf>) -> Vec<PathBuf> {

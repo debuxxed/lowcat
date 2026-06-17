@@ -4,7 +4,7 @@ use gpui::{
     Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    ActiveTheme as _, IconName, Sizable as _, StyledExt, TitleBar,
+    ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt, TitleBar,
     button::{Button, ButtonVariants as _},
 };
 
@@ -19,6 +19,7 @@ pub(crate) const TITLEBAR_LEFT_OFFSET: Pixels = px(84.);
 pub struct AppTitleBar {
     library: Entity<Library>,
     hovered_category: Option<Category>,
+    folder_prompt_active: bool,
 }
 
 impl AppTitleBar {
@@ -28,6 +29,7 @@ impl AppTitleBar {
         Self {
             library,
             hovered_category: None,
+            folder_prompt_active: false,
         }
     }
 
@@ -39,6 +41,13 @@ impl AppTitleBar {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
+        if self.folder_prompt_active {
+            return;
+        }
+
+        self.folder_prompt_active = true;
+        cx.notify();
+
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -47,8 +56,24 @@ impl AppTitleBar {
         });
         let library = self.library.downgrade();
 
-        cx.spawn(async move |_, cx: &mut AsyncApp| {
-            let path = paths.await.ok()?.ok()??.into_iter().next()?;
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let path = paths
+                .await
+                .ok()
+                .and_then(|paths| paths.ok())
+                .flatten()
+                .and_then(|paths| paths.into_iter().next());
+
+            this.update(cx, |this, cx| {
+                this.folder_prompt_active = false;
+                cx.notify();
+            })
+            .ok()?;
+
+            let Some(path) = path else {
+                return Some(());
+            };
+
             library
                 .update(cx, |lib, cx| {
                     let _ = lib.set_category_folder(category, path, cx);
@@ -104,10 +129,15 @@ impl Render for AppTitleBar {
                 category.label()
             )))
             .icon(IconName::Folder)
-            .xsmall()
+            .small()
             .compact()
             .ghost()
-            .tooltip(format!("Choose {} folder", category.label()))
+            .disabled(self.folder_prompt_active)
+            .tooltip(if self.folder_prompt_active {
+                SharedString::from("Folder picker is already open")
+            } else {
+                SharedString::from(format!("Choose {} folder", category.label()))
+            })
             .on_click(cx.listener(move |this, event, window, cx| {
                 this.choose_category_folder(category, event, window, cx);
             }));
