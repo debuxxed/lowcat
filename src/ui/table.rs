@@ -187,8 +187,9 @@ impl FileTable {
 
         let path = pending.path.clone();
         self.clear_pending_drag();
-        self.library
-            .update(cx, |lib, cx| lib.begin_internal_file_drag(path.clone(), cx));
+        self.library.update(cx, |lib, cx| {
+            lib.begin_internal_file_drag_with_anchor(path.clone(), Some(event.position), cx)
+        });
         let (drag_finished_tx, mut drag_finished_rx) = mpsc::unbounded::<()>();
         let library = self.library.clone();
         cx.spawn(async move |_, cx| {

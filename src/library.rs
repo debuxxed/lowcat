@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use gpui::Context;
+use gpui::{Context, Pixels, Point};
 
 use crate::backend::Backend;
 use crate::model::{Category, CategoryState, FileRecord, tag_label};
@@ -24,6 +24,7 @@ pub struct Library {
 struct InternalFileDrag {
     category: Category,
     path: PathBuf,
+    anchor: Option<Point<Pixels>>,
 }
 
 impl Library {
@@ -128,16 +129,33 @@ impl Library {
         }
     }
 
-    pub fn begin_internal_file_drag(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    pub fn begin_internal_file_drag_with_anchor(
+        &mut self,
+        path: PathBuf,
+        anchor: Option<Point<Pixels>>,
+        cx: &mut Context<Self>,
+    ) {
         self.internal_file_drag = Some(InternalFileDrag {
             category: self.active,
             path: canonical_or_original(path),
+            anchor,
         });
         cx.notify();
     }
 
+    #[cfg(test)]
+    pub fn begin_internal_file_drag(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.begin_internal_file_drag_with_anchor(path, None, cx);
+    }
+
     pub fn internal_file_drag_active(&self) -> bool {
         self.internal_file_drag.is_some()
+    }
+
+    pub fn internal_file_drag_anchor(&self) -> Option<Point<Pixels>> {
+        self.internal_file_drag
+            .as_ref()
+            .and_then(|drag| drag.anchor)
     }
 
     pub fn clear_internal_file_drag(&mut self, cx: &mut Context<Self>) {
