@@ -28,7 +28,7 @@ pub struct Library {
 #[derive(Clone)]
 struct InternalFileDrag {
     category: Category,
-    path: PathBuf,
+    paths: Vec<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -173,9 +173,14 @@ impl Library {
     }
 
     pub fn begin_internal_file_drag(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.begin_internal_file_drag_files(vec![path], cx);
+    }
+
+    pub fn begin_internal_file_drag_files(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let paths = paths.into_iter().map(canonical_or_original).collect();
         self.internal_file_drag = Some(InternalFileDrag {
             category: self.active,
-            path: canonical_or_original(path),
+            paths,
         });
         cx.notify();
     }
@@ -284,6 +289,25 @@ impl Library {
         }
 
         let category = self.active;
+        let paths = self.backend.convertible_paths(category);
+        self.convert_active_unsupported_files(paths, cx);
+    }
+
+    pub fn convert_active_unsupported_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.convert_active_unsupported_files(vec![path], cx);
+    }
+
+    pub fn convert_active_unsupported_files(
+        &mut self,
+        paths: Vec<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.importing {
+            cx.notify();
+            return;
+        }
+
+        let category = self.active;
         let Some(folder) = self
             .settings
             .category_folder(category)
@@ -292,7 +316,16 @@ impl Library {
             cx.notify();
             return;
         };
-        let paths = self.backend.convertible_paths(category);
+
+        let convertible_paths = self.backend.convertible_paths(category);
+        let paths: Vec<PathBuf> = paths
+            .into_iter()
+            .filter(|path| {
+                convertible_paths
+                    .iter()
+                    .any(|candidate| paths_equal(candidate, path))
+            })
+            .collect();
         if paths.is_empty() {
             cx.notify();
             return;
@@ -326,69 +359,6 @@ impl Library {
                 if progress >= 100. {
                     let _ = progress_tx.unbounded_send(ImportProgressEvent::Finish);
                     current_path = None;
-                }
-            });
-            ConvertBatchResult { category }
-        });
-
-        cx.spawn(async move |this, cx| {
-            let result = convert_task.await;
-            this.update(cx, |lib, cx| {
-                lib.finish_convert_unsupported(result, cx);
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    pub fn convert_active_unsupported_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if self.importing {
-            cx.notify();
-            return;
-        }
-
-        let category = self.active;
-        let Some(folder) = self
-            .settings
-            .category_folder(category)
-            .map(Path::to_path_buf)
-        else {
-            cx.notify();
-            return;
-        };
-        if !self
-            .backend
-            .convertible_paths(category)
-            .iter()
-            .any(|candidate| paths_equal(candidate, &path))
-        {
-            cx.notify();
-            return;
-        }
-
-        self.importing = true;
-        self.import_progress = None;
-        cx.notify();
-
-        let (progress_tx, mut progress_rx) = mpsc::unbounded();
-        cx.spawn(async move |this, cx| {
-            while let Some(event) = progress_rx.next().await {
-                this.update(cx, |lib, cx| {
-                    lib.apply_import_progress(event, cx);
-                })
-                .ok();
-            }
-        })
-        .detach();
-
-        let convert_task = cx.background_spawn(async move {
-            let _ = progress_tx.unbounded_send(ImportProgressEvent::Start {
-                file_name: file_name(&path),
-            });
-            let _ = convert_unsupported_files(&folder, vec![path], |_, progress| {
-                let _ = progress_tx.unbounded_send(ImportProgressEvent::Progress(progress));
-                if progress >= 100. {
-                    let _ = progress_tx.unbounded_send(ImportProgressEvent::Finish);
                 }
             });
             ConvertBatchResult { category }
@@ -531,9 +501,9 @@ impl Library {
 
     fn internal_drag_origin(&self, paths: &[PathBuf]) -> Option<Category> {
         let drag = self.internal_file_drag.as_ref()?;
-        paths
+        drag.paths
             .iter()
-            .any(|path| paths_equal(&drag.path, path))
+            .any(|drag_path| paths.iter().any(|path| paths_equal(drag_path, path)))
             .then_some(drag.category)
     }
 

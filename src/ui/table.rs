@@ -1,5 +1,6 @@
 mod native_drag;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use futures::{StreamExt as _, channel::mpsc};
@@ -18,8 +19,8 @@ use gpui_component::{
     table::*,
 };
 
-use crate::library::Library;
 use crate::ui::CONTENT_PX;
+use crate::{library::Library, model::FileRecord};
 
 const TAG_CELL_X_PADDING_WIDTH: f32 = 24.;
 const TAG_CHIP_X_PADDING_WIDTH: f32 = 12.;
@@ -42,6 +43,8 @@ pub struct FileTable {
     focus_handle: FocusHandle,
     alt_down: bool,
     pending_drag: Option<PendingFileDrag>,
+    selected: BTreeSet<PathBuf>,
+    selection_anchor: Option<PathBuf>,
 }
 
 impl FileTable {
@@ -109,6 +112,8 @@ impl FileTable {
             focus_handle: cx.focus_handle(),
             alt_down: false,
             pending_drag: None,
+            selected: BTreeSet::new(),
+            selection_anchor: None,
         }
     }
 
@@ -162,6 +167,68 @@ impl FileTable {
         self.pending_drag = None;
     }
 
+    fn select_row(&mut self, path: PathBuf, extend: bool, cx: &mut Context<Self>) {
+        let paths: Vec<PathBuf> = self
+            .library
+            .read(cx)
+            .active_state()
+            .results
+            .iter()
+            .map(|record| record.path.clone())
+            .collect();
+
+        if extend
+            && let Some(anchor) = self.selection_anchor.as_ref()
+            && let (Some(anchor_ix), Some(path_ix)) = (
+                paths.iter().position(|candidate| candidate == anchor),
+                paths.iter().position(|candidate| candidate == &path),
+            )
+        {
+            let (start, end) = if anchor_ix <= path_ix {
+                (anchor_ix, path_ix)
+            } else {
+                (path_ix, anchor_ix)
+            };
+            self.selected = paths[start..=end].iter().cloned().collect();
+        } else {
+            self.selected.clear();
+            self.selected.insert(path.clone());
+            self.selection_anchor = Some(path);
+        }
+
+        cx.notify();
+    }
+
+    fn selected_paths_for(&self, records: &[FileRecord], path: &Path) -> Vec<PathBuf> {
+        if self.selected.contains(path) {
+            records
+                .iter()
+                .filter(|record| self.selected.contains(record.path.as_path()))
+                .map(|record| record.path.clone())
+                .collect()
+        } else {
+            vec![path.to_path_buf()]
+        }
+    }
+
+    fn selected_convertible_paths_for(&self, records: &[FileRecord], path: &Path) -> Vec<PathBuf> {
+        if self.selected.contains(path) {
+            records
+                .iter()
+                .filter(|record| {
+                    self.selected.contains(record.path.as_path()) && record.is_convertible()
+                })
+                .map(|record| record.path.clone())
+                .collect()
+        } else {
+            records
+                .iter()
+                .find(|record| record.path == path && record.is_convertible())
+                .map(|record| vec![record.path.clone()])
+                .unwrap_or_default()
+        }
+    }
+
     pub(crate) fn cancel_file_drag(&mut self, cx: &mut Context<Self>) {
         self.clear_pending_drag();
         self.library
@@ -190,9 +257,16 @@ impl FileTable {
         }
 
         let path = pending.path.clone();
+        let drag_paths =
+            self.selected_paths_for(&self.library.read(cx).active_state().results, &path);
         self.clear_pending_drag();
-        self.library
-            .update(cx, |lib, cx| lib.begin_internal_file_drag(path.clone(), cx));
+        self.library.update(cx, |lib, cx| {
+            if drag_paths.len() == 1 {
+                lib.begin_internal_file_drag(drag_paths[0].clone(), cx);
+            } else {
+                lib.begin_internal_file_drag_files(drag_paths.clone(), cx);
+            }
+        });
         let (drag_finished_tx, mut drag_finished_rx) = mpsc::unbounded::<()>();
         let library = self.library.clone();
         cx.spawn(async move |_, cx| {
@@ -205,7 +279,7 @@ impl FileTable {
         let library = self.library.clone();
         window.on_next_frame(move |window, cx| {
             let drag_finished_tx = drag_finished_tx.clone();
-            if !native_drag::start_file_drag(vec![path.clone()], window, move || {
+            if !native_drag::start_file_drag(drag_paths.clone(), window, move || {
                 let _ = drag_finished_tx.unbounded_send(());
             }) {
                 library.update(cx, |lib, cx| lib.clear_internal_file_drag(cx));
@@ -242,6 +316,7 @@ impl Render for FileTable {
         for record in &state.results {
             let path = record.path.clone();
             let convertible = record.is_convertible();
+            let selected = self.selected.contains(path.as_path());
             let row_hover_bg = if convertible {
                 convertible_hover_bg
             } else {
@@ -254,8 +329,9 @@ impl Render for FileTable {
                 .child(record.name.clone());
             let open_path = record.path.clone();
             let drag_path = record.path.clone();
-            let convert_path = record.path.clone();
-            let convert_target = conversion_target_format(&record.path);
+            let select_path = record.path.clone();
+            let convert_paths = self.selected_convertible_paths_for(&state.results, &record.path);
+            let convert_target = conversion_target_label(&convert_paths);
             let table = cx.entity();
             let mut row = div()
                 .id(SharedString::from(format!("row:{}", path.display())))
@@ -263,6 +339,7 @@ impl Render for FileTable {
                 .flex_row()
                 .w_full()
                 .when(convertible, |s| s.bg(convertible_bg))
+                .when(selected, |s| s.bg(row_hover_bg))
                 .hover(move |s| s.bg(row_hover_bg))
                 .on_click(cx.listener(move |_, event: &ClickEvent, _, _| {
                     if event.click_count() == 2 {
@@ -271,8 +348,11 @@ impl Render for FileTable {
                 }))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, event: &MouseDownEvent, _, _| {
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                         if event.click_count == 1 {
+                            if event.modifiers.shift || !this.selected.contains(&select_path) {
+                                this.select_row(select_path.clone(), event.modifiers.shift, cx);
+                            }
                             this.start_pending_drag(drag_path.clone(), event.position);
                         }
                     }),
@@ -287,11 +367,11 @@ impl Render for FileTable {
                     }),
                 )
                 .context_menu(move |menu, _, _| {
-                    if !convertible {
+                    if convert_paths.is_empty() {
                         return menu;
                     }
 
-                    let path = convert_path.clone();
+                    let paths = convert_paths.clone();
                     let table = table.clone();
                     menu.item(
                         PopupMenuItem::new(SharedString::from(format!(
@@ -300,7 +380,11 @@ impl Render for FileTable {
                         .on_click(move |_, _, cx| {
                             cx.update_entity(&table, |this, cx| {
                                 this.library.update(cx, |lib, cx| {
-                                    lib.convert_active_unsupported_file(path.clone(), cx);
+                                    if paths.len() == 1 {
+                                        lib.convert_active_unsupported_file(paths[0].clone(), cx);
+                                    } else {
+                                        lib.convert_active_unsupported_files(paths.clone(), cx);
+                                    }
                                 });
                             });
                         }),
@@ -450,15 +534,12 @@ impl Render for FileTable {
                     .child(TableHeader::new().child(header_row)),
             )
             .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .child(
-                        div()
-                            .size_full()
-                            .overflow_y_scrollbar()
-                            .child(Table::new().child(body)),
-                    ),
+                div().flex_1().min_h_0().child(
+                    div()
+                        .size_full()
+                        .overflow_y_scrollbar()
+                        .child(Table::new().child(body)),
+                ),
             )
     }
 }
@@ -479,4 +560,14 @@ fn conversion_target_format(path: &Path) -> &'static str {
     } else {
         "opus"
     }
+}
+
+fn conversion_target_label(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| conversion_target_format(path))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("/")
 }
