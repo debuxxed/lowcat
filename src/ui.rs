@@ -246,6 +246,7 @@ impl Focusable for UI {
 
 impl Render for UI {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::perf::sample("ui.render.rate");
         let render_start = crate::perf::start();
         let filters_open = self.library.read(cx).filters_open();
         let internal_drag_active = self.library.read(cx).internal_file_drag_active();

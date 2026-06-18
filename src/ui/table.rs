@@ -41,6 +41,13 @@ struct PendingFileDrag {
     origin: Point<Pixels>,
 }
 
+struct TagWidthCache {
+    keys: Vec<String>,
+    editing: Option<(PathBuf, String)>,
+    row_count: usize,
+    widths: Vec<Pixels>,
+}
+
 pub struct FileTable {
     library: Entity<Library>,
     tag_input: Entity<InputState>,
@@ -53,6 +60,7 @@ pub struct FileTable {
     row_scroll_handle: VirtualListScrollHandle,
     row_sizes: Rc<Vec<Size<Pixels>>>,
     row_sizes_len: usize,
+    tag_width_cache: Option<TagWidthCache>,
 }
 
 impl FileTable {
@@ -95,7 +103,11 @@ impl FileTable {
     }
 
     pub fn new(library: Entity<Library>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        cx.observe(&library, |_, _, cx| cx.notify()).detach();
+        cx.observe(&library, |this, _, cx| {
+            this.tag_width_cache = None;
+            cx.notify();
+        })
+        .detach();
 
         let tag_input = cx.new(|cx| InputState::new(window, cx));
 
@@ -125,7 +137,48 @@ impl FileTable {
             row_scroll_handle: VirtualListScrollHandle::new(),
             row_sizes: Rc::new(Vec::new()),
             row_sizes_len: 0,
+            tag_width_cache: None,
         }
+    }
+
+    fn table_columns(&mut self, cx: &mut Context<Self>) -> (Vec<String>, Vec<Pixels>, usize) {
+        let editing = self.editing.clone();
+        let (keys, row_count, widths) = {
+            let state = self.library.read(cx).active_state();
+            let keys: Vec<String> = state.schema.keys().cloned().collect();
+            let row_count = state.results.len();
+
+            if let Some(cache) = self.tag_width_cache.as_ref()
+                && cache.keys == keys
+                && cache.editing == editing
+                && cache.row_count == row_count
+            {
+                return (cache.keys.clone(), cache.widths.clone(), cache.row_count);
+            }
+
+            let width_start = crate::perf::start();
+            let editing_ref = editing
+                .as_ref()
+                .map(|(path, key)| (path, key.as_str()));
+            let widths: Vec<Pixels> = keys
+                .iter()
+                .map(|key| Self::tag_column_width(state, key, editing_ref))
+                .collect();
+            crate::perf::finish("table.widths", width_start, || {
+                format!("rows={} keys={} cached=false", state.results.len(), keys.len())
+            });
+
+            (keys, row_count, widths)
+        };
+
+        self.tag_width_cache = Some(TagWidthCache {
+            keys: keys.clone(),
+            editing,
+            row_count,
+            widths: widths.clone(),
+        });
+
+        (keys, widths, row_count)
     }
 
     fn row_sizes(&mut self, len: usize) -> Rc<Vec<Size<Pixels>>> {
@@ -327,6 +380,7 @@ impl FileTable {
         tag_widths: Vec<Pixels>,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
+        crate::perf::sample("table.rows.rate");
         let rows_start = crate::perf::start();
         let (records, selected_convertible_paths, total_rows, visible_start, visible_end) = {
             let state = self.library.read(cx).active_state();
@@ -604,24 +658,9 @@ impl Focusable for FileTable {
 
 impl Render for FileTable {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::perf::sample("table.render.rate");
         let render_start = crate::perf::start();
-        let editing = self
-            .editing
-            .as_ref()
-            .map(|(path, key)| (path, key.as_str()));
-        let (keys, tag_widths, row_count) = {
-            let state = self.library.read(cx).active_state();
-            let keys: Vec<String> = state.schema.keys().cloned().collect();
-            let width_start = crate::perf::start();
-            let tag_widths: Vec<Pixels> = keys
-                .iter()
-                .map(|key| Self::tag_column_width(state, key, editing))
-                .collect();
-            crate::perf::finish("table.widths", width_start, || {
-                format!("rows={} keys={}", state.results.len(), keys.len())
-            });
-            (keys, tag_widths, state.results.len())
-        };
+        let (keys, tag_widths, row_count) = self.table_columns(cx);
 
         let mut header_row = TableRow::new().child(
             TableHead::new()
