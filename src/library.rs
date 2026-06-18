@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use futures::{StreamExt as _, channel::mpsc};
 use gpui::{AppContext as _, Context};
 
-use crate::backend::{Backend, import_requires_conversion, import_to_folder};
+use crate::backend::{
+    Backend, convert_unsupported_files, import_requires_conversion, import_to_folder,
+};
 use crate::model::{Category, CategoryState, FileRecord, tag_label};
 
 #[path = "config.rs"]
@@ -39,6 +41,10 @@ struct ImportBatchResult {
     category: Category,
     imported: bool,
     moved_from: Option<Category>,
+}
+
+struct ConvertBatchResult {
+    category: Category,
 }
 
 enum ImportProgressEvent {
@@ -88,6 +94,17 @@ impl Library {
 
     pub fn import_progress(&self) -> Option<&ImportProgress> {
         self.import_progress.as_ref()
+    }
+
+    pub fn active_unsupported_count(&self) -> usize {
+        self.states
+            .get(&self.active)
+            .map(|state| state.unsupported_count)
+            .unwrap_or_default()
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.importing
     }
 
     pub fn toggle_filters(&mut self, cx: &mut Context<Self>) {
@@ -260,6 +277,133 @@ impl Library {
         .detach();
     }
 
+    pub fn convert_active_unsupported(&mut self, cx: &mut Context<Self>) {
+        if self.importing || self.active_unsupported_count() == 0 {
+            cx.notify();
+            return;
+        }
+
+        let category = self.active;
+        let Some(folder) = self
+            .settings
+            .category_folder(category)
+            .map(Path::to_path_buf)
+        else {
+            cx.notify();
+            return;
+        };
+        let paths = self.backend.convertible_paths(category);
+        if paths.is_empty() {
+            cx.notify();
+            return;
+        }
+
+        self.importing = true;
+        self.import_progress = None;
+        cx.notify();
+
+        let (progress_tx, mut progress_rx) = mpsc::unbounded();
+        cx.spawn(async move |this, cx| {
+            while let Some(event) = progress_rx.next().await {
+                this.update(cx, |lib, cx| {
+                    lib.apply_import_progress(event, cx);
+                })
+                .ok();
+            }
+        })
+        .detach();
+
+        let convert_task = cx.background_spawn(async move {
+            let mut current_path: Option<PathBuf> = None;
+            let _ = convert_unsupported_files(&folder, paths, |path, progress| {
+                if current_path.as_deref() != Some(path) {
+                    current_path = Some(path.to_path_buf());
+                    let _ = progress_tx.unbounded_send(ImportProgressEvent::Start {
+                        file_name: file_name(path),
+                    });
+                }
+                let _ = progress_tx.unbounded_send(ImportProgressEvent::Progress(progress));
+                if progress >= 100. {
+                    let _ = progress_tx.unbounded_send(ImportProgressEvent::Finish);
+                    current_path = None;
+                }
+            });
+            ConvertBatchResult { category }
+        });
+
+        cx.spawn(async move |this, cx| {
+            let result = convert_task.await;
+            this.update(cx, |lib, cx| {
+                lib.finish_convert_unsupported(result, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn convert_active_unsupported_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.importing {
+            cx.notify();
+            return;
+        }
+
+        let category = self.active;
+        let Some(folder) = self
+            .settings
+            .category_folder(category)
+            .map(Path::to_path_buf)
+        else {
+            cx.notify();
+            return;
+        };
+        if !self
+            .backend
+            .convertible_paths(category)
+            .iter()
+            .any(|candidate| paths_equal(candidate, &path))
+        {
+            cx.notify();
+            return;
+        }
+
+        self.importing = true;
+        self.import_progress = None;
+        cx.notify();
+
+        let (progress_tx, mut progress_rx) = mpsc::unbounded();
+        cx.spawn(async move |this, cx| {
+            while let Some(event) = progress_rx.next().await {
+                this.update(cx, |lib, cx| {
+                    lib.apply_import_progress(event, cx);
+                })
+                .ok();
+            }
+        })
+        .detach();
+
+        let convert_task = cx.background_spawn(async move {
+            let _ = progress_tx.unbounded_send(ImportProgressEvent::Start {
+                file_name: file_name(&path),
+            });
+            let _ = convert_unsupported_files(&folder, vec![path], |_, progress| {
+                let _ = progress_tx.unbounded_send(ImportProgressEvent::Progress(progress));
+                if progress >= 100. {
+                    let _ = progress_tx.unbounded_send(ImportProgressEvent::Finish);
+                }
+            });
+            ConvertBatchResult { category }
+        });
+
+        cx.spawn(async move |this, cx| {
+            let result = convert_task.await;
+            this.update(cx, |lib, cx| {
+                lib.finish_convert_unsupported(result, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     pub fn set_category_folder(
         &mut self,
         category: Category,
@@ -369,10 +513,20 @@ impl Library {
         };
         let schema = display_schema(self.backend.schema_for(category));
         let results = display_records(self.backend.filter(category, &search, &selected));
+        let unsupported_count = self.backend.convertible_count(category);
         let state = self.states.entry(category).or_default();
         state.schema = schema;
         state.results = results;
+        state.unsupported_count = unsupported_count;
         Ok(())
+    }
+
+    fn finish_convert_unsupported(&mut self, result: ConvertBatchResult, cx: &mut Context<Self>) {
+        self.importing = false;
+        self.import_progress = None;
+        let _ = self.backend.refresh_category(result.category);
+        let _ = self.refresh_category_state(result.category);
+        cx.notify();
     }
 
     fn internal_drag_origin(&self, paths: &[PathBuf]) -> Option<Category> {
@@ -386,9 +540,11 @@ impl Library {
     fn load_category_state(&self, category: Category) -> CategoryState {
         let schema = display_schema(self.backend.schema_for(category));
         let results = display_records(self.backend.filter(category, "", &BTreeMap::new()));
+        let unsupported_count = self.backend.convertible_count(category);
         CategoryState {
             schema,
             results,
+            unsupported_count,
             ..Default::default()
         }
     }
@@ -574,6 +730,33 @@ mod tests {
                 ("aaa.flac".to_string(), false)
             ]
         );
+        let unsupported_count = library.read_with(cx, |lib, _| lib.active_unsupported_count());
+        assert_eq!(unsupported_count, 1);
+    }
+
+    #[gpui::test]
+    fn unsupported_count_ignores_active_search(cx: &mut gpui::TestAppContext) {
+        let settings_path = settings_path("unsupported-count");
+        let (music_dir, _) = settings_with_folders(&settings_path);
+        fixture(&music_dir, "native.flac", &[("GENRE", "Ambient")]);
+        fixture(&music_dir, "hidden.wav", &[]);
+
+        let library = cx.new(|_| Library::new_with_settings_path(settings_path));
+        library.update(cx, |lib, cx| lib.set_search("native".to_string(), cx));
+
+        let (visible, unsupported_count) = library.read_with(cx, |lib, _| {
+            (
+                lib.active_state()
+                    .results
+                    .iter()
+                    .map(|record| record.name.clone())
+                    .collect::<Vec<_>>(),
+                lib.active_unsupported_count(),
+            )
+        });
+
+        assert_eq!(visible, vec!["native.flac"]);
+        assert_eq!(unsupported_count, 1);
     }
 
     #[gpui::test]

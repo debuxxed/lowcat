@@ -13,6 +13,7 @@ use gpui::{
 use gpui_component::{
     ActiveTheme as _, Sizable, StyledExt,
     input::{Input, InputEvent, InputState},
+    menu::{ContextMenuExt as _, PopupMenuItem},
     scroll::ScrollableElement,
     table::*,
 };
@@ -253,6 +254,9 @@ impl Render for FileTable {
                 .child(record.name.clone());
             let open_path = record.path.clone();
             let drag_path = record.path.clone();
+            let convert_path = record.path.clone();
+            let convert_target = conversion_target_format(&record.path);
+            let table = cx.entity();
             let mut row = div()
                 .id(SharedString::from(format!("row:{}", path.display())))
                 .flex()
@@ -282,6 +286,26 @@ impl Render for FileTable {
                         this.clear_pending_drag();
                     }),
                 )
+                .context_menu(move |menu, _, _| {
+                    if !convertible {
+                        return menu;
+                    }
+
+                    let path = convert_path.clone();
+                    let table = table.clone();
+                    menu.item(
+                        PopupMenuItem::new(SharedString::from(format!(
+                            "Convert to {convert_target}"
+                        )))
+                        .on_click(move |_, _, cx| {
+                            cx.update_entity(&table, |this, cx| {
+                                this.library.update(cx, |lib, cx| {
+                                    lib.convert_active_unsupported_file(path.clone(), cx);
+                                });
+                            });
+                        }),
+                    )
+                })
                 .child(
                     div()
                         .flex()
@@ -419,12 +443,22 @@ impl Render for FileTable {
             .track_focus(&self.focus_handle)
             .flex_1()
             .min_h_0()
+            .v_flex()
             .child(
-                div().size_full().overflow_y_scrollbar().child(
-                    Table::new()
-                        .child(TableHeader::new().child(header_row))
-                        .child(body),
-                ),
+                Table::new()
+                    .flex_shrink_0()
+                    .child(TableHeader::new().child(header_row)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        div()
+                            .size_full()
+                            .overflow_y_scrollbar()
+                            .child(Table::new().child(body)),
+                    ),
             )
     }
 }
@@ -432,5 +466,17 @@ impl Render for FileTable {
 fn open_in_default_app(path: &Path) {
     if let Err(err) = open::that(path) {
         eprintln!("failed to open {}: {err}", path.display());
+    }
+}
+
+fn conversion_target_format(path: &Path) -> &'static str {
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
+    {
+        "flac"
+    } else {
+        "opus"
     }
 }

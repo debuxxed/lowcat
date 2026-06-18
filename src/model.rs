@@ -71,6 +71,7 @@ pub struct CategoryState {
     pub selected: BTreeMap<String, BTreeSet<String>>,
     pub search: String,
     pub results: Vec<FileRecord>,
+    pub unsupported_count: usize,
 }
 
 pub fn canonical_tag_key(key: &str) -> Option<&'static str> {

@@ -22,6 +22,11 @@ pub struct ImportResult {
     pub converted: bool,
 }
 
+pub struct ConvertUnsupportedResult {
+    pub converted: usize,
+    pub failed: usize,
+}
+
 impl Backend {
     pub fn new() -> Self {
         Self::default()
@@ -124,6 +129,31 @@ impl Backend {
             .into_iter()
             .map(|(key, values)| (key, values.into_iter().collect()))
             .collect()
+    }
+
+    pub fn convertible_count(&self, category: Category) -> usize {
+        self.files
+            .get(&category)
+            .map(|records| {
+                records
+                    .iter()
+                    .filter(|record| record.is_convertible())
+                    .count()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn convertible_paths(&self, category: Category) -> Vec<PathBuf> {
+        self.files
+            .get(&category)
+            .map(|records| {
+                records
+                    .iter()
+                    .filter(|record| record.is_convertible())
+                    .map(|record| record.path.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn add_tag(
@@ -229,6 +259,41 @@ pub fn import_requires_conversion(path: &Path) -> bool {
     !is_library_file(path)
 }
 
+pub fn convert_unsupported_files(
+    folder: &Path,
+    sources: Vec<PathBuf>,
+    mut on_conversion_progress: impl FnMut(&Path, f32),
+) -> io::Result<ConvertUnsupportedResult> {
+    if !folder.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "category folder does not exist",
+        ));
+    }
+
+    let mut result = ConvertUnsupportedResult {
+        converted: 0,
+        failed: 0,
+    };
+    for source in sources {
+        if is_library_file(&source) || !source.is_file() || !probe_is_audio(&source) {
+            continue;
+        }
+
+        match convert_unsupported_file(&source, folder, |progress| {
+            on_conversion_progress(&source, progress);
+        }) {
+            Ok(()) => result.converted += 1,
+            Err(error) => {
+                result.failed += 1;
+                eprintln!("failed to convert {}: {error}", source.display());
+            }
+        }
+    }
+
+    Ok(result)
+}
+
 fn probe_is_audio(path: &Path) -> bool {
     Command::new("ffprobe")
         .args([
@@ -247,10 +312,54 @@ fn probe_is_audio(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn convert_to_opus(
+fn convert_unsupported_file(
+    source: &Path,
+    folder: &Path,
+    on_progress: impl FnMut(f32),
+) -> io::Result<()> {
+    let extension = if extension(source).as_deref() == Some("wav") {
+        "flac"
+    } else {
+        "opus"
+    };
+    let stem = source
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("converted");
+    let final_path = unique_destination(folder, stem, extension);
+    let temp_path = temp_destination(folder, extension);
+
+    let produced = if extension == "flac" {
+        convert_to_flac(source, &temp_path, on_progress)
+    } else {
+        convert_to_opus(source, &temp_path, on_progress)
+    };
+    if let Err(error) = produced.and_then(|()| verify_exists(&temp_path)) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+
+    if let Err(error) = fs::rename(&temp_path, &final_path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+
+    fs::remove_file(source)
+}
+
+fn convert_to_opus(source: &Path, dest: &Path, on_progress: impl FnMut(f32)) -> io::Result<()> {
+    convert_media(source, dest, &["-vn", "-c:a", "libopus", "-y"], on_progress)
+}
+
+fn convert_to_flac(source: &Path, dest: &Path, on_progress: impl FnMut(f32)) -> io::Result<()> {
+    convert_media(source, dest, &["-vn", "-c:a", "flac", "-y"], on_progress)
+}
+
+fn convert_media(
     source: &Path,
     dest: &Path,
-    on_progress: &mut impl FnMut(f32),
+    output_args: &[&str],
+    mut on_progress: impl FnMut(f32),
 ) -> io::Result<()> {
     let duration_us = media_duration_us(source);
     on_progress(0.);
@@ -265,7 +374,7 @@ fn convert_to_opus(
             "-i",
         ])
         .arg(source)
-        .args(["-vn", "-c:a", "libopus", "-y"])
+        .args(output_args)
         .arg(dest)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -821,6 +930,29 @@ mod tests {
             names(backend.filter(Category::Music, "", &BTreeMap::new())),
             vec!["clip.opus"]
         );
+    }
+
+    #[test]
+    fn convert_unsupported_uses_flac_for_wav_and_opus_for_other_formats() {
+        let dir = unique_dir("convert-unsupported");
+        fixture(&dir, "voice.wav", &[]);
+        fixture(&dir, "loop.ogg", &[]);
+
+        let mut backend = Backend::new();
+        backend
+            .set_category_folder(Category::Music, dir.clone())
+            .unwrap();
+
+        let result =
+            convert_unsupported_files(&dir, backend.convertible_paths(Category::Music), |_, _| {})
+                .unwrap();
+
+        assert_eq!(result.converted, 2);
+        assert_eq!(result.failed, 0);
+        assert!(!dir.join("voice.wav").exists());
+        assert!(dir.join("voice.flac").is_file());
+        assert!(!dir.join("loop.ogg").exists());
+        assert!(dir.join("loop.opus").is_file());
     }
 
     #[test]
