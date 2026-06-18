@@ -45,27 +45,44 @@ impl Backend {
     }
 
     pub fn refresh_category(&mut self, category: Category) -> io::Result<()> {
+        let refresh_start = crate::perf::start();
         let Some(folder) = self.folders.get(&category) else {
             self.files.insert(category, Vec::new());
+            crate::perf::finish("backend.refresh_category", refresh_start, || {
+                format!(
+                    "category={} records=0 missing_folder=true",
+                    category.label()
+                )
+            });
             return Ok(());
         };
 
         if !folder.is_dir() {
             self.files.insert(category, Vec::new());
+            crate::perf::finish("backend.refresh_category", refresh_start, || {
+                format!(
+                    "category={} records=0 invalid_folder=true",
+                    category.label()
+                )
+            });
             return Ok(());
         }
 
         let mut records = Vec::new();
+        let mut files_seen = 0usize;
+        let mut convertible_seen = 0usize;
         for entry in fs::read_dir(folder)? {
             let entry = entry?;
             let path = entry.path();
             if !entry.file_type()?.is_file() {
                 continue;
             }
+            files_seen += 1;
 
             let support = if is_library_file(&path) {
                 FileSupport::Native
             } else if probe_is_audio(&path) {
+                convertible_seen += 1;
                 FileSupport::Convertible
             } else {
                 continue;
@@ -83,7 +100,14 @@ impl Backend {
                 .then_with(|| a.name.cmp(&b.name))
                 .then_with(|| a.path.cmp(&b.path))
         });
+        let records_len = records.len();
         self.files.insert(category, records);
+        crate::perf::finish("backend.refresh_category", refresh_start, || {
+            format!(
+                "category={} records={records_len} files_seen={files_seen} convertible={convertible_seen}",
+                category.label()
+            )
+        });
         Ok(())
     }
 

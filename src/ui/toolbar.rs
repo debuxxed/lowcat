@@ -51,6 +51,7 @@ impl Toolbar {
 
 impl Render for Toolbar {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let render_start = crate::perf::start();
         let chips: Vec<(String, String)> = {
             let state = self.library.read(cx).active_state();
             state
@@ -59,6 +60,7 @@ impl Render for Toolbar {
                 .flat_map(|(key, values)| values.iter().map(move |v| (key.clone(), v.clone())))
                 .collect()
         };
+        let chips_len = chips.len();
         let chip_delete_bg = red().opacity(0.18);
 
         let search = div()
@@ -136,7 +138,7 @@ impl Render for Toolbar {
                 this.library.update(cx, |lib, cx| lib.toggle_filters(cx));
             }));
 
-        div()
+        let toolbar = div()
             .h_flex()
             .w_full()
             .items_center()
@@ -145,6 +147,11 @@ impl Render for Toolbar {
             .px(CONTENT_PX)
             .child(filter_button)
             .child(chip_row)
-            .child(search)
+            .child(search);
+
+        crate::perf::finish("toolbar.render", render_start, || {
+            format!("chips={chips_len} alt_down={}", self.alt_down)
+        });
+        toolbar
     }
 }

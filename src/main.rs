@@ -1,6 +1,7 @@
 mod backend;
 mod library;
 mod model;
+mod perf;
 mod ui;
 
 use std::borrow::Cow;

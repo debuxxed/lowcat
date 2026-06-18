@@ -1,22 +1,25 @@
 mod native_drag;
 
 use std::collections::BTreeSet;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use futures::{StreamExt as _, channel::mpsc};
 use gpui::{
-    App, AppContext as _, ClickEvent, Context, Entity, FocusHandle, Focusable,
+    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, SharedString,
+    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, SharedString, Size,
     StatefulInteractiveElement as _, Styled, Window, div, hsla, prelude::FluentBuilder as _, px,
-    red,
+    red, size,
 };
 use gpui_component::{
-    ActiveTheme as _, Sizable, StyledExt,
+    ActiveTheme as _, Sizable, StyledExt, VirtualListScrollHandle,
     input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt as _, PopupMenuItem},
-    scroll::ScrollableElement,
+    scroll::{ScrollableElement, ScrollbarAxis},
     table::*,
+    v_virtual_list,
 };
 
 use crate::ui::CONTENT_PX;
@@ -30,9 +33,11 @@ const TAG_GAP_WIDTH: f32 = 4.;
 const TAG_TEXT_WIDTH: f32 = 7.;
 const TAG_EDITOR_WIDTH: f32 = 90.;
 const FILE_DRAG_THRESHOLD_PX: f32 = 4.;
+const ROW_HEIGHT: Pixels = px(32.);
 
 struct PendingFileDrag {
     path: PathBuf,
+    paths: Vec<PathBuf>,
     origin: Point<Pixels>,
 }
 
@@ -45,6 +50,9 @@ pub struct FileTable {
     pending_drag: Option<PendingFileDrag>,
     selected: BTreeSet<PathBuf>,
     selection_anchor: Option<PathBuf>,
+    row_scroll_handle: VirtualListScrollHandle,
+    row_sizes: Rc<Vec<Size<Pixels>>>,
+    row_sizes_len: usize,
 }
 
 impl FileTable {
@@ -114,7 +122,18 @@ impl FileTable {
             pending_drag: None,
             selected: BTreeSet::new(),
             selection_anchor: None,
+            row_scroll_handle: VirtualListScrollHandle::new(),
+            row_sizes: Rc::new(Vec::new()),
+            row_sizes_len: 0,
         }
+    }
+
+    fn row_sizes(&mut self, len: usize) -> Rc<Vec<Size<Pixels>>> {
+        if self.row_sizes_len != len {
+            self.row_sizes = Rc::new((0..len).map(|_| size(px(0.), ROW_HEIGHT)).collect());
+            self.row_sizes_len = len;
+        }
+        self.row_sizes.clone()
     }
 
     pub(crate) fn set_alt_down(&mut self, alt_down: bool, cx: &mut Context<Self>) {
@@ -159,8 +178,18 @@ impl FileTable {
         }
     }
 
-    fn start_pending_drag(&mut self, path: PathBuf, origin: Point<Pixels>) {
-        self.pending_drag = Some(PendingFileDrag { path, origin });
+    fn start_pending_drag(&mut self, path: PathBuf, origin: Point<Pixels>, cx: &mut Context<Self>) {
+        let start = crate::perf::start();
+        let paths = self.selected_paths_for(&self.library.read(cx).active_state().results, &path);
+        let path_count = paths.len();
+        self.pending_drag = Some(PendingFileDrag {
+            path,
+            paths,
+            origin,
+        });
+        crate::perf::finish("table.pending_drag", start, || {
+            format!("paths={path_count}")
+        });
     }
 
     fn clear_pending_drag(&mut self) {
@@ -168,6 +197,7 @@ impl FileTable {
     }
 
     fn select_row(&mut self, path: PathBuf, extend: bool, cx: &mut Context<Self>) {
+        let start = crate::perf::start();
         let paths: Vec<PathBuf> = self
             .library
             .read(cx)
@@ -197,10 +227,13 @@ impl FileTable {
         }
 
         cx.notify();
+        crate::perf::finish("table.select_row", start, || {
+            format!("rows={} selected={}", paths.len(), self.selected.len())
+        });
     }
 
     fn selected_paths_for(&self, records: &[FileRecord], path: &Path) -> Vec<PathBuf> {
-        if self.selected.contains(path) {
+        if self.selected.len() > 1 && self.selected.contains(path) {
             records
                 .iter()
                 .filter(|record| self.selected.contains(record.path.as_path()))
@@ -208,24 +241,6 @@ impl FileTable {
                 .collect()
         } else {
             vec![path.to_path_buf()]
-        }
-    }
-
-    fn selected_convertible_paths_for(&self, records: &[FileRecord], path: &Path) -> Vec<PathBuf> {
-        if self.selected.contains(path) {
-            records
-                .iter()
-                .filter(|record| {
-                    self.selected.contains(record.path.as_path()) && record.is_convertible()
-                })
-                .map(|record| record.path.clone())
-                .collect()
-        } else {
-            records
-                .iter()
-                .find(|record| record.path == path && record.is_convertible())
-                .map(|record| vec![record.path.clone()])
-                .unwrap_or_default()
         }
     }
 
@@ -250,15 +265,20 @@ impl FileTable {
             return;
         };
 
+        let move_start = crate::perf::start();
         let dx = event.position.x.as_f32() - pending.origin.x.as_f32();
         let dy = event.position.y.as_f32() - pending.origin.y.as_f32();
         if dx.hypot(dy) < FILE_DRAG_THRESHOLD_PX {
+            crate::perf::finish("table.drag_move", move_start, || {
+                "below_threshold".to_string()
+            });
             return;
         }
 
+        let drag_start = crate::perf::start();
         let path = pending.path.clone();
-        let drag_paths =
-            self.selected_paths_for(&self.library.read(cx).active_state().results, &path);
+        let drag_paths = pending.paths.clone();
+        let drag_path_count = drag_paths.len();
         self.clear_pending_drag();
         self.library.update(cx, |lib, cx| {
             if drag_paths.len() == 1 {
@@ -278,105 +298,174 @@ impl FileTable {
 
         let library = self.library.clone();
         window.on_next_frame(move |window, cx| {
+            let native_start = crate::perf::start();
             let drag_finished_tx = drag_finished_tx.clone();
-            if !native_drag::start_file_drag(drag_paths.clone(), window, move || {
+            let ok = native_drag::start_file_drag(drag_paths.clone(), window, move || {
                 let _ = drag_finished_tx.unbounded_send(());
-            }) {
+            });
+            crate::perf::finish("table.native_file_drag", native_start, || {
+                format!("paths={} ok={ok}", drag_paths.len())
+            });
+            if !ok {
                 library.update(cx, |lib, cx| lib.clear_internal_file_drag(cx));
                 eprintln!("native file drag unavailable for {}", path.display());
             }
         });
         window.refresh();
+        crate::perf::finish("table.drag_start", drag_start, || {
+            format!("paths={drag_path_count}")
+        });
+        crate::perf::finish("table.drag_move", move_start, || {
+            format!("started paths={drag_path_count}")
+        });
     }
-}
 
-impl Focusable for FileTable {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
-
-impl Render for FileTable {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let state = self.library.read(cx).active_state();
-        let keys: Vec<String> = state.schema.keys().cloned().collect();
-        let editing = self
-            .editing
-            .as_ref()
-            .map(|(path, key)| (path, key.as_str()));
-        let tag_widths: Vec<Pixels> = keys
-            .iter()
-            .map(|key| Self::tag_column_width(state, key, editing))
-            .collect();
-        let chip_delete_bg = red().opacity(0.18);
-        let convertible_bg = hsla(0.095, 1., 0.55, 0.12);
-        let convertible_hover_bg = hsla(0.095, 1., 0.55, 0.2);
-
-        let mut body = TableBody::new();
-        for record in &state.results {
-            let path = record.path.clone();
-            let convertible = record.is_convertible();
-            let selected = self.selected.contains(path.as_path());
-            let row_hover_bg = if convertible {
-                convertible_hover_bg
+    fn render_rows(
+        &mut self,
+        range: Range<usize>,
+        keys: Vec<String>,
+        tag_widths: Vec<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let rows_start = crate::perf::start();
+        let (records, selected_convertible_paths, total_rows, visible_start, visible_end) = {
+            let state = self.library.read(cx).active_state();
+            let total_rows = state.results.len();
+            let visible_start = range.start.min(total_rows);
+            let visible_end = range.end.min(total_rows).max(visible_start);
+            let selected_convertible_paths = if self.selected.is_empty() {
+                Vec::new()
             } else {
-                cx.theme().table_hover
+                state
+                    .results
+                    .iter()
+                    .filter(|record| {
+                        self.selected.contains(record.path.as_path()) && record.is_convertible()
+                    })
+                    .map(|record| record.path.clone())
+                    .collect()
             };
-            let name = div()
-                .w_full()
-                .min_w_0()
-                .truncate()
-                .child(record.name.clone());
-            let open_path = record.path.clone();
-            let drag_path = record.path.clone();
-            let select_path = record.path.clone();
-            let convert_paths = self.selected_convertible_paths_for(&state.results, &record.path);
-            let convert_target = conversion_target_label(&convert_paths);
-            let table = cx.entity();
-            let mut row = div()
-                .id(SharedString::from(format!("row:{}", path.display())))
-                .flex()
-                .flex_row()
-                .w_full()
-                .when(convertible, |s| s.bg(convertible_bg))
-                .when(selected, |s| s.bg(row_hover_bg))
-                .hover(move |s| s.bg(row_hover_bg))
-                .on_click(cx.listener(move |_, event: &ClickEvent, _, _| {
-                    if event.click_count() == 2 {
-                        open_in_default_app(&open_path);
-                    }
-                }))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                        if event.click_count == 1 {
-                            if event.modifiers.shift || !this.selected.contains(&select_path) {
-                                this.select_row(select_path.clone(), event.modifiers.shift, cx);
-                            }
-                            this.start_pending_drag(drag_path.clone(), event.position);
-                        }
-                    }),
-                )
-                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
-                    this.maybe_start_file_drag(event, window, cx);
-                }))
-                .on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(|this, _: &MouseUpEvent, _, _| {
-                        this.clear_pending_drag();
-                    }),
-                )
-                .context_menu(move |menu, _, _| {
-                    if convert_paths.is_empty() {
-                        return menu;
-                    }
 
-                    let paths = convert_paths.clone();
-                    let table = table.clone();
-                    menu.item(
-                        PopupMenuItem::new(SharedString::from(format!(
-                            "Convert to {convert_target}"
-                        )))
+            (
+                state.results[visible_start..visible_end].to_vec(),
+                selected_convertible_paths,
+                total_rows,
+                visible_start,
+                visible_end,
+            )
+        };
+
+        let rows = records
+            .iter()
+            .enumerate()
+            .map(|(offset, record)| {
+                self.render_record(
+                    visible_start + offset,
+                    record,
+                    &keys,
+                    &tag_widths,
+                    &selected_convertible_paths,
+                    cx,
+                )
+            })
+            .collect();
+
+        crate::perf::finish("table.rows", rows_start, || {
+            format!(
+                "visible={}..{} total={} keys={} selected={}",
+                visible_start,
+                visible_end,
+                total_rows,
+                keys.len(),
+                self.selected.len()
+            )
+        });
+        rows
+    }
+
+    fn render_record(
+        &self,
+        row_ix: usize,
+        record: &FileRecord,
+        keys: &[String],
+        tag_widths: &[Pixels],
+        selected_convertible_paths: &[PathBuf],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let path = record.path.clone();
+        let convertible = record.is_convertible();
+        let selected = self.selected.contains(path.as_path());
+        let row_hover_bg = if convertible {
+            hsla(0.095, 1., 0.55, 0.2)
+        } else {
+            cx.theme().table_hover
+        };
+        let convertible_bg = hsla(0.095, 1., 0.55, 0.12);
+        let chip_delete_bg = red().opacity(0.18);
+        let name = div()
+            .w_full()
+            .min_w_0()
+            .truncate()
+            .child(record.name.clone());
+        let open_path = record.path.clone();
+        let drag_path = record.path.clone();
+        let select_path = record.path.clone();
+        let convert_paths = if selected && !selected_convertible_paths.is_empty() {
+            selected_convertible_paths.to_vec()
+        } else if record.is_convertible() {
+            vec![record.path.clone()]
+        } else {
+            Vec::new()
+        };
+        let convert_target = conversion_target_label(&convert_paths);
+        let table = cx.entity();
+        let mut row = div()
+            .id(SharedString::from(format!("row:{}", path.display())))
+            .h(ROW_HEIGHT)
+            .flex()
+            .flex_row()
+            .w_full()
+            .text_sm()
+            .when(row_ix > 0, |s| {
+                s.border_t_1().border_color(cx.theme().table_row_border)
+            })
+            .when(convertible, |s| s.bg(convertible_bg))
+            .when(selected, |s| s.bg(row_hover_bg))
+            .hover(move |s| s.bg(row_hover_bg))
+            .on_click(cx.listener(move |_, event: &ClickEvent, _, _| {
+                if event.click_count() == 2 {
+                    open_in_default_app(&open_path);
+                }
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    if event.click_count == 1 {
+                        if event.modifiers.shift || !this.selected.contains(&select_path) {
+                            this.select_row(select_path.clone(), event.modifiers.shift, cx);
+                        }
+                        this.start_pending_drag(drag_path.clone(), event.position, cx);
+                    }
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                this.maybe_start_file_drag(event, window, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, _| {
+                    this.clear_pending_drag();
+                }),
+            )
+            .context_menu(move |menu, _, _| {
+                if convert_paths.is_empty() {
+                    return menu;
+                }
+
+                let paths = convert_paths.clone();
+                let table = table.clone();
+                menu.item(
+                    PopupMenuItem::new(SharedString::from(format!("Convert to {convert_target}")))
                         .on_click(move |_, _, cx| {
                             cx.update_entity(&table, |this, cx| {
                                 this.library.update(cx, |lib, cx| {
@@ -388,122 +477,151 @@ impl Render for FileTable {
                                 });
                             });
                         }),
-                    )
-                })
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .flex_1()
-                        .min_w_0()
-                        .px(CONTENT_PX)
-                        .py(px(4.))
-                        .child(name),
-                );
-
-            for (key, tag_width) in keys.iter().zip(&tag_widths) {
-                let group = SharedString::from(format!("cell:{}:{key}", path.display()));
-                let is_editing = self
-                    .editing
-                    .as_ref()
-                    .is_some_and(|(p, k)| p == &path && k == key);
-
-                let mut cell = div()
-                    .id(group.clone())
-                    .group(group.clone())
-                    .h_flex()
-                    .flex_nowrap()
+                )
+            })
+            .child(
+                div()
+                    .h_full()
+                    .flex()
                     .items_center()
-                    .gap_1();
+                    .flex_1()
+                    .min_w_0()
+                    .px(CONTENT_PX)
+                    .py(px(4.))
+                    .child(name),
+            );
 
-                if let Some(values) = record.tags.get(key) {
-                    for value in values {
-                        let (key, value, path) = (key.clone(), value.clone(), path.clone());
+        for (key, tag_width) in keys.iter().zip(tag_widths) {
+            let group = SharedString::from(format!("cell:{}:{key}", path.display()));
+            let is_editing = self
+                .editing
+                .as_ref()
+                .is_some_and(|(p, k)| p == &path && k == key);
 
-                        cell = cell.child(
-                            div()
-                                .id(SharedString::from(format!(
-                                    "chip:{}:{key}:{value}",
-                                    path.display()
-                                )))
-                                .px_1p5()
-                                .rounded_md()
-                                .text_xs()
-                                .whitespace_nowrap()
-                                .bg(cx.theme().muted)
-                                .text_color(cx.theme().muted_foreground)
-                                .cursor_pointer()
-                                .child(SharedString::from(value.clone()))
-                                .when(self.alt_down, |this| {
-                                    this.hover(move |this| this.bg(chip_delete_bg))
-                                })
-                                .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                                    if event.modifiers().alt {
-                                        let path = path.clone();
-                                        this.library.update(cx, |lib, cx| {
-                                            lib.remove_tag(path, &key, &value, cx)
-                                        });
-                                    }
-                                })),
-                        );
-                    }
-                }
+            let mut cell = div()
+                .id(group.clone())
+                .group(group.clone())
+                .h_flex()
+                .flex_nowrap()
+                .items_center()
+                .gap_1();
 
-                if is_editing {
+            if let Some(values) = record.tags.get(key) {
+                for value in values {
+                    let (key, value, path) = (key.clone(), value.clone(), path.clone());
+
                     cell = cell.child(
                         div()
-                            .h_flex()
-                            .items_center()
-                            .w(px(TAG_EDITOR_WIDTH))
-                            .flex_shrink_0()
-                            .px_1p5()
-                            .rounded_md()
-                            .text_xs()
-                            .bg(cx.theme().muted)
-                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                                if event.keystroke.key == "escape" {
-                                    this.cancel_tag(window, cx);
-                                }
-                            }))
-                            .child(Input::new(&self.tag_input).appearance(false).xsmall()),
-                    );
-                } else if !convertible {
-                    let (key, path) = (key.clone(), path.clone());
-                    cell = cell.child(
-                        div()
-                            .id(SharedString::from(format!("add:{}:{key}", path.display())))
+                            .id(SharedString::from(format!(
+                                "chip:{}:{key}:{value}",
+                                path.display()
+                            )))
                             .px_1p5()
                             .rounded_md()
                             .text_xs()
                             .whitespace_nowrap()
+                            .bg(cx.theme().muted)
                             .text_color(cx.theme().muted_foreground)
                             .cursor_pointer()
-                            .opacity(0.)
-                            .group_hover(group.clone(), |s| s.opacity(1.))
-                            .hover(|s| s.text_color(cx.theme().foreground))
-                            .child("+")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.start_editing(path.clone(), key.clone(), window, cx);
+                            .child(SharedString::from(value.clone()))
+                            .when(self.alt_down, |this| {
+                                this.hover(move |this| this.bg(chip_delete_bg))
+                            })
+                            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                                if event.modifiers().alt {
+                                    let path = path.clone();
+                                    this.library.update(cx, |lib, cx| {
+                                        lib.remove_tag(path, &key, &value, cx)
+                                    });
+                                }
                             })),
                     );
                 }
+            }
 
-                row = row.child(
+            if is_editing {
+                cell = cell.child(
                     div()
-                        .flex()
+                        .h_flex()
                         .items_center()
-                        .w(*tag_width)
-                        .min_w(*tag_width)
+                        .w(px(TAG_EDITOR_WIDTH))
                         .flex_shrink_0()
-                        .px(CONTENT_PX)
-                        .py(px(4.))
-                        .child(cell),
+                        .px_1p5()
+                        .rounded_md()
+                        .text_xs()
+                        .bg(cx.theme().muted)
+                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                            if event.keystroke.key == "escape" {
+                                this.cancel_tag(window, cx);
+                            }
+                        }))
+                        .child(Input::new(&self.tag_input).appearance(false).xsmall()),
+                );
+            } else if !convertible {
+                let (key, path) = (key.clone(), path.clone());
+                cell = cell.child(
+                    div()
+                        .id(SharedString::from(format!("add:{}:{key}", path.display())))
+                        .px_1p5()
+                        .rounded_md()
+                        .text_xs()
+                        .whitespace_nowrap()
+                        .text_color(cx.theme().muted_foreground)
+                        .cursor_pointer()
+                        .opacity(0.)
+                        .group_hover(group.clone(), |s| s.opacity(1.))
+                        .hover(|s| s.text_color(cx.theme().foreground))
+                        .child("+")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.start_editing(path.clone(), key.clone(), window, cx);
+                        })),
                 );
             }
 
-            body = body
-                .child(TableRow::new().child(TableCell::new().w_full().min_w_0().p_0().child(row)));
+            row = row.child(
+                div()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .w(*tag_width)
+                    .min_w(*tag_width)
+                    .flex_shrink_0()
+                    .px(CONTENT_PX)
+                    .py(px(4.))
+                    .child(cell),
+            );
         }
+
+        row.into_any_element()
+    }
+}
+
+impl Focusable for FileTable {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for FileTable {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let render_start = crate::perf::start();
+        let editing = self
+            .editing
+            .as_ref()
+            .map(|(path, key)| (path, key.as_str()));
+        let (keys, tag_widths, row_count) = {
+            let state = self.library.read(cx).active_state();
+            let keys: Vec<String> = state.schema.keys().cloned().collect();
+            let width_start = crate::perf::start();
+            let tag_widths: Vec<Pixels> = keys
+                .iter()
+                .map(|key| Self::tag_column_width(state, key, editing))
+                .collect();
+            crate::perf::finish("table.widths", width_start, || {
+                format!("rows={} keys={}", state.results.len(), keys.len())
+            });
+            (keys, tag_widths, state.results.len())
+        };
 
         let mut header_row = TableRow::new().child(
             TableHead::new()
@@ -523,7 +641,31 @@ impl Render for FileTable {
             );
         }
 
-        div()
+        let virtual_keys = keys.clone();
+        let virtual_tag_widths = tag_widths.clone();
+        let row_sizes = self.row_sizes(row_count);
+        let row_scroll_handle = self.row_scroll_handle.clone();
+        let rows = div()
+            .size_full()
+            .child(
+                v_virtual_list(
+                    cx.entity().clone(),
+                    "file-table-rows",
+                    row_sizes,
+                    move |this, range, _, cx| {
+                        this.render_rows(
+                            range,
+                            virtual_keys.clone(),
+                            virtual_tag_widths.clone(),
+                            cx,
+                        )
+                    },
+                )
+                .track_scroll(&row_scroll_handle),
+            )
+            .scrollbar(&row_scroll_handle, ScrollbarAxis::Vertical);
+
+        let table = div()
             .track_focus(&self.focus_handle)
             .flex_1()
             .min_h_0()
@@ -534,13 +676,21 @@ impl Render for FileTable {
                     .child(TableHeader::new().child(header_row)),
             )
             .child(
-                div().flex_1().min_h_0().child(
-                    div()
-                        .size_full()
-                        .overflow_y_scrollbar()
-                        .child(Table::new().child(body)),
-                ),
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(div().size_full().child(rows)),
+            );
+
+        crate::perf::finish("table.render", render_start, || {
+            format!(
+                "rows={} keys={} editing={}",
+                row_count,
+                keys.len(),
+                self.editing.is_some()
             )
+        });
+        table
     }
 }
 

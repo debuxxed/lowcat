@@ -476,18 +476,48 @@ impl Library {
     }
 
     fn refresh_category_state(&mut self, category: Category) -> io::Result<()> {
+        let total_start = crate::perf::start();
         let (search, selected) = if let Some(state) = self.states.get(&category) {
             (state.search.clone(), state.selected.clone())
         } else {
             (String::new(), BTreeMap::new())
         };
+        let schema_start = crate::perf::start();
         let schema = display_schema(self.backend.schema_for(category));
+        crate::perf::finish("library.schema", schema_start, || {
+            format!("category={} keys={}", category.label(), schema.len())
+        });
+        let filter_start = crate::perf::start();
         let results = display_records(self.backend.filter(category, &search, &selected));
+        crate::perf::finish("library.filter", filter_start, || {
+            format!(
+                "category={} results={} search_len={} selected_keys={}",
+                category.label(),
+                results.len(),
+                search.len(),
+                selected.len()
+            )
+        });
+        let unsupported_start = crate::perf::start();
         let unsupported_count = self.backend.convertible_count(category);
+        crate::perf::finish("library.unsupported_count", unsupported_start, || {
+            format!(
+                "category={} unsupported={unsupported_count}",
+                category.label()
+            )
+        });
         let state = self.states.entry(category).or_default();
         state.schema = schema;
         state.results = results;
         state.unsupported_count = unsupported_count;
+        crate::perf::finish("library.refresh_category_state", total_start, || {
+            format!(
+                "category={} results={} unsupported={}",
+                category.label(),
+                state.results.len(),
+                state.unsupported_count
+            )
+        });
         Ok(())
     }
 

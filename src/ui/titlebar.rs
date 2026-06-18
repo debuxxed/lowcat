@@ -144,6 +144,7 @@ impl AppTitleBar {
 
 impl Render for AppTitleBar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let render_start = crate::perf::start();
         let active = self.library.read(cx).active();
         let internal_drag_active = self.library.read(cx).internal_file_drag_active();
         if !internal_drag_active && self.internal_drag_hover_category.is_some() {
@@ -269,10 +270,18 @@ impl Render for AppTitleBar {
             );
         }
 
-        TitleBar::new()
+        let titlebar = TitleBar::new()
             .h(px(38.))
             .pl(TITLEBAR_LEFT_OFFSET)
             .bg(cx.theme().background)
-            .child(categories)
+            .child(categories);
+
+        crate::perf::finish("titlebar.render", render_start, || {
+            format!(
+                "active={} internal_drag={internal_drag_active}",
+                active.label()
+            )
+        });
+        titlebar
     }
 }

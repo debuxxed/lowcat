@@ -246,12 +246,18 @@ impl Focusable for UI {
 
 impl Render for UI {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let render_start = crate::perf::start();
         let filters_open = self.library.read(cx).filters_open();
         let internal_drag_active = self.library.read(cx).internal_file_drag_active();
         let import_progress_active = self.library.read(cx).import_progress().is_some();
         let unsupported_count = self.library.read(cx).active_unsupported_count();
         let busy = self.library.read(cx).is_busy();
         let drop_overlay = self.render_drop_overlay(cx);
+        crate::perf::finish("ui.render", render_start, || {
+            format!(
+                "filters_open={filters_open} import_progress={import_progress_active} unsupported={unsupported_count}"
+            )
+        });
 
         div()
             .track_focus(&self.focus_handle)

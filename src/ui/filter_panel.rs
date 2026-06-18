@@ -20,6 +20,7 @@ impl FilterPanel {
 
 impl Render for FilterPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let render_start = crate::perf::start();
         let state = self.library.read(cx).active_state();
 
         let mut panel = div()
@@ -92,6 +93,13 @@ impl Render for FilterPanel {
             panel = panel.child(group);
         }
 
+        crate::perf::finish("filter_panel.render", render_start, || {
+            format!(
+                "keys={} values={}",
+                state.schema.len(),
+                state.schema.values().map(Vec::len).sum::<usize>()
+            )
+        });
         panel
     }
 }
