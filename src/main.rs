@@ -1,4 +1,5 @@
 mod backend;
+mod db;
 mod library;
 mod model;
 mod perf;

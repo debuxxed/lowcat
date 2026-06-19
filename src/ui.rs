@@ -1,4 +1,5 @@
 mod filter_panel;
+mod settings_menu;
 mod table;
 mod titlebar;
 mod toolbar;
@@ -6,13 +7,9 @@ mod toolbar;
 use gpui::{
     App, AppContext, Context, Entity, ExternalPaths, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyDownEvent, ModifiersChangedEvent, ParentElement, Pixels, Render, SharedString,
-    Styled, Window, actions, div, hsla, prelude::FluentBuilder, px, rgba,
+    Styled, Window, actions, div, prelude::FluentBuilder, px, rgba,
 };
-use gpui_component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, StyledExt,
-    button::{Button, ButtonVariants as _},
-    progress::Progress,
-};
+use gpui_component::{ActiveTheme as _, Sizable as _, StyledExt, progress::Progress};
 
 use crate::model::Category;
 use crate::ui::titlebar::TITLEBAR_LEFT_OFFSET;
@@ -41,6 +38,13 @@ impl UI {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let library = cx.new(|_| Library::new());
         cx.observe(&library, |_, _, cx| cx.notify()).detach();
+        cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                this.library
+                    .update(cx, |lib, cx| lib.rescan_after_focus(cx));
+            }
+        })
+        .detach();
         // Hold focus at the root so window-level actions (e.g. ToggleFilters)
         // still dispatch when no input is active.
         let focus_handle = cx.focus_handle();
@@ -189,53 +193,6 @@ impl UI {
                     ),
             )
     }
-
-    fn render_suggestion_bar(
-        &self,
-        unsupported_count: usize,
-        busy: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let problem = if unsupported_count == 1 {
-            "There is 1 file in unsupported format.".to_string()
-        } else {
-            format!("There are {unsupported_count} files in unsupported format.")
-        };
-
-        div()
-            .id("suggestion-bar")
-            .flex_shrink_0()
-            .h(px(48.))
-            .w_full()
-            .h_flex()
-            .items_center()
-            .justify_between()
-            .gap_3()
-            .px(CONTENT_PX)
-            .border_t_1()
-            .border_color(cx.theme().border)
-            .bg(hsla(0.095, 0.68, 0.22, 0.18))
-            .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .text_sm()
-                    .text_color(cx.theme().foreground)
-                    .child(SharedString::from(problem)),
-            )
-            .child(
-                Button::new("convert-all-unsupported")
-                    .small()
-                    .warning()
-                    .label("Convert all")
-                    .loading(busy)
-                    .disabled(busy)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.library
-                            .update(cx, |lib, cx| lib.convert_active_unsupported(cx));
-                    })),
-            )
-    }
 }
 
 impl Focusable for UI {
@@ -251,13 +208,9 @@ impl Render for UI {
         let filters_open = self.library.read(cx).filters_open();
         let internal_drag_active = self.library.read(cx).internal_file_drag_active();
         let import_progress_active = self.library.read(cx).import_progress().is_some();
-        let unsupported_count = self.library.read(cx).active_unsupported_count();
-        let busy = self.library.read(cx).is_busy();
         let drop_overlay = self.render_drop_overlay(cx);
         crate::perf::finish("ui.render", render_start, || {
-            format!(
-                "filters_open={filters_open} import_progress={import_progress_active} unsupported={unsupported_count}"
-            )
+            format!("filters_open={filters_open} import_progress={import_progress_active}")
         });
 
         div()
@@ -291,9 +244,6 @@ impl Render for UI {
             .child(self.toolbar.clone())
             .when(filters_open, |el| el.child(self.filter_panel.clone()))
             .child(self.table.clone())
-            .when(unsupported_count > 0, |el| {
-                el.child(self.render_suggestion_bar(unsupported_count, busy, cx))
-            })
             .when(!internal_drag_active, |el| el.child(drop_overlay))
             .when(import_progress_active, |el| {
                 el.child(self.render_import_progress_modal(cx))

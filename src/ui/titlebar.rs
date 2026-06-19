@@ -1,7 +1,7 @@
 use gpui::{
-    AsyncApp, ClickEvent, Context, Entity, ExternalPaths, InteractiveElement as _, IntoElement,
-    MouseMoveEvent, ParentElement, PathPromptOptions, Pixels, Point, Render, SharedString,
-    StatefulInteractiveElement as _, Styled, Window, div, prelude::FluentBuilder as _, px,
+    AsyncApp, ClickEvent, Context, Entity, InteractiveElement as _, IntoElement, ParentElement,
+    PathPromptOptions, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled,
+    Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt, TitleBar,
@@ -19,7 +19,6 @@ pub(crate) const TITLEBAR_LEFT_OFFSET: Pixels = px(84.);
 pub struct AppTitleBar {
     library: Entity<Library>,
     hovered_category: Option<Category>,
-    internal_drag_hover_category: Option<Category>,
     folder_prompt_active: bool,
 }
 
@@ -30,7 +29,6 @@ impl AppTitleBar {
         Self {
             library,
             hovered_category: None,
-            internal_drag_hover_category: None,
             folder_prompt_active: false,
         }
     }
@@ -85,61 +83,6 @@ impl AppTitleBar {
         })
         .detach();
     }
-
-    fn drop_files_into_category(
-        &mut self,
-        category: Category,
-        paths: &ExternalPaths,
-        cx: &mut Context<Self>,
-    ) {
-        let paths = paths.paths().to_vec();
-        if paths.is_empty() {
-            return;
-        }
-
-        let can_drop = {
-            let library = self.library.read(cx);
-            library.internal_file_drag_active() && library.active() != category
-        };
-        if can_drop {
-            self.library
-                .update(cx, |lib, cx| lib.import_files(category, paths, cx));
-        }
-    }
-
-    fn category_at_position(position: Point<Pixels>, window: &Window) -> Option<Category> {
-        let y = position.y.as_f32();
-        if !(0.0..=38.0).contains(&y) {
-            return None;
-        }
-
-        let x = (position.x - TITLEBAR_LEFT_OFFSET).as_f32();
-        let width = (window.viewport_size().width - TITLEBAR_LEFT_OFFSET).as_f32();
-        if x < 0. || width <= 0. {
-            return None;
-        }
-
-        let column_width = width / Category::ALL.len() as f32;
-        if column_width <= 0. {
-            return None;
-        }
-
-        let index = ((x / column_width).floor() as usize).min(Category::ALL.len() - 1);
-        Category::ALL.get(index).copied()
-    }
-
-    fn update_internal_drag_hover(
-        &mut self,
-        position: Point<Pixels>,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) {
-        let category = Self::category_at_position(position, window);
-        if self.internal_drag_hover_category != category {
-            self.internal_drag_hover_category = category;
-            cx.notify();
-        }
-    }
 }
 
 impl Render for AppTitleBar {
@@ -147,9 +90,6 @@ impl Render for AppTitleBar {
         let render_start = crate::perf::start();
         let active = self.library.read(cx).active();
         let internal_drag_active = self.library.read(cx).internal_file_drag_active();
-        if !internal_drag_active && self.internal_drag_hover_category.is_some() {
-            self.internal_drag_hover_category = None;
-        }
         let outline = cx.theme().title_bar_border;
         let selected_bg = outline.opacity(0.16);
 
@@ -166,11 +106,8 @@ impl Render for AppTitleBar {
         for category in Category::ALL {
             let selected = category == active;
             let hovered = self.hovered_category == Some(category);
-            let drag_hovered = self.internal_drag_hover_category == Some(category);
             let bg = if selected {
                 selected_bg
-            } else if drag_hovered {
-                cx.theme().secondary
             } else {
                 cx.theme().background
             };
@@ -181,8 +118,6 @@ impl Render for AppTitleBar {
             };
             let fg = if selected {
                 cx.theme().foreground
-            } else if drag_hovered {
-                cx.theme().foreground
             } else {
                 cx.theme().muted_foreground
             };
@@ -191,7 +126,6 @@ impl Render for AppTitleBar {
             } else {
                 cx.theme().transparent
             };
-            let can_drop_internal = internal_drag_active && !selected;
             let can_hover = !internal_drag_active;
             let folder_button = Button::new(SharedString::from(format!(
                 "category-folder:{}",
@@ -233,18 +167,6 @@ impl Render for AppTitleBar {
                     .when(can_hover && hovered, |this| {
                         this.child(div().absolute().right(px(6.)).child(folder_button))
                     })
-                    .when(can_drop_internal, |this| {
-                        this.on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
-                            this.drop_files_into_category(category, paths, cx);
-                        }))
-                    })
-                    .on_mouse_move(
-                        cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
-                            if internal_drag_active {
-                                this.update_internal_drag_hover(event.position, window, cx);
-                            }
-                        }),
-                    )
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                         if internal_drag_active {
                             if this.hovered_category.is_some() {

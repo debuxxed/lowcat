@@ -23,7 +23,10 @@ use gpui_component::{
 };
 
 use crate::ui::CONTENT_PX;
-use crate::{library::Library, model::FileRecord};
+use crate::{
+    library::Library,
+    model::{AudioFormat, FileRecord},
+};
 
 const TAG_CELL_X_PADDING_WIDTH: f32 = 24.;
 const TAG_CHIP_X_PADDING_WIDTH: f32 = 12.;
@@ -33,10 +36,12 @@ const TAG_GAP_WIDTH: f32 = 4.;
 const TAG_TEXT_WIDTH: f32 = 7.;
 const TAG_EDITOR_WIDTH: f32 = 90.;
 const FILE_DRAG_THRESHOLD_PX: f32 = 4.;
+const CONVERT_MENU_PANE_WIDTH: f32 = 160.;
 const ROW_HEIGHT: Pixels = px(32.);
 
 struct PendingFileDrag {
     path: PathBuf,
+    extension: String,
     paths: Vec<PathBuf>,
     origin: Point<Pixels>,
 }
@@ -46,6 +51,13 @@ struct TagWidthCache {
     editing: Option<(PathBuf, String)>,
     row_count: usize,
     widths: Vec<Pixels>,
+}
+
+#[derive(Clone)]
+struct ConversionAction {
+    target: AudioFormat,
+    sources: Vec<PathBuf>,
+    skipped: usize,
 }
 
 pub struct FileTable {
@@ -157,15 +169,17 @@ impl FileTable {
             }
 
             let width_start = crate::perf::start();
-            let editing_ref = editing
-                .as_ref()
-                .map(|(path, key)| (path, key.as_str()));
+            let editing_ref = editing.as_ref().map(|(path, key)| (path, key.as_str()));
             let widths: Vec<Pixels> = keys
                 .iter()
                 .map(|key| Self::tag_column_width(state, key, editing_ref))
                 .collect();
             crate::perf::finish("table.widths", width_start, || {
-                format!("rows={} keys={} cached=false", state.results.len(), keys.len())
+                format!(
+                    "rows={} keys={} cached=false",
+                    state.results.len(),
+                    keys.len()
+                )
             });
 
             (keys, row_count, widths)
@@ -231,12 +245,25 @@ impl FileTable {
         }
     }
 
-    fn start_pending_drag(&mut self, path: PathBuf, origin: Point<Pixels>, cx: &mut Context<Self>) {
+    fn start_pending_drag(
+        &mut self,
+        record: &FileRecord,
+        extension: String,
+        origin: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
         let start = crate::perf::start();
-        let paths = self.selected_paths_for(&self.library.read(cx).active_state().results, &path);
+        let state = self.library.read(cx);
+        let paths = self.selected_paths_for_extension(
+            &state.active_state().results,
+            &record.path,
+            &extension,
+            state.format_priority(),
+        );
         let path_count = paths.len();
         self.pending_drag = Some(PendingFileDrag {
-            path,
+            path: record.path.clone(),
+            extension,
             paths,
             origin,
         });
@@ -285,16 +312,101 @@ impl FileTable {
         });
     }
 
-    fn selected_paths_for(&self, records: &[FileRecord], path: &Path) -> Vec<PathBuf> {
+    fn selected_paths_for_extension(
+        &self,
+        records: &[FileRecord],
+        path: &Path,
+        extension: &str,
+        priority: &[AudioFormat],
+    ) -> Vec<PathBuf> {
         if self.selected.len() > 1 && self.selected.contains(path) {
             records
                 .iter()
                 .filter(|record| self.selected.contains(record.path.as_path()))
-                .map(|record| record.path.clone())
+                .filter_map(|record| {
+                    if let Some(variant) = record.variant_for_extension(extension) {
+                        eprintln!(
+                            "lowcat drag row={} selected_extension={} path={}",
+                            record.name,
+                            extension,
+                            variant.path.display()
+                        );
+                        return Some(variant.path.clone());
+                    }
+
+                    let fallback = priority
+                        .iter()
+                        .filter_map(|format| record.variant_for_extension(format.extension()))
+                        .next()
+                        .or_else(|| record.variants.first());
+                    if let Some(variant) = fallback {
+                        eprintln!(
+                            "lowcat drag fallback row={} requested={} picked={} path={}",
+                            record.name,
+                            extension,
+                            variant.extension,
+                            variant.path.display()
+                        );
+                        Some(variant.path.clone())
+                    } else {
+                        eprintln!("lowcat drag skipped row={} no variants", record.name);
+                        None
+                    }
+                })
                 .collect()
         } else {
-            vec![path.to_path_buf()]
+            records
+                .iter()
+                .find(|record| record.path.as_path() == path)
+                .and_then(|record| record.variant_for_extension(extension))
+                .map(|variant| {
+                    eprintln!(
+                        "lowcat drag single extension={} path={}",
+                        extension,
+                        variant.path.display()
+                    );
+                    vec![variant.path.clone()]
+                })
+                .unwrap_or_default()
         }
+    }
+
+    fn conversion_actions(
+        &self,
+        record: &FileRecord,
+        selected_records: &[FileRecord],
+    ) -> Vec<ConversionAction> {
+        if self.selected.len() > 1 && self.selected.contains(record.path.as_path()) {
+            return AudioFormat::ALL
+                .into_iter()
+                .filter_map(|target| {
+                    let mut sources = Vec::new();
+                    let mut skipped = 0usize;
+                    for selected in selected_records {
+                        if selected.has_extension(target.extension()) {
+                            skipped += 1;
+                        } else {
+                            sources.push(selected.path.clone());
+                        }
+                    }
+                    (!sources.is_empty()).then_some(ConversionAction {
+                        target,
+                        sources,
+                        skipped,
+                    })
+                })
+                .collect();
+        }
+
+        record
+            .conversion_targets()
+            .into_iter()
+            .map(|target| ConversionAction {
+                target,
+                sources: vec![record.path.clone()],
+                skipped: 0,
+            })
+            .collect()
     }
 
     pub(crate) fn cancel_file_drag(&mut self, cx: &mut Context<Self>) {
@@ -330,6 +442,7 @@ impl FileTable {
 
         let drag_start = crate::perf::start();
         let path = pending.path.clone();
+        let extension = pending.extension.clone();
         let drag_paths = pending.paths.clone();
         let drag_path_count = drag_paths.len();
         self.clear_pending_drag();
@@ -366,10 +479,10 @@ impl FileTable {
         });
         window.refresh();
         crate::perf::finish("table.drag_start", drag_start, || {
-            format!("paths={drag_path_count}")
+            format!("extension={extension} paths={drag_path_count}")
         });
         crate::perf::finish("table.drag_move", move_start, || {
-            format!("started paths={drag_path_count}")
+            format!("started extension={extension} paths={drag_path_count}")
         });
     }
 
@@ -382,27 +495,25 @@ impl FileTable {
     ) -> Vec<AnyElement> {
         crate::perf::sample("table.rows.rate");
         let rows_start = crate::perf::start();
-        let (records, selected_convertible_paths, total_rows, visible_start, visible_end) = {
+        let (records, selected_records, total_rows, visible_start, visible_end) = {
             let state = self.library.read(cx).active_state();
             let total_rows = state.results.len();
             let visible_start = range.start.min(total_rows);
             let visible_end = range.end.min(total_rows).max(visible_start);
-            let selected_convertible_paths = if self.selected.is_empty() {
-                Vec::new()
-            } else {
+            let selected_records = if self.selected.len() > 1 {
                 state
                     .results
                     .iter()
-                    .filter(|record| {
-                        self.selected.contains(record.path.as_path()) && record.is_convertible()
-                    })
-                    .map(|record| record.path.clone())
+                    .filter(|record| self.selected.contains(record.path.as_path()))
+                    .cloned()
                     .collect()
+            } else {
+                Vec::new()
             };
 
             (
                 state.results[visible_start..visible_end].to_vec(),
-                selected_convertible_paths,
+                selected_records,
                 total_rows,
                 visible_start,
                 visible_end,
@@ -418,7 +529,7 @@ impl FileTable {
                     record,
                     &keys,
                     &tag_widths,
-                    &selected_convertible_paths,
+                    &selected_records,
                     cx,
                 )
             })
@@ -443,7 +554,7 @@ impl FileTable {
         record: &FileRecord,
         keys: &[String],
         tag_widths: &[Pixels],
-        selected_convertible_paths: &[PathBuf],
+        selected_records: &[FileRecord],
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let path = record.path.clone();
@@ -462,19 +573,15 @@ impl FileTable {
             .truncate()
             .child(record.name.clone());
         let open_path = record.path.clone();
-        let drag_path = record.path.clone();
         let select_path = record.path.clone();
-        let convert_paths = if selected && !selected_convertible_paths.is_empty() {
-            selected_convertible_paths.to_vec()
-        } else if record.is_convertible() {
-            vec![record.path.clone()]
-        } else {
-            Vec::new()
-        };
-        let convert_target = conversion_target_label(&convert_paths);
+        let conversion_row_path = record.path.clone();
+        let conversion_actions = self.conversion_actions(record, selected_records);
+        let conversion_selected_count = selected_records.len();
         let table = cx.entity();
+        let row_group = SharedString::from(format!("row-group:{}", path.display()));
         let mut row = div()
             .id(SharedString::from(format!("row:{}", path.display())))
+            .group(row_group.clone())
             .h(ROW_HEIGHT)
             .flex()
             .flex_row()
@@ -498,7 +605,6 @@ impl FileTable {
                         if event.modifiers.shift || !this.selected.contains(&select_path) {
                             this.select_row(select_path.clone(), event.modifiers.shift, cx);
                         }
-                        this.start_pending_drag(drag_path.clone(), event.position, cx);
                     }
                 }),
             )
@@ -511,27 +617,40 @@ impl FileTable {
                     this.clear_pending_drag();
                 }),
             )
-            .context_menu(move |menu, _, _| {
-                if convert_paths.is_empty() {
+            .context_menu(move |menu, _window, _cx| {
+                if conversion_actions.is_empty() {
                     return menu;
                 }
 
-                let paths = convert_paths.clone();
                 let table = table.clone();
-                menu.item(
-                    PopupMenuItem::new(SharedString::from(format!("Convert to {convert_target}")))
-                        .on_click(move |_, _, cx| {
-                            cx.update_entity(&table, |this, cx| {
-                                this.library.update(cx, |lib, cx| {
-                                    if paths.len() == 1 {
-                                        lib.convert_active_unsupported_file(paths[0].clone(), cx);
-                                    } else {
-                                        lib.convert_active_unsupported_files(paths.clone(), cx);
-                                    }
-                                });
+                let actions = conversion_actions.clone();
+                eprintln!(
+                    "lowcat context_menu convert_to row={} targets={} selected={}",
+                    conversion_row_path.display(),
+                    actions.len(),
+                    conversion_selected_count
+                );
+                let mut menu = menu.max_w(px(CONVERT_MENU_PANE_WIDTH));
+                for action in actions {
+                    let table = table.clone();
+                    let target = action.target;
+                    let label = SharedString::from(format!("Convert to {}", target.label()));
+                    menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                        let sources = action.sources.clone();
+                        eprintln!(
+                            "lowcat context_menu convert_to click target={} sources={} skipped={}",
+                            target.extension(),
+                            sources.len(),
+                            action.skipped
+                        );
+                        cx.update_entity(&table, |this, cx| {
+                            this.library.update(cx, |lib, cx| {
+                                lib.convert_files_to_format(sources, target, cx);
                             });
-                        }),
-                )
+                        });
+                    }));
+                }
+                menu
             })
             .child(
                 div()
@@ -542,7 +661,65 @@ impl FileTable {
                     .min_w_0()
                     .px(CONTENT_PX)
                     .py(px(4.))
-                    .child(name),
+                    .relative()
+                    .child(
+                        div()
+                            .absolute()
+                            .left(CONTENT_PX)
+                            .right(CONTENT_PX)
+                            .top_0()
+                            .bottom_0()
+                            .h_flex()
+                            .items_center()
+                            .gap_1()
+                            .opacity(0.)
+                            .group_hover(row_group.clone(), |style| style.opacity(1.))
+                            .children(record.variants.iter().map(|variant| {
+                                let record = record.clone();
+                                let extension = variant.extension.clone();
+                                let label = extension.to_ascii_uppercase();
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "extension-chip:{}:{extension}",
+                                        record.path.display()
+                                    )))
+                                    .w(px(56.))
+                                    .h_full()
+                                    .flex_shrink_0()
+                                    .h_flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .text_base()
+                                    .bg(cx.theme().muted)
+                                    .text_color(cx.theme().muted_foreground)
+                                    .cursor_pointer()
+                                    .child(SharedString::from(label))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                            if event.click_count == 1 {
+                                                if event.modifiers.shift
+                                                    || !this.selected.contains(&record.path)
+                                                {
+                                                    this.select_row(
+                                                        record.path.clone(),
+                                                        event.modifiers.shift,
+                                                        cx,
+                                                    );
+                                                }
+                                                this.start_pending_drag(
+                                                    &record,
+                                                    extension.clone(),
+                                                    event.position,
+                                                    cx,
+                                                );
+                                            }
+                                        }),
+                                    )
+                            })),
+                    )
+                    .child(name.group_hover(row_group.clone(), |style| style.opacity(0.))),
             );
 
         for (key, tag_width) in keys.iter().zip(tag_widths) {
@@ -737,26 +914,4 @@ fn open_in_default_app(path: &Path) {
     if let Err(err) = open::that(path) {
         eprintln!("failed to open {}: {err}", path.display());
     }
-}
-
-fn conversion_target_format(path: &Path) -> &'static str {
-    if path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
-    {
-        "flac"
-    } else {
-        "opus"
-    }
-}
-
-fn conversion_target_label(paths: &[PathBuf]) -> String {
-    paths
-        .iter()
-        .map(|path| conversion_target_format(path))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>()
-        .join("/")
 }

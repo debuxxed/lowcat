@@ -9,11 +9,12 @@ use gpui_component::{
 };
 
 use crate::library::Library;
-use crate::ui::CONTENT_PX;
+use crate::ui::{CONTENT_PX, settings_menu::SettingsMenu};
 
 pub struct Toolbar {
     library: Entity<Library>,
     search_input: Entity<InputState>,
+    settings_menu: Entity<SettingsMenu>,
     hovered_chip: Option<String>,
     alt_down: bool,
 }
@@ -34,6 +35,7 @@ impl Toolbar {
         cx.observe(&library, |_, _, cx| cx.notify()).detach();
 
         Self {
+            settings_menu: cx.new(|cx| SettingsMenu::new(library.clone(), cx)),
             library,
             search_input,
             hovered_chip: None,
@@ -50,7 +52,7 @@ impl Toolbar {
 }
 
 impl Render for Toolbar {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let render_start = crate::perf::start();
         let chips: Vec<(String, String)> = {
             let state = self.library.read(cx).active_state();
@@ -145,6 +147,7 @@ impl Render for Toolbar {
             .gap_2()
             .py_2()
             .px(CONTENT_PX)
+            .child(self.settings_menu.clone())
             .child(filter_button)
             .child(chip_row)
             .child(search);

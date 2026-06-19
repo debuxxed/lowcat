@@ -1,14 +1,16 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use futures::{StreamExt as _, channel::mpsc};
 use gpui::{AppContext as _, Context};
 
-use crate::backend::{
-    Backend, convert_unsupported_files, import_requires_conversion, import_to_folder,
+use crate::backend::{Backend, import_to_folder};
+use crate::model::{
+    AudioFormat, Category, CategoryState, ConvertConflictBehavior, FileRecord,
+    default_format_priority, tag_label,
 };
-use crate::model::{Category, CategoryState, FileRecord, tag_label};
 
 #[path = "config.rs"]
 mod config;
@@ -19,10 +21,14 @@ pub struct Library {
     states: BTreeMap<Category, CategoryState>,
     settings: config::Settings,
     settings_path: PathBuf,
+    format_priority: Vec<AudioFormat>,
+    convert_conflict_behavior: ConvertConflictBehavior,
     filters_open: bool,
     internal_file_drag: Option<InternalFileDrag>,
     importing: bool,
     import_progress: Option<ImportProgress>,
+    last_focus_rescan: Option<Instant>,
+    focus_rescan_in_flight: bool,
 }
 
 #[derive(Clone)]
@@ -45,6 +51,9 @@ struct ImportBatchResult {
 
 struct ConvertBatchResult {
     category: Category,
+    converted: bool,
+    converted_count: usize,
+    failed_count: usize,
 }
 
 enum ImportProgressEvent {
@@ -60,16 +69,28 @@ impl Library {
 
     pub fn new_with_settings_path(settings_path: PathBuf) -> Self {
         let settings = config::Settings::load(&settings_path);
+        let backend = Backend::new(database_path_for_settings(&settings_path))
+            .expect("failed to initialize Lowcat SQLite database");
+        let format_priority = backend
+            .format_priority()
+            .unwrap_or_else(|_| default_format_priority());
+        let convert_conflict_behavior = backend
+            .convert_conflict_behavior()
+            .unwrap_or(ConvertConflictBehavior::AddCopy);
         let mut this = Self {
-            backend: Backend::new(),
+            backend,
             active: Category::Music,
             states: BTreeMap::new(),
             settings,
             settings_path,
+            format_priority,
+            convert_conflict_behavior,
             filters_open: false,
             internal_file_drag: None,
             importing: false,
             import_progress: None,
+            last_focus_rescan: None,
+            focus_rescan_in_flight: false,
         };
         this.init();
         this
@@ -96,15 +117,12 @@ impl Library {
         self.import_progress.as_ref()
     }
 
-    pub fn active_unsupported_count(&self) -> usize {
-        self.states
-            .get(&self.active)
-            .map(|state| state.unsupported_count)
-            .unwrap_or_default()
+    pub fn format_priority(&self) -> &[AudioFormat] {
+        &self.format_priority
     }
 
-    pub fn is_busy(&self) -> bool {
-        self.importing
+    pub fn convert_conflict_behavior(&self) -> ConvertConflictBehavior {
+        self.convert_conflict_behavior
     }
 
     pub fn toggle_filters(&mut self, cx: &mut Context<Self>) {
@@ -172,12 +190,82 @@ impl Library {
         }
     }
 
+    pub fn move_format_priority_up(&mut self, format: AudioFormat, cx: &mut Context<Self>) {
+        let Some(index) = self.format_priority.iter().position(|item| *item == format) else {
+            return;
+        };
+        self.move_format_priority_to_index(format, index.saturating_sub(1), cx);
+    }
+
+    pub fn move_format_priority_down(&mut self, format: AudioFormat, cx: &mut Context<Self>) {
+        let Some(index) = self.format_priority.iter().position(|item| *item == format) else {
+            return;
+        };
+        self.move_format_priority_to_index(format, index.saturating_add(1), cx);
+    }
+
+    fn move_format_priority_to_index(
+        &mut self,
+        format: AudioFormat,
+        new_index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.format_priority.iter().position(|item| *item == format) else {
+            return;
+        };
+        let new_index = new_index.min(self.format_priority.len().saturating_sub(1));
+        if index == new_index {
+            cx.notify();
+            return;
+        }
+        let format = self.format_priority.remove(index);
+        self.format_priority.insert(new_index, format);
+        if self
+            .backend
+            .set_format_priority(self.format_priority.clone())
+            .is_ok()
+        {
+            eprintln!(
+                "lowcat format priority={}",
+                self.format_priority
+                    .iter()
+                    .map(|format| format.extension())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            self.refresh(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    pub fn set_convert_conflict_behavior(
+        &mut self,
+        behavior: ConvertConflictBehavior,
+        cx: &mut Context<Self>,
+    ) {
+        if self.convert_conflict_behavior == behavior {
+            cx.notify();
+            return;
+        }
+        if self.backend.set_convert_conflict_behavior(behavior).is_ok() {
+            self.convert_conflict_behavior = behavior;
+            eprintln!("lowcat convert conflict behavior={}", behavior.key());
+        }
+        cx.notify();
+    }
+
     pub fn begin_internal_file_drag(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.begin_internal_file_drag_files(vec![path], cx);
     }
 
     pub fn begin_internal_file_drag_files(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        let paths = paths.into_iter().map(canonical_or_original).collect();
+        let paths: Vec<PathBuf> = paths.into_iter().map(canonical_or_original).collect();
+        eprintln!(
+            "lowcat internal file drag started category={} paths={}",
+            self.active.label(),
+            paths.len()
+        );
         self.internal_file_drag = Some(InternalFileDrag {
             category: self.active,
             paths,
@@ -191,6 +279,7 @@ impl Library {
 
     pub fn clear_internal_file_drag(&mut self, cx: &mut Context<Self>) {
         if self.internal_file_drag.take().is_some() {
+            eprintln!("lowcat internal file drag cleared");
             cx.notify();
         }
     }
@@ -231,37 +320,10 @@ impl Library {
             );
             return;
         };
-        let (progress_tx, mut progress_rx) = mpsc::unbounded();
-
-        cx.spawn(async move |this, cx| {
-            while let Some(event) = progress_rx.next().await {
-                this.update(cx, |lib, cx| {
-                    lib.apply_import_progress(event, cx);
-                })
-                .ok();
-            }
-        })
-        .detach();
-
         let import_task = cx.background_spawn(async move {
             let mut imported = false;
             for path in paths {
-                let file_name = file_name(&path);
-                let converting = import_requires_conversion(&path);
-                let mut conversion_started = false;
-                let result = import_to_folder(&folder, &path, |progress| {
-                    if converting && !conversion_started {
-                        conversion_started = true;
-                        let _ = progress_tx.unbounded_send(ImportProgressEvent::Start {
-                            file_name: file_name.clone(),
-                        });
-                    }
-                    let _ = progress_tx.unbounded_send(ImportProgressEvent::Progress(progress));
-                });
-                if conversion_started {
-                    let _ = progress_tx.unbounded_send(ImportProgressEvent::Finish);
-                }
-                if result.is_ok_and(|result| result.converted || !converting) {
+                if import_to_folder(&folder, &path, |_| {}).is_ok() {
                     imported = true;
                 }
             }
@@ -282,57 +344,48 @@ impl Library {
         .detach();
     }
 
-    pub fn convert_active_unsupported(&mut self, cx: &mut Context<Self>) {
-        if self.importing || self.active_unsupported_count() == 0 {
-            cx.notify();
-            return;
-        }
-
-        let category = self.active;
-        let paths = self.backend.convertible_paths(category);
-        self.convert_active_unsupported_files(paths, cx);
-    }
-
-    pub fn convert_active_unsupported_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        self.convert_active_unsupported_files(vec![path], cx);
-    }
-
-    pub fn convert_active_unsupported_files(
+    pub fn convert_files_to_format(
         &mut self,
-        paths: Vec<PathBuf>,
+        sources: Vec<PathBuf>,
+        target: AudioFormat,
         cx: &mut Context<Self>,
     ) {
         if self.importing {
+            eprintln!(
+                "lowcat convert batch skipped target={} reason=busy",
+                target.extension()
+            );
+            cx.notify();
+            return;
+        }
+
+        let mut seen = BTreeSet::new();
+        let sources: Vec<PathBuf> = sources
+            .into_iter()
+            .filter(|source| seen.insert(source.clone()))
+            .collect();
+        if sources.is_empty() {
+            eprintln!(
+                "lowcat convert batch skipped target={} sources=0",
+                target.extension()
+            );
             cx.notify();
             return;
         }
 
         let category = self.active;
-        let Some(folder) = self
-            .settings
-            .category_folder(category)
-            .map(Path::to_path_buf)
-        else {
-            cx.notify();
-            return;
-        };
-
-        let convertible_paths = self.backend.convertible_paths(category);
-        let paths: Vec<PathBuf> = paths
-            .into_iter()
-            .filter(|path| {
-                convertible_paths
-                    .iter()
-                    .any(|candidate| paths_equal(candidate, path))
-            })
-            .collect();
-        if paths.is_empty() {
-            cx.notify();
-            return;
-        }
-
+        let behavior = self.convert_conflict_behavior;
+        let db_path = database_path_for_settings(&self.settings_path);
         self.importing = true;
-        self.import_progress = None;
+        self.import_progress = Some(ImportProgress {
+            file_name: file_name(&sources[0]),
+            progress: 0.,
+        });
+        eprintln!(
+            "lowcat convert batch start target={} sources={}",
+            target.extension(),
+            sources.len()
+        );
         cx.notify();
 
         let (progress_tx, mut progress_rx) = mpsc::unbounded();
@@ -347,21 +400,56 @@ impl Library {
         .detach();
 
         let convert_task = cx.background_spawn(async move {
-            let mut current_path: Option<PathBuf> = None;
-            let _ = convert_unsupported_files(&folder, paths, |path, progress| {
-                if current_path.as_deref() != Some(path) {
-                    current_path = Some(path.to_path_buf());
-                    let _ = progress_tx.unbounded_send(ImportProgressEvent::Start {
-                        file_name: file_name(path),
-                    });
+            let mut converted_count = 0usize;
+            let mut failed_count = 0usize;
+            match Backend::new(db_path) {
+                Ok(backend) => {
+                    for source in sources {
+                        let file_name = file_name(&source);
+                        let _ = progress_tx.unbounded_send(ImportProgressEvent::Start {
+                            file_name: file_name.clone(),
+                        });
+                        let result =
+                            backend.convert_file_to_format(&source, target, behavior, |progress| {
+                                let _ = progress_tx
+                                    .unbounded_send(ImportProgressEvent::Progress(progress));
+                            });
+                        match result {
+                            Ok(path) => {
+                                converted_count += 1;
+                                eprintln!(
+                                    "lowcat converted source={} target={} output={}",
+                                    source.display(),
+                                    target.extension(),
+                                    path.display()
+                                );
+                            }
+                            Err(error) => {
+                                failed_count += 1;
+                                eprintln!(
+                                    "lowcat convert failed source={} target={} error={error}",
+                                    source.display(),
+                                    target.extension()
+                                );
+                            }
+                        }
+                    }
                 }
-                let _ = progress_tx.unbounded_send(ImportProgressEvent::Progress(progress));
-                if progress >= 100. {
-                    let _ = progress_tx.unbounded_send(ImportProgressEvent::Finish);
-                    current_path = None;
+                Err(error) => {
+                    failed_count = sources.len();
+                    eprintln!(
+                        "lowcat convert batch failed target={} error={error}",
+                        target.extension()
+                    );
                 }
-            });
-            ConvertBatchResult { category }
+            }
+            let _ = progress_tx.unbounded_send(ImportProgressEvent::Finish);
+            ConvertBatchResult {
+                category,
+                converted: converted_count > 0,
+                converted_count,
+                failed_count,
+            }
         });
 
         cx.spawn(async move |this, cx| {
@@ -410,6 +498,49 @@ impl Library {
         }
         cx.notify();
         Ok(())
+    }
+
+    pub fn rescan_after_focus(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        if self.focus_rescan_in_flight {
+            eprintln!("lowcat focus rescan skipped in_flight=true");
+            return;
+        }
+        if self
+            .last_focus_rescan
+            .is_some_and(|last| now.duration_since(last) < Duration::from_millis(750))
+        {
+            eprintln!("lowcat focus rescan skipped debounce=true");
+            return;
+        }
+        self.last_focus_rescan = Some(now);
+        self.focus_rescan_in_flight = true;
+        eprintln!("lowcat focus rescan start");
+        let settings = self.settings.clone();
+        let db_path = database_path_for_settings(&self.settings_path);
+        let started_at = Instant::now();
+
+        let rescan_task = cx.background_spawn(async move {
+            let mut backend = Backend::new(db_path)?;
+            for category in Category::ALL {
+                if let Some(path) = settings.category_folder(category).map(Path::to_path_buf) {
+                    backend.set_category_folder(category, path)?;
+                } else {
+                    backend.refresh_category(category)?;
+                }
+            }
+            Ok::<(), io::Error>(())
+        });
+
+        cx.spawn(async move |this, cx| {
+            let result = rescan_task.await;
+            this.update(cx, |lib, cx| {
+                lib.finish_focus_rescan(result, started_at, cx);
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
     }
 
     fn init(&mut self) {
@@ -498,24 +629,14 @@ impl Library {
                 selected.len()
             )
         });
-        let unsupported_start = crate::perf::start();
-        let unsupported_count = self.backend.convertible_count(category);
-        crate::perf::finish("library.unsupported_count", unsupported_start, || {
-            format!(
-                "category={} unsupported={unsupported_count}",
-                category.label()
-            )
-        });
         let state = self.states.entry(category).or_default();
         state.schema = schema;
         state.results = results;
-        state.unsupported_count = unsupported_count;
         crate::perf::finish("library.refresh_category_state", total_start, || {
             format!(
-                "category={} results={} unsupported={}",
+                "category={} results={}",
                 category.label(),
-                state.results.len(),
-                state.unsupported_count
+                state.results.len()
             )
         });
         Ok(())
@@ -524,8 +645,48 @@ impl Library {
     fn finish_convert_unsupported(&mut self, result: ConvertBatchResult, cx: &mut Context<Self>) {
         self.importing = false;
         self.import_progress = None;
-        let _ = self.backend.refresh_category(result.category);
-        let _ = self.refresh_category_state(result.category);
+        eprintln!(
+            "lowcat convert batch finish category={} converted={} failed={}",
+            result.category.label(),
+            result.converted_count,
+            result.failed_count
+        );
+        if result.converted {
+            let _ = self.backend.refresh_category(result.category);
+            let _ = self.refresh_category_state(result.category);
+        }
+        cx.notify();
+    }
+
+    fn finish_focus_rescan(
+        &mut self,
+        result: io::Result<()>,
+        started_at: Instant,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_rescan_in_flight = false;
+        match result {
+            Ok(()) => {
+                for category in Category::ALL {
+                    if let Err(error) = self.refresh_category_state(category) {
+                        eprintln!(
+                            "lowcat focus rescan state refresh failed category={} error={error}",
+                            category.label()
+                        );
+                    }
+                }
+                eprintln!(
+                    "lowcat focus rescan ok elapsed_ms={}",
+                    started_at.elapsed().as_millis()
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "lowcat focus rescan failed elapsed_ms={} error={error}",
+                    started_at.elapsed().as_millis()
+                );
+            }
+        }
         cx.notify();
     }
 
@@ -540,14 +701,19 @@ impl Library {
     fn load_category_state(&self, category: Category) -> CategoryState {
         let schema = display_schema(self.backend.schema_for(category));
         let results = display_records(self.backend.filter(category, "", &BTreeMap::new()));
-        let unsupported_count = self.backend.convertible_count(category);
         CategoryState {
             schema,
             results,
-            unsupported_count,
             ..Default::default()
         }
     }
+}
+
+fn database_path_for_settings(settings_path: &Path) -> PathBuf {
+    settings_path
+        .parent()
+        .map(|parent| parent.join("library.sqlite"))
+        .unwrap_or_else(|| PathBuf::from("library.sqlite"))
 }
 
 fn file_name(path: &Path) -> String {
@@ -581,6 +747,8 @@ fn display_record(record: FileRecord) -> FileRecord {
         name: record.name,
         path: record.path,
         support: record.support,
+        stem: record.stem,
+        variants: record.variants,
         tags: display_schema(record.tags),
     }
 }
@@ -708,55 +876,93 @@ mod tests {
     }
 
     #[gpui::test]
-    fn active_results_keep_convertible_files_first(cx: &mut gpui::TestAppContext) {
-        let settings_path = settings_path("convertible-first");
+    fn active_results_group_extension_variants(cx: &mut gpui::TestAppContext) {
+        let settings_path = settings_path("group-variants");
         let (music_dir, _) = settings_with_folders(&settings_path);
         fixture(&music_dir, "aaa.flac", &[("GENRE", "Ambient")]);
-        fixture(&music_dir, "zzz.wav", &[]);
+        fixture(&music_dir, "aaa.mp3", &[]);
 
         let library = cx.new(|_| Library::new_with_settings_path(settings_path));
         let results = library.read_with(cx, |lib, _| {
             lib.active_state()
                 .results
                 .iter()
-                .map(|record| (record.name.clone(), record.is_convertible()))
+                .map(|record| {
+                    (
+                        record.name.clone(),
+                        record
+                            .variants
+                            .iter()
+                            .map(|variant| variant.extension.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                })
                 .collect::<Vec<_>>()
         });
 
         assert_eq!(
             results,
-            vec![
-                ("zzz.wav".to_string(), true),
-                ("aaa.flac".to_string(), false)
-            ]
+            vec![(
+                "aaa".to_string(),
+                vec!["mp3".to_string(), "flac".to_string()]
+            )]
         );
-        let unsupported_count = library.read_with(cx, |lib, _| lib.active_unsupported_count());
-        assert_eq!(unsupported_count, 1);
+        let priority = library.read_with(cx, |lib, _| lib.format_priority().to_vec());
+        assert_eq!(priority[0], AudioFormat::Mp3);
     }
 
     #[gpui::test]
-    fn unsupported_count_ignores_active_search(cx: &mut gpui::TestAppContext) {
-        let settings_path = settings_path("unsupported-count");
+    fn format_priority_moves_one_step(cx: &mut gpui::TestAppContext) {
+        let library = cx.new(|_| Library::new_with_settings_path(settings_path("priority-step")));
+
+        library.update(cx, |lib, cx| {
+            lib.move_format_priority_down(AudioFormat::Mp3, cx);
+        });
+        let after_down = library.read_with(cx, |lib, _| lib.format_priority().to_vec());
+        assert_eq!(
+            after_down,
+            vec![
+                AudioFormat::Wav,
+                AudioFormat::Mp3,
+                AudioFormat::Opus,
+                AudioFormat::Flac,
+            ]
+        );
+
+        library.update(cx, |lib, cx| {
+            lib.move_format_priority_up(AudioFormat::Opus, cx);
+        });
+        let after_up = library.read_with(cx, |lib, _| lib.format_priority().to_vec());
+        assert_eq!(
+            after_up,
+            vec![
+                AudioFormat::Wav,
+                AudioFormat::Opus,
+                AudioFormat::Mp3,
+                AudioFormat::Flac,
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn supported_wav_is_indexed_and_searchable(cx: &mut gpui::TestAppContext) {
+        let settings_path = settings_path("supported-wav");
         let (music_dir, _) = settings_with_folders(&settings_path);
         fixture(&music_dir, "native.flac", &[("GENRE", "Ambient")]);
         fixture(&music_dir, "hidden.wav", &[]);
 
         let library = cx.new(|_| Library::new_with_settings_path(settings_path));
-        library.update(cx, |lib, cx| lib.set_search("native".to_string(), cx));
+        library.update(cx, |lib, cx| lib.set_search("wav".to_string(), cx));
 
-        let (visible, unsupported_count) = library.read_with(cx, |lib, _| {
-            (
-                lib.active_state()
-                    .results
-                    .iter()
-                    .map(|record| record.name.clone())
-                    .collect::<Vec<_>>(),
-                lib.active_unsupported_count(),
-            )
+        let visible = library.read_with(cx, |lib, _| {
+            lib.active_state()
+                .results
+                .iter()
+                .map(|record| record.name.clone())
+                .collect::<Vec<_>>()
         });
 
-        assert_eq!(visible, vec!["native.flac"]);
-        assert_eq!(unsupported_count, 1);
+        assert_eq!(visible, vec!["hidden"]);
     }
 
     #[gpui::test]
