@@ -90,15 +90,6 @@ impl Backend {
 
         let records_len = records.len();
         let summary = self.db.sync_category(category, records)?;
-        eprintln!(
-            "lowcat sync category={} added={} updated={} removed={} files_seen={} skipped={}",
-            category.label(),
-            summary.added,
-            summary.updated,
-            summary.removed,
-            files_seen,
-            skipped_seen
-        );
         crate::perf::finish("backend.refresh_category", refresh_start, || {
             format!(
                 "category={} records={records_len} files_seen={files_seen} skipped={skipped_seen} added={} updated={} removed={}",
@@ -211,6 +202,25 @@ impl Backend {
         })?;
         convert_file_to_format(source, folder, target, behavior, on_progress)
     }
+
+    pub fn trash_files(paths: Vec<PathBuf>) -> io::Result<usize> {
+        trash_files(paths)
+    }
+}
+
+fn trash_files(paths: Vec<PathBuf>) -> io::Result<usize> {
+    let mut seen = BTreeSet::new();
+    let paths: Vec<PathBuf> = paths
+        .into_iter()
+        .filter(|path| seen.insert(path.clone()))
+        .collect();
+    let path_count = paths.len();
+    if path_count == 0 {
+        return Ok(0);
+    }
+
+    trash::delete_all(&paths).map_err(io::Error::other)?;
+    Ok(path_count)
 }
 
 pub fn import_to_folder(

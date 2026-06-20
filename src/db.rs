@@ -113,12 +113,14 @@ impl Database {
         block_on(async {
             let category_key = category_key(category);
             let existing_rows =
-                sqlx::query("SELECT path, size, modified FROM files WHERE category = ?")
+                sqlx::query("SELECT path, stem, size, modified FROM files WHERE category = ?")
                     .bind(category_key)
                     .fetch_all(&self.pool)
                     .await?;
             let mut existing = BTreeMap::new();
+            let mut existing_stems = BTreeSet::new();
             for row in existing_rows {
+                existing_stems.insert(row.get::<String, _>("stem"));
                 existing.insert(
                     row.get::<String, _>("path"),
                     (
@@ -187,7 +189,7 @@ impl Database {
                 .fetch_one(&self.pool)
                 .await?
                 .get("count");
-                if tag_count == 0 {
+                if !existing_stems.contains(&record.stem) && tag_count == 0 {
                     for (key, values) in record.tags {
                         let Some(key) = canonical_tag_key(&key) else {
                             continue;
@@ -479,6 +481,7 @@ impl Database {
         })
         .map_err(io::Error::other)
     }
+
 }
 
 fn sort_variants(variants: &mut [FileVariant], priority: &[AudioFormat]) {
@@ -588,6 +591,34 @@ mod tests {
             vec!["mp3", "flac"]
         );
         assert_eq!(rows[0].tags["GENRE"], vec!["Ambient"]);
+    }
+
+    #[test]
+    fn sync_category_preserves_removed_last_tag() {
+        let db = Database::open(&db_path("sync-category-removed-last-tag")).unwrap();
+
+        db.sync_category(
+            Category::Music,
+            vec![scan("song.flac", &[("GENRE", &["sgdsfg"])])],
+        )
+        .unwrap();
+        db.remove_tag(Category::Music, "song", "GENRE", "sgdsfg")
+            .unwrap();
+        db.sync_category(
+            Category::Music,
+            vec![scan("song.flac", &[("GENRE", &["sgdsfg"])])],
+        )
+        .unwrap();
+
+        let rows = db
+            .query_visible_rows(
+                Category::Music,
+                "",
+                &BTreeMap::new(),
+                &default_format_priority(),
+            )
+            .unwrap();
+        assert!(!rows[0].tags.contains_key("GENRE"));
     }
 
     #[test]

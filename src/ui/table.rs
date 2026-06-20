@@ -7,11 +7,11 @@ use std::rc::Rc;
 
 use futures::{StreamExt as _, channel::mpsc};
 use gpui::{
-    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, SharedString, Size,
-    StatefulInteractiveElement as _, Styled, Window, div, hsla, prelude::FluentBuilder as _, px,
-    red, size,
+    AnyElement, App, AppContext as _, ClickEvent, Context, DismissEvent, Entity, FocusHandle,
+    Focusable, InteractiveElement as _, IntoElement, KeyDownEvent, Keystroke, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
+    SharedString, Size, StatefulInteractiveElement as _, Styled, Window, div, hsla,
+    prelude::FluentBuilder as _, px, red, size,
 };
 use gpui_component::{
     ActiveTheme as _, Sizable, StyledExt, VirtualListScrollHandle,
@@ -24,7 +24,7 @@ use gpui_component::{
 
 use crate::ui::CONTENT_PX;
 use crate::{
-    library::Library,
+    library::{Library, LibraryEvent},
     model::{AudioFormat, FileRecord},
 };
 
@@ -40,7 +40,6 @@ const CONVERT_MENU_PANE_WIDTH: f32 = 160.;
 const ROW_HEIGHT: Pixels = px(32.);
 
 struct PendingFileDrag {
-    path: PathBuf,
     extension: String,
     paths: Vec<PathBuf>,
     origin: Point<Pixels>,
@@ -57,7 +56,17 @@ struct TagWidthCache {
 struct ConversionAction {
     target: AudioFormat,
     sources: Vec<PathBuf>,
-    skipped: usize,
+}
+
+#[derive(Clone)]
+struct DeleteTarget {
+    row_count: usize,
+    paths: Vec<PathBuf>,
+}
+
+#[derive(Clone)]
+struct PendingDelete {
+    target: DeleteTarget,
 }
 
 pub struct FileTable {
@@ -66,6 +75,12 @@ pub struct FileTable {
     editing: Option<(PathBuf, String)>,
     focus_handle: FocusHandle,
     alt_down: bool,
+    hovered_row: Option<PathBuf>,
+    hovered_tag_chip: Option<PathBuf>,
+    hovered_delete_row: Option<PathBuf>,
+    pending_delete: Option<PendingDelete>,
+    pending_context_menu_delete: Option<DeleteTarget>,
+    row_context_menu_open: bool,
     pending_drag: Option<PendingFileDrag>,
     selected: BTreeSet<PathBuf>,
     selection_anchor: Option<PathBuf>,
@@ -120,6 +135,17 @@ impl FileTable {
             cx.notify();
         })
         .detach();
+        cx.subscribe(&library, |this, _, event: &LibraryEvent, cx| match event {
+            LibraryEvent::TagEdited { path } => {
+                this.tag_width_cache = None;
+                this.hovered_tag_chip = None;
+                if this.hovered_row.as_ref() == Some(path) {
+                    this.hovered_delete_row = Some(path.clone());
+                }
+                cx.notify();
+            }
+        })
+        .detach();
 
         let tag_input = cx.new(|cx| InputState::new(window, cx));
 
@@ -143,6 +169,12 @@ impl FileTable {
             editing: None,
             focus_handle: cx.focus_handle(),
             alt_down: false,
+            hovered_row: None,
+            hovered_tag_chip: None,
+            hovered_delete_row: None,
+            pending_delete: None,
+            pending_context_menu_delete: None,
+            row_context_menu_open: false,
             pending_drag: None,
             selected: BTreeSet::new(),
             selection_anchor: None,
@@ -235,6 +267,7 @@ impl FileTable {
                 .update(cx, |lib, cx| lib.add_tag(path, &key, value, cx));
         }
         self.focus_handle.focus(window, cx);
+        window.refresh();
         cx.notify();
     }
 
@@ -262,7 +295,6 @@ impl FileTable {
         );
         let path_count = paths.len();
         self.pending_drag = Some(PendingFileDrag {
-            path: record.path.clone(),
             extension,
             paths,
             origin,
@@ -276,7 +308,13 @@ impl FileTable {
         self.pending_drag = None;
     }
 
-    fn select_row(&mut self, path: PathBuf, extend: bool, cx: &mut Context<Self>) {
+    fn select_row(
+        &mut self,
+        path: PathBuf,
+        extend: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let start = crate::perf::start();
         let paths: Vec<PathBuf> = self
             .library
@@ -306,6 +344,7 @@ impl FileTable {
             self.selection_anchor = Some(path);
         }
 
+        self.focus_handle.focus(window, cx);
         cx.notify();
         crate::perf::finish("table.select_row", start, || {
             format!("rows={} selected={}", paths.len(), self.selected.len())
@@ -325,12 +364,6 @@ impl FileTable {
                 .filter(|record| self.selected.contains(record.path.as_path()))
                 .filter_map(|record| {
                     if let Some(variant) = record.variant_for_extension(extension) {
-                        eprintln!(
-                            "lowcat drag row={} selected_extension={} path={}",
-                            record.name,
-                            extension,
-                            variant.path.display()
-                        );
                         return Some(variant.path.clone());
                     }
 
@@ -340,16 +373,8 @@ impl FileTable {
                         .next()
                         .or_else(|| record.variants.first());
                     if let Some(variant) = fallback {
-                        eprintln!(
-                            "lowcat drag fallback row={} requested={} picked={} path={}",
-                            record.name,
-                            extension,
-                            variant.extension,
-                            variant.path.display()
-                        );
                         Some(variant.path.clone())
                     } else {
-                        eprintln!("lowcat drag skipped row={} no variants", record.name);
                         None
                     }
                 })
@@ -359,14 +384,7 @@ impl FileTable {
                 .iter()
                 .find(|record| record.path.as_path() == path)
                 .and_then(|record| record.variant_for_extension(extension))
-                .map(|variant| {
-                    eprintln!(
-                        "lowcat drag single extension={} path={}",
-                        extension,
-                        variant.path.display()
-                    );
-                    vec![variant.path.clone()]
-                })
+                .map(|variant| vec![variant.path.clone()])
                 .unwrap_or_default()
         }
     }
@@ -381,19 +399,12 @@ impl FileTable {
                 .into_iter()
                 .filter_map(|target| {
                     let mut sources = Vec::new();
-                    let mut skipped = 0usize;
                     for selected in selected_records {
-                        if selected.has_extension(target.extension()) {
-                            skipped += 1;
-                        } else {
+                        if !selected.has_extension(target.extension()) {
                             sources.push(selected.path.clone());
                         }
                     }
-                    (!sources.is_empty()).then_some(ConversionAction {
-                        target,
-                        sources,
-                        skipped,
-                    })
+                    (!sources.is_empty()).then_some(ConversionAction { target, sources })
                 })
                 .collect();
         }
@@ -404,9 +415,169 @@ impl FileTable {
             .map(|target| ConversionAction {
                 target,
                 sources: vec![record.path.clone()],
-                skipped: 0,
             })
             .collect()
+    }
+
+    fn delete_target(&self, record: &FileRecord, selected_records: &[FileRecord]) -> DeleteTarget {
+        let records: Vec<&FileRecord> =
+            if self.selected.len() > 1 && self.selected.contains(record.path.as_path()) {
+                selected_records.iter().collect()
+            } else {
+                vec![record]
+            };
+
+        let mut seen = BTreeSet::new();
+        let paths = records
+            .iter()
+            .flat_map(|record| record.variants.iter().map(|variant| variant.path.clone()))
+            .filter(|path| seen.insert(path.clone()))
+            .collect();
+
+        DeleteTarget {
+            row_count: records.len(),
+            paths,
+        }
+    }
+
+    fn selected_delete_target(&self, cx: &mut Context<Self>) -> Option<DeleteTarget> {
+        if self.selected.is_empty() {
+            return None;
+        }
+
+        let state = self.library.read(cx);
+        let selected_records: Vec<&FileRecord> = state
+            .active_state()
+            .results
+            .iter()
+            .filter(|record| self.selected.contains(record.path.as_path()))
+            .collect();
+
+        if selected_records.is_empty() {
+            return None;
+        }
+
+        let mut seen = BTreeSet::new();
+        let paths = selected_records
+            .iter()
+            .flat_map(|record| record.variants.iter().map(|variant| variant.path.clone()))
+            .filter(|path| seen.insert(path.clone()))
+            .collect();
+
+        Some(DeleteTarget {
+            row_count: selected_records.len(),
+            paths,
+        })
+    }
+
+    fn confirm_delete_target(
+        &mut self,
+        target: DeleteTarget,
+        _source: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if target.paths.is_empty() {
+            return;
+        }
+
+        self.pending_delete = Some(PendingDelete { target });
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    fn confirm_selected_delete(
+        &mut self,
+        source: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(target) = self.selected_delete_target(cx) else {
+            return false;
+        };
+        self.confirm_delete_target(target, source, window, cx);
+        true
+    }
+
+    fn request_context_menu_delete(&mut self, target: DeleteTarget) {
+        self.pending_context_menu_delete = Some(target);
+    }
+
+    fn confirm_pending_context_menu_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.pending_context_menu_delete.take() else {
+            return;
+        };
+
+        self.confirm_delete_target(target, "context-menu", window, cx);
+    }
+
+    pub fn pending_delete_counts(&self) -> Option<(usize, usize)> {
+        let pending = self.pending_delete.as_ref()?;
+        Some((pending.target.row_count, pending.target.paths.len()))
+    }
+
+    pub fn cancel_delete(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.pending_delete.take().is_some() {
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn clear_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.selected.is_empty() && self.selection_anchor.is_none() {
+            return false;
+        }
+
+        self.selected.clear();
+        self.selection_anchor = None;
+        cx.notify();
+        true
+    }
+
+    pub fn confirm_pending_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_delete.take() else {
+            return;
+        };
+
+        let paths = pending.target.paths;
+        self.selected.clear();
+        self.selection_anchor = None;
+        self.hovered_row = None;
+        self.hovered_tag_chip = None;
+        self.hovered_delete_row = None;
+        self.library
+            .update(cx, |lib, cx| lib.trash_files(paths, cx));
+        cx.notify();
+    }
+
+    fn set_row_hovered(&mut self, path: PathBuf, hovered: bool, cx: &mut Context<Self>) {
+        if hovered {
+            if self.hovered_row.as_ref() != Some(&path) {
+                self.hovered_row = Some(path.clone());
+                self.hovered_delete_row = Some(path);
+                cx.notify();
+            }
+        } else if self.hovered_row.as_ref() == Some(&path) {
+            self.hovered_row = None;
+            if self.hovered_delete_row.as_ref() == Some(&path) {
+                self.hovered_delete_row = None;
+            }
+            cx.notify();
+        }
+    }
+
+    fn set_tag_chip_hovered(&mut self, path: PathBuf, hovered: bool, cx: &mut Context<Self>) {
+        if hovered {
+            if self.hovered_tag_chip.as_ref() != Some(&path) {
+                self.hovered_tag_chip = Some(path);
+                cx.notify();
+            }
+        } else if self.hovered_tag_chip.as_ref() == Some(&path) {
+            self.hovered_tag_chip = None;
+            cx.notify();
+        }
     }
 
     pub(crate) fn cancel_file_drag(&mut self, cx: &mut Context<Self>) {
@@ -441,7 +612,6 @@ impl FileTable {
         }
 
         let drag_start = crate::perf::start();
-        let path = pending.path.clone();
         let extension = pending.extension.clone();
         let drag_paths = pending.paths.clone();
         let drag_path_count = drag_paths.len();
@@ -474,7 +644,6 @@ impl FileTable {
             });
             if !ok {
                 library.update(cx, |lib, cx| lib.clear_internal_file_drag(cx));
-                eprintln!("native file drag unavailable for {}", path.display());
             }
         });
         window.refresh();
@@ -560,6 +729,7 @@ impl FileTable {
         let path = record.path.clone();
         let convertible = record.is_convertible();
         let selected = self.selected.contains(path.as_path());
+        let delete_target = self.delete_target(record, selected_records);
         let row_hover_bg = if convertible {
             hsla(0.095, 1., 0.55, 0.2)
         } else {
@@ -567,6 +737,19 @@ impl FileTable {
         };
         let convertible_bg = hsla(0.095, 1., 0.55, 0.12);
         let chip_delete_bg = red().opacity(0.18);
+        let row_delete_bg = red().opacity(0.18);
+        let chip_hovered = self.hovered_tag_chip.as_ref() == Some(&path);
+        let row_hovered = !chip_hovered && self.hovered_row.as_ref() == Some(&path);
+        let row_delete_hover_enabled = self.hovered_tag_chip.is_none();
+        let delete_hovered = row_delete_hover_enabled
+            && self.alt_down
+            && self.hovered_delete_row.as_ref().is_some_and(|hovered| {
+                if self.selected.len() > 1 && self.selected.contains(hovered.as_path()) {
+                    selected
+                } else {
+                    hovered == &path
+                }
+            });
         let name = div()
             .w_full()
             .min_w_0()
@@ -574,10 +757,11 @@ impl FileTable {
             .child(record.name.clone());
         let open_path = record.path.clone();
         let select_path = record.path.clone();
-        let conversion_row_path = record.path.clone();
+        let hover_path = record.path.clone();
+        let delete_click_target = delete_target.clone();
         let conversion_actions = self.conversion_actions(record, selected_records);
-        let conversion_selected_count = selected_records.len();
         let table = cx.entity();
+        let menu_action_context = self.focus_handle.clone();
         let row_group = SharedString::from(format!("row-group:{}", path.display()));
         let mut row = div()
             .id(SharedString::from(format!("row:{}", path.display())))
@@ -591,19 +775,36 @@ impl FileTable {
                 s.border_t_1().border_color(cx.theme().table_row_border)
             })
             .when(convertible, |s| s.bg(convertible_bg))
-            .when(selected, |s| s.bg(row_hover_bg))
-            .hover(move |s| s.bg(row_hover_bg))
+            .when(selected || row_hovered, |s| s.bg(row_hover_bg))
+            .when(delete_hovered, |s| s.bg(row_delete_bg))
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                this.set_row_hovered(hover_path.clone(), *hovered, cx);
+            }))
             .on_click(cx.listener(move |_, event: &ClickEvent, _, _| {
+                if event.modifiers().alt {
+                    return;
+                }
                 if event.click_count() == 2 {
                     open_in_default_app(&open_path);
                 }
             }))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     if event.click_count == 1 {
+                        if event.modifiers.alt {
+                            this.clear_pending_drag();
+                            this.confirm_delete_target(
+                                delete_click_target.clone(),
+                                "opt-click",
+                                window,
+                                cx,
+                            );
+                            cx.stop_propagation();
+                            return;
+                        }
                         if event.modifiers.shift || !this.selected.contains(&select_path) {
-                            this.select_row(select_path.clone(), event.modifiers.shift, cx);
+                            this.select_row(select_path.clone(), event.modifiers.shift, window, cx);
                         }
                     }
                 }),
@@ -617,32 +818,37 @@ impl FileTable {
                     this.clear_pending_drag();
                 }),
             )
-            .context_menu(move |menu, _window, _cx| {
-                if conversion_actions.is_empty() {
-                    return menu;
-                }
-
+            .context_menu(move |menu, window, menu_cx| {
                 let table = table.clone();
                 let actions = conversion_actions.clone();
-                eprintln!(
-                    "lowcat context_menu convert_to row={} targets={} selected={}",
-                    conversion_row_path.display(),
-                    actions.len(),
-                    conversion_selected_count
-                );
-                let mut menu = menu.max_w(px(CONVERT_MENU_PANE_WIDTH));
+                let target = delete_target.clone();
+                let row_count = target.row_count;
+                menu_cx.update_entity(&table, |this, cx| {
+                    this.row_context_menu_open = true;
+                    cx.notify();
+                });
+                let popup = menu_cx.entity().clone();
+                window
+                    .subscribe(&popup, menu_cx, {
+                        let table = table.clone();
+                        move |_, _: &DismissEvent, window, cx| {
+                            cx.update_entity(&table, |this, cx| {
+                                this.row_context_menu_open = false;
+                                this.confirm_pending_context_menu_delete(window, cx);
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .detach();
+                let mut menu = menu
+                    .max_w(px(CONVERT_MENU_PANE_WIDTH))
+                    .action_context(menu_action_context.clone());
                 for action in actions {
                     let table = table.clone();
                     let target = action.target;
                     let label = SharedString::from(format!("Convert to {}", target.label()));
                     menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
                         let sources = action.sources.clone();
-                        eprintln!(
-                            "lowcat context_menu convert_to click target={} sources={} skipped={}",
-                            target.extension(),
-                            sources.len(),
-                            action.skipped
-                        );
                         cx.update_entity(&table, |this, cx| {
                             this.library.update(cx, |lib, cx| {
                                 lib.convert_files_to_format(sources, target, cx);
@@ -650,6 +856,20 @@ impl FileTable {
                         });
                     }));
                 }
+                if !conversion_actions.is_empty() {
+                    menu = menu.separator();
+                }
+                let table = table.clone();
+                let label = if row_count == 1 {
+                    SharedString::from("Delete")
+                } else {
+                    SharedString::from(format!("Delete {row_count} Rows"))
+                };
+                menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                    cx.update_entity(&table, |this, _| {
+                        this.request_context_menu_delete(target.clone());
+                    });
+                }));
                 menu
             })
             .child(
@@ -697,25 +917,28 @@ impl FileTable {
                                     .child(SharedString::from(label))
                                     .on_mouse_down(
                                         MouseButton::Left,
-                                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                            if event.click_count == 1 {
-                                                if event.modifiers.shift
-                                                    || !this.selected.contains(&record.path)
-                                                {
-                                                    this.select_row(
-                                                        record.path.clone(),
-                                                        event.modifiers.shift,
+                                        cx.listener(
+                                            move |this, event: &MouseDownEvent, window, cx| {
+                                                if event.click_count == 1 {
+                                                    if event.modifiers.shift
+                                                        || !this.selected.contains(&record.path)
+                                                    {
+                                                        this.select_row(
+                                                            record.path.clone(),
+                                                            event.modifiers.shift,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    }
+                                                    this.start_pending_drag(
+                                                        &record,
+                                                        extension.clone(),
+                                                        event.position,
                                                         cx,
                                                     );
                                                 }
-                                                this.start_pending_drag(
-                                                    &record,
-                                                    extension.clone(),
-                                                    event.position,
-                                                    cx,
-                                                );
-                                            }
-                                        }),
+                                            },
+                                        ),
                                     )
                             })),
                     )
@@ -732,6 +955,11 @@ impl FileTable {
             let mut cell = div()
                 .id(group.clone())
                 .group(group.clone())
+                .absolute()
+                .left(CONTENT_PX)
+                .right(CONTENT_PX)
+                .top_0()
+                .bottom_0()
                 .h_flex()
                 .flex_nowrap()
                 .items_center()
@@ -740,6 +968,9 @@ impl FileTable {
             if let Some(values) = record.tags.get(key) {
                 for value in values {
                     let (key, value, path) = (key.clone(), value.clone(), path.clone());
+                    let chip_hover_path = path.clone();
+                    let chip_group =
+                        SharedString::from(format!("chip-group:{}:{key}:{value}", path.display()));
 
                     cell = cell.child(
                         div()
@@ -747,25 +978,65 @@ impl FileTable {
                                 "chip:{}:{key}:{value}",
                                 path.display()
                             )))
-                            .px_1p5()
-                            .rounded_md()
-                            .text_xs()
-                            .whitespace_nowrap()
-                            .bg(cx.theme().muted)
-                            .text_color(cx.theme().muted_foreground)
-                            .cursor_pointer()
-                            .child(SharedString::from(value.clone()))
-                            .when(self.alt_down, |this| {
-                                this.hover(move |this| this.bg(chip_delete_bg))
-                            })
-                            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                                if event.modifiers().alt {
-                                    let path = path.clone();
-                                    this.library.update(cx, |lib, cx| {
-                                        lib.remove_tag(path, &key, &value, cx)
-                                    });
-                                }
-                            })),
+                            .group(chip_group.clone())
+                            .relative()
+                            .h(ROW_HEIGHT)
+                            .h_flex()
+                            .items_center()
+                            .child(
+                                div()
+                                    .px_1p5()
+                                    .rounded_md()
+                                    .text_xs()
+                                    .whitespace_nowrap()
+                                    .bg(cx.theme().muted)
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(SharedString::from(value.clone()))
+                                    .when(self.alt_down, |this| {
+                                        this.group_hover(chip_group, move |this| {
+                                            this.bg(chip_delete_bg)
+                                        })
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "chip-hitbox:{}:{key}:{value}",
+                                        path.display()
+                                    )))
+                                    .absolute()
+                                    .left_0()
+                                    .right_0()
+                                    .top(px(-1.))
+                                    .bottom(px(-1.))
+                                    .bg(cx.theme().transparent)
+                                    .cursor_pointer()
+                                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                                        this.set_tag_chip_hovered(
+                                            chip_hover_path.clone(),
+                                            *hovered,
+                                            cx,
+                                        );
+                                    }))
+                                    .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
+                                    .on_mouse_up(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .on_mouse_move(|_, _, cx| cx.stop_propagation())
+                                    .on_click(cx.listener(
+                                        move |this, event: &ClickEvent, window, cx| {
+                                            if event.modifiers().alt {
+                                                let path = path.clone();
+                                                this.library.update(cx, |lib, cx| {
+                                                    lib.remove_tag(path, &key, &value, cx)
+                                                });
+                                                window.refresh();
+                                                cx.notify();
+                                            }
+                                            cx.stop_propagation();
+                                        },
+                                    )),
+                            ),
                     );
                 }
             }
@@ -803,8 +1074,12 @@ impl FileTable {
                         .group_hover(group.clone(), |s| s.opacity(1.))
                         .hover(|s| s.text_color(cx.theme().foreground))
                         .child("+")
+                        .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
+                        .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_mouse_move(|_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.start_editing(path.clone(), key.clone(), window, cx);
+                            cx.stop_propagation();
                         })),
                 );
             }
@@ -812,13 +1087,10 @@ impl FileTable {
             row = row.child(
                 div()
                     .h_full()
-                    .flex()
-                    .items_center()
+                    .relative()
                     .w(*tag_width)
                     .min_w(*tag_width)
                     .flex_shrink_0()
-                    .px(CONTENT_PX)
-                    .py(px(4.))
                     .child(cell),
             );
         }
@@ -883,6 +1155,25 @@ impl Render for FileTable {
 
         let table = div()
             .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                match event.keystroke.key.as_str() {
+                    "escape" => {
+                        if this.cancel_delete(cx) || this.clear_selection(cx) {
+                            cx.stop_propagation();
+                        }
+                    }
+                    "backspace" | "delete" => {
+                        if this.row_context_menu_open {
+                            window.dispatch_keystroke(Keystroke::parse("escape").unwrap(), cx);
+                        }
+                        if this.confirm_selected_delete("keyboard", window, cx) {
+                            cx.stop_propagation();
+                        }
+                    }
+                    _ => {}
+                }
+            }))
+            .relative()
             .flex_1()
             .min_h_0()
             .v_flex()

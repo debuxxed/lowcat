@@ -101,32 +101,50 @@ impl Render for Toolbar {
             chip_row = chip_row.child(
                 div()
                     .id(SharedString::from(chip_id.clone()))
+                    .group(SharedString::from(format!("chip-group:{chip_id}")))
                     .flex_shrink_0()
-                    .px_1p5()
-                    .rounded_md()
-                    .text_xs()
-                    .bg(chip_bg)
-                    .text_color(cx.theme().muted_foreground)
-                    .cursor_pointer()
-                    .child(SharedString::from(value.clone()))
-                    .on_hover(cx.listener({
-                        let chip_id = chip_id.clone();
-                        move |this, hovered: &bool, _, cx| {
-                            if *hovered {
-                                this.hovered_chip = Some(chip_id.clone());
-                            } else if this.hovered_chip.as_deref() == Some(chip_id.as_str()) {
-                                this.hovered_chip = None;
-                            }
-                            cx.notify();
-                        }
-                    }))
-                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                        if event.modifiers().alt {
-                            this.library.update(cx, |lib, cx| {
-                                lib.remove_value(&key.clone(), &value.clone(), cx);
-                            });
-                        }
-                    })),
+                    .relative()
+                    .h_6()
+                    .h_flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .px_1p5()
+                            .rounded_md()
+                            .text_xs()
+                            .bg(chip_bg)
+                            .text_color(cx.theme().muted_foreground)
+                            .child(SharedString::from(value.clone())),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("chip-hitbox:{chip_id}")))
+                            .absolute()
+                            .inset_0()
+                            .w_full()
+                            .h_full()
+                            .bg(cx.theme().transparent)
+                            .cursor_pointer()
+                            .on_hover(cx.listener({
+                                let chip_id = chip_id.clone();
+                                move |this, hovered: &bool, _, cx| {
+                                    if *hovered {
+                                        this.hovered_chip = Some(chip_id.clone());
+                                    } else if this.hovered_chip.as_deref() == Some(chip_id.as_str())
+                                    {
+                                        this.hovered_chip = None;
+                                    }
+                                    cx.notify();
+                                }
+                            }))
+                            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                                if event.modifiers().alt {
+                                    this.library.update(cx, |lib, cx| {
+                                        lib.remove_value(&key.clone(), &value.clone(), cx);
+                                    });
+                                }
+                            })),
+                    ),
             );
         }
 

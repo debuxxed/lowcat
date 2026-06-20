@@ -91,7 +91,7 @@ pub fn sample(label: &'static str) {
 fn enabled() -> bool {
     *ENABLED.get_or_init(|| {
         std::env::var("LOWCAT_PROFILE")
-            .map(|value| value != "0")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
             .unwrap_or(false)
     })
 }

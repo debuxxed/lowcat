@@ -4,11 +4,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use futures::{StreamExt as _, channel::mpsc};
-use gpui::{AppContext as _, Context};
+use gpui::{AppContext as _, Context, EventEmitter};
 
 use crate::backend::{Backend, import_to_folder};
 use crate::model::{
-    AudioFormat, Category, CategoryState, ConvertConflictBehavior, FileRecord,
+    AudioFormat, Category, CategoryState, ConvertConflictBehavior, FileRecord, canonical_tag_key,
     default_format_priority, tag_label,
 };
 
@@ -32,6 +32,13 @@ pub struct Library {
 }
 
 #[derive(Clone)]
+pub enum LibraryEvent {
+    TagEdited { path: PathBuf },
+}
+
+impl EventEmitter<LibraryEvent> for Library {}
+
+#[derive(Clone)]
 struct InternalFileDrag {
     category: Category,
     paths: Vec<PathBuf>,
@@ -52,8 +59,12 @@ struct ImportBatchResult {
 struct ConvertBatchResult {
     category: Category,
     converted: bool,
-    converted_count: usize,
-    failed_count: usize,
+}
+
+struct TrashBatchResult {
+    category: Category,
+    file_count: usize,
+    result: io::Result<usize>,
 }
 
 enum ImportProgressEvent {
@@ -175,18 +186,38 @@ impl Library {
     }
 
     pub fn add_tag(&mut self, path: PathBuf, key: &str, value: &str, cx: &mut Context<Self>) {
-        if self.backend.add_tag(self.active, &path, key, value).is_ok() {
-            self.refresh(cx);
+        match self.backend.add_tag(self.active, &path, key, value) {
+            Ok(()) => {
+                eprintln!("tag add path={} key={key}", path.display());
+                self.apply_tag_add(&path, key, value);
+                let _ = self.refresh_category_state(self.active);
+                cx.emit(LibraryEvent::TagEdited { path });
+                cx.notify();
+            }
+            Err(error) => {
+                eprintln!(
+                    "tag add failed path={} key={key} error={error}",
+                    path.display()
+                );
+            }
         }
     }
 
     pub fn remove_tag(&mut self, path: PathBuf, key: &str, value: &str, cx: &mut Context<Self>) {
-        if self
-            .backend
-            .remove_tag(self.active, &path, key, value)
-            .is_ok()
-        {
-            self.refresh(cx);
+        match self.backend.remove_tag(self.active, &path, key, value) {
+            Ok(()) => {
+                eprintln!("tag remove path={} key={key}", path.display());
+                self.apply_tag_remove(&path, key, value);
+                let _ = self.refresh_category_state(self.active);
+                cx.emit(LibraryEvent::TagEdited { path });
+                cx.notify();
+            }
+            Err(error) => {
+                eprintln!(
+                    "tag remove failed path={} key={key} error={error}",
+                    path.display()
+                );
+            }
         }
     }
 
@@ -225,14 +256,6 @@ impl Library {
             .set_format_priority(self.format_priority.clone())
             .is_ok()
         {
-            eprintln!(
-                "lowcat format priority={}",
-                self.format_priority
-                    .iter()
-                    .map(|format| format.extension())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
             self.refresh(cx);
         } else {
             cx.notify();
@@ -250,7 +273,6 @@ impl Library {
         }
         if self.backend.set_convert_conflict_behavior(behavior).is_ok() {
             self.convert_conflict_behavior = behavior;
-            eprintln!("lowcat convert conflict behavior={}", behavior.key());
         }
         cx.notify();
     }
@@ -261,11 +283,6 @@ impl Library {
 
     pub fn begin_internal_file_drag_files(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         let paths: Vec<PathBuf> = paths.into_iter().map(canonical_or_original).collect();
-        eprintln!(
-            "lowcat internal file drag started category={} paths={}",
-            self.active.label(),
-            paths.len()
-        );
         self.internal_file_drag = Some(InternalFileDrag {
             category: self.active,
             paths,
@@ -279,7 +296,6 @@ impl Library {
 
     pub fn clear_internal_file_drag(&mut self, cx: &mut Context<Self>) {
         if self.internal_file_drag.take().is_some() {
-            eprintln!("lowcat internal file drag cleared");
             cx.notify();
         }
     }
@@ -351,10 +367,6 @@ impl Library {
         cx: &mut Context<Self>,
     ) {
         if self.importing {
-            eprintln!(
-                "lowcat convert batch skipped target={} reason=busy",
-                target.extension()
-            );
             cx.notify();
             return;
         }
@@ -365,10 +377,6 @@ impl Library {
             .filter(|source| seen.insert(source.clone()))
             .collect();
         if sources.is_empty() {
-            eprintln!(
-                "lowcat convert batch skipped target={} sources=0",
-                target.extension()
-            );
             cx.notify();
             return;
         }
@@ -381,11 +389,6 @@ impl Library {
             file_name: file_name(&sources[0]),
             progress: 0.,
         });
-        eprintln!(
-            "lowcat convert batch start target={} sources={}",
-            target.extension(),
-            sources.len()
-        );
         cx.notify();
 
         let (progress_tx, mut progress_rx) = mpsc::unbounded();
@@ -400,8 +403,7 @@ impl Library {
         .detach();
 
         let convert_task = cx.background_spawn(async move {
-            let mut converted_count = 0usize;
-            let mut failed_count = 0usize;
+            let mut converted = false;
             match Backend::new(db_path) {
                 Ok(backend) => {
                     for source in sources {
@@ -415,17 +417,10 @@ impl Library {
                                     .unbounded_send(ImportProgressEvent::Progress(progress));
                             });
                         match result {
-                            Ok(path) => {
-                                converted_count += 1;
-                                eprintln!(
-                                    "lowcat converted source={} target={} output={}",
-                                    source.display(),
-                                    target.extension(),
-                                    path.display()
-                                );
+                            Ok(_) => {
+                                converted = true;
                             }
                             Err(error) => {
-                                failed_count += 1;
                                 eprintln!(
                                     "lowcat convert failed source={} target={} error={error}",
                                     source.display(),
@@ -436,7 +431,6 @@ impl Library {
                     }
                 }
                 Err(error) => {
-                    failed_count = sources.len();
                     eprintln!(
                         "lowcat convert batch failed target={} error={error}",
                         target.extension()
@@ -446,9 +440,7 @@ impl Library {
             let _ = progress_tx.unbounded_send(ImportProgressEvent::Finish);
             ConvertBatchResult {
                 category,
-                converted: converted_count > 0,
-                converted_count,
-                failed_count,
+                converted,
             }
         });
 
@@ -460,6 +452,40 @@ impl Library {
             .ok();
         })
         .detach();
+    }
+
+    pub fn trash_files(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let mut seen = BTreeSet::new();
+        let paths: Vec<PathBuf> = paths
+            .into_iter()
+            .filter(|path| seen.insert(path.clone()))
+            .collect();
+        if paths.is_empty() {
+            cx.notify();
+            return;
+        }
+
+        let category = self.active;
+        let file_count = paths.len();
+
+        let trash_task = cx.background_spawn(async move {
+            let result = Backend::trash_files(paths);
+            TrashBatchResult {
+                category,
+                file_count,
+                result,
+            }
+        });
+
+        cx.spawn(async move |this, cx| {
+            let result = trash_task.await;
+            this.update(cx, |lib, cx| {
+                lib.finish_trash_files(result, cx);
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
     }
 
     pub fn set_category_folder(
@@ -503,19 +529,16 @@ impl Library {
     pub fn rescan_after_focus(&mut self, cx: &mut Context<Self>) {
         let now = Instant::now();
         if self.focus_rescan_in_flight {
-            eprintln!("lowcat focus rescan skipped in_flight=true");
             return;
         }
         if self
             .last_focus_rescan
             .is_some_and(|last| now.duration_since(last) < Duration::from_millis(750))
         {
-            eprintln!("lowcat focus rescan skipped debounce=true");
             return;
         }
         self.last_focus_rescan = Some(now);
         self.focus_rescan_in_flight = true;
-        eprintln!("lowcat focus rescan start");
         let settings = self.settings.clone();
         let db_path = database_path_for_settings(&self.settings_path);
         let started_at = Instant::now();
@@ -645,15 +668,35 @@ impl Library {
     fn finish_convert_unsupported(&mut self, result: ConvertBatchResult, cx: &mut Context<Self>) {
         self.importing = false;
         self.import_progress = None;
-        eprintln!(
-            "lowcat convert batch finish category={} converted={} failed={}",
-            result.category.label(),
-            result.converted_count,
-            result.failed_count
-        );
         if result.converted {
             let _ = self.backend.refresh_category(result.category);
             let _ = self.refresh_category_state(result.category);
+        }
+        cx.notify();
+    }
+
+    fn finish_trash_files(&mut self, result: TrashBatchResult, cx: &mut Context<Self>) {
+        match result.result {
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!(
+                    "lowcat trash batch failed category={} requested={} error={error}",
+                    result.category.label(),
+                    result.file_count
+                );
+            }
+        }
+        if let Err(error) = self.backend.refresh_category(result.category) {
+            eprintln!(
+                "lowcat trash refresh failed category={} error={error}",
+                result.category.label()
+            );
+        }
+        if let Err(error) = self.refresh_category_state(result.category) {
+            eprintln!(
+                "lowcat trash state refresh failed category={} error={error}",
+                result.category.label()
+            );
         }
         cx.notify();
     }
@@ -675,10 +718,6 @@ impl Library {
                         );
                     }
                 }
-                eprintln!(
-                    "lowcat focus rescan ok elapsed_ms={}",
-                    started_at.elapsed().as_millis()
-                );
             }
             Err(error) => {
                 eprintln!(
@@ -705,6 +744,55 @@ impl Library {
             schema,
             results,
             ..Default::default()
+        }
+    }
+
+    fn apply_tag_add(&mut self, path: &Path, key: &str, value: &str) {
+        let Some(key) = display_tag_key(key) else {
+            return;
+        };
+        let value = value.to_string();
+        let Some(state) = self.states.get_mut(&self.active) else {
+            return;
+        };
+        if let Some(record) = state.results.iter_mut().find(|record| record.path == path) {
+            let values = record.tags.entry(key.clone()).or_default();
+            if !values.contains(&value) {
+                values.push(value.clone());
+                values.sort_by_key(|value| value.to_lowercase());
+            }
+        }
+        let values = state.schema.entry(key).or_default();
+        if !values.contains(&value) {
+            values.push(value);
+            values.sort_by_key(|value| value.to_lowercase());
+        }
+    }
+
+    fn apply_tag_remove(&mut self, path: &Path, key: &str, value: &str) {
+        let Some(key) = display_tag_key(key) else {
+            return;
+        };
+        let Some(state) = self.states.get_mut(&self.active) else {
+            return;
+        };
+        if let Some(record) = state.results.iter_mut().find(|record| record.path == path)
+            && let Some(values) = record.tags.get_mut(&key)
+        {
+            values.retain(|existing| existing != value);
+            if values.is_empty() {
+                record.tags.remove(&key);
+            }
+        }
+        let value = value.to_string();
+        let still_used = state.results.iter().any(|record| {
+            record
+                .tags
+                .get(&key)
+                .is_some_and(|values| values.contains(&value))
+        });
+        if !still_used && let Some(values) = state.schema.get_mut(&key) {
+            values.retain(|existing| existing != &value);
         }
     }
 }
@@ -736,6 +824,10 @@ fn display_schema(schema: BTreeMap<String, Vec<String>>) -> BTreeMap<String, Vec
         .into_iter()
         .map(|(key, values)| (tag_label(&key).to_string(), values))
         .collect()
+}
+
+fn display_tag_key(key: &str) -> Option<String> {
+    canonical_tag_key(key).map(tag_label).map(str::to_string)
 }
 
 fn display_records(records: Vec<FileRecord>) -> Vec<FileRecord> {
@@ -909,6 +1001,40 @@ mod tests {
         );
         let priority = library.read_with(cx, |lib, _| lib.format_priority().to_vec());
         assert_eq!(priority[0], AudioFormat::Mp3);
+    }
+
+    #[gpui::test]
+    fn trash_files_removes_grouped_variants_and_refreshes(cx: &mut gpui::TestAppContext) {
+        let settings_path = settings_path("trash-grouped");
+        let (music_dir, _) = settings_with_folders(&settings_path);
+        let aaa_flac = fixture(&music_dir, "aaa.flac", &[("GENRE", "Ambient")]);
+        let aaa_mp3 = fixture(&music_dir, "aaa.mp3", &[]);
+        let bbb_opus = fixture(&music_dir, "bbb.opus", &[("MOOD", "Dark")]);
+        let bbb_wav = fixture(&music_dir, "bbb.wav", &[]);
+        let original_paths = vec![aaa_flac, aaa_mp3, bbb_opus, bbb_wav];
+        let library = cx.new(|_| Library::new_with_settings_path(settings_path));
+
+        let variant_paths = library.read_with(cx, |lib, _| {
+            assert_eq!(lib.active_state().results.len(), 2);
+            lib.active_state()
+                .results
+                .iter()
+                .flat_map(|record| record.variants.iter().map(|variant| variant.path.clone()))
+                .collect::<Vec<_>>()
+        });
+
+        library.update(cx, |lib, cx| lib.trash_files(variant_paths, cx));
+        cx.run_until_parked();
+
+        for path in &original_paths {
+            assert!(
+                !path.exists(),
+                "{} should have moved to Trash",
+                path.display()
+            );
+        }
+        let count = library.read_with(cx, |lib, _| lib.active_state().results.len());
+        assert_eq!(count, 0);
     }
 
     #[gpui::test]

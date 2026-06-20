@@ -5,11 +5,15 @@ mod titlebar;
 mod toolbar;
 
 use gpui::{
-    App, AppContext, Context, Entity, ExternalPaths, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, ModifiersChangedEvent, ParentElement, Pixels, Render, SharedString,
-    Styled, Window, actions, div, prelude::FluentBuilder, px, rgba,
+    AnyElement, App, AppContext, Context, Entity, ExternalPaths, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, KeyDownEvent, ModifiersChangedEvent, ParentElement, Pixels,
+    Render, SharedString, Styled, Window, actions, div, prelude::FluentBuilder, px, rgba,
 };
-use gpui_component::{ActiveTheme as _, Sizable as _, StyledExt, progress::Progress};
+use gpui_component::{
+    ActiveTheme as _, Sizable as _, StyledExt,
+    button::{Button, ButtonVariants as _},
+    progress::Progress,
+};
 
 use crate::model::Category;
 use crate::ui::titlebar::TITLEBAR_LEFT_OFFSET;
@@ -65,6 +69,10 @@ impl UI {
         self.table
             .update(cx, |table, cx| table.cancel_file_drag(cx));
         cx.notify();
+    }
+
+    fn cancel_delete(&mut self, cx: &mut Context<Self>) -> bool {
+        self.table.update(cx, |table, cx| table.cancel_delete(cx))
     }
 
     /// Full-window overlay that fades in while OS files are dragged over the
@@ -193,6 +201,92 @@ impl UI {
                     ),
             )
     }
+
+    fn render_delete_confirmation_modal(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (row_count, file_count) = self.table.read(cx).pending_delete_counts()?;
+        let title = if row_count == 1 {
+            "Move row to Trash?"
+        } else {
+            "Move rows to Trash?"
+        };
+        let row_label = pluralize(row_count, "row", "rows");
+        let file_label = pluralize(file_count, "file", "files");
+        let description =
+            format!("Move {row_count} {row_label} ({file_count} {file_label}) to Trash?");
+
+        Some(
+            div()
+                .id("delete-confirmation-overlay")
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .bg(rgba(0x00000099))
+                .occlude()
+                .hover(|style| style)
+                .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
+                .on_mouse_move(|_, _, cx| cx.stop_propagation())
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .size_full()
+                        .h_flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .w(px(360.))
+                                .max_w(px(520.))
+                                .v_flex()
+                                .gap_3()
+                                .p_4()
+                                .rounded(px(8.))
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .bg(cx.theme().popover)
+                                .shadow_lg()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .child(title),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(description),
+                                )
+                                .child(
+                                    div()
+                                        .h_flex()
+                                        .justify_end()
+                                        .gap_2()
+                                        .child(
+                                            Button::new("delete-cancel")
+                                                .small()
+                                                .label("Cancel")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.cancel_delete(cx);
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("delete-confirm")
+                                                .small()
+                                                .danger()
+                                                .label("Move to Trash")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.table.update(cx, |table, cx| {
+                                                        table.confirm_pending_delete(cx);
+                                                    });
+                                                })),
+                                        ),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
 }
 
 impl Focusable for UI {
@@ -227,6 +321,10 @@ impl Render for UI {
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" {
+                    if this.cancel_delete(cx) {
+                        cx.stop_propagation();
+                        return;
+                    }
                     this.cancel_file_drag(cx);
                     cx.stop_propagation();
                 }
@@ -248,5 +346,10 @@ impl Render for UI {
             .when(import_progress_active, |el| {
                 el.child(self.render_import_progress_modal(cx))
             })
+            .children(self.render_delete_confirmation_modal(cx))
     }
+}
+
+fn pluralize(count: usize, singular: &'static str, plural: &'static str) -> &'static str {
+    if count == 1 { singular } else { plural }
 }
