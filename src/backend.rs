@@ -34,6 +34,10 @@ impl Backend {
         self.refresh_category(category)
     }
 
+    pub fn remember_category_folder(&mut self, category: Category, path: PathBuf) {
+        self.folders.insert(category, path);
+    }
+
     pub fn refresh_all(&mut self) -> io::Result<()> {
         for category in Category::ALL {
             self.refresh_category(category)?;
@@ -67,42 +71,20 @@ impl Backend {
             return Ok(());
         }
 
-        let mut records = Vec::new();
-        let mut files_seen = 0usize;
-        let mut skipped_seen = 0usize;
-        for entry in fs::read_dir(folder)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
-            files_seen += 1;
+        let fingerprints = self.db.file_fingerprints(category)?;
+        let scan = scan_category_folder(category, folder, &fingerprints)?;
 
-            if !is_library_file(&path) || !probe_is_audio(&path) {
-                skipped_seen += 1;
-                continue;
-            }
-
-            if let Ok(record) = read_scan_record(category, &path) {
-                records.push(record);
-            }
-        }
-
-        let records_len = records.len();
-        let summary = self.db.sync_category(category, records)?;
-        eprintln!(
-            "lowcat sync category={} added={} updated={} removed={} files_seen={} skipped={}",
-            category.label(),
-            summary.added,
-            summary.updated,
-            summary.removed,
-            files_seen,
-            skipped_seen
-        );
+        let records_len = scan.records.len();
+        let summary = self.db.sync_category(category, scan.records)?;
         crate::perf::finish("backend.refresh_category", refresh_start, || {
             format!(
-                "category={} records={records_len} files_seen={files_seen} skipped={skipped_seen} added={} updated={} removed={}",
+                "category={} records={records_len} files_seen={} dirs_seen={} skipped={} reused={} tags_read={} added={} updated={} removed={}",
                 category.label(),
+                scan.files_seen,
+                scan.dirs_seen,
+                scan.skipped_seen,
+                scan.reused_seen,
+                scan.tags_read,
                 summary.added,
                 summary.updated,
                 summary.removed
@@ -211,6 +193,80 @@ impl Backend {
         })?;
         convert_file_to_format(source, folder, target, behavior, on_progress)
     }
+
+    pub fn trash_files(paths: Vec<PathBuf>) -> io::Result<usize> {
+        trash_files(paths)
+    }
+}
+
+#[derive(Default)]
+struct CategoryScan {
+    records: Vec<FileScanRecord>,
+    files_seen: usize,
+    dirs_seen: usize,
+    skipped_seen: usize,
+    reused_seen: usize,
+    tags_read: usize,
+}
+
+fn scan_category_folder(
+    category: Category,
+    folder: &Path,
+    fingerprints: &BTreeMap<String, (u64, i64)>,
+) -> io::Result<CategoryScan> {
+    let mut scan = CategoryScan::default();
+    scan_category_dir(category, folder, fingerprints, &mut scan)?;
+    Ok(scan)
+}
+
+fn scan_category_dir(
+    category: Category,
+    folder: &Path,
+    fingerprints: &BTreeMap<String, (u64, i64)>,
+    scan: &mut CategoryScan,
+) -> io::Result<()> {
+    for entry in fs::read_dir(folder)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+
+        if file_type.is_dir() {
+            scan.dirs_seen += 1;
+            scan_category_dir(category, &path, fingerprints, scan)?;
+            continue;
+        }
+
+        if !file_type.is_file() {
+            continue;
+        }
+        scan.files_seen += 1;
+
+        if !is_library_file(&path) {
+            scan.skipped_seen += 1;
+            continue;
+        }
+
+        if let Ok(record) = read_scan_record_cached(category, &path, fingerprints, scan) {
+            scan.records.push(record);
+        }
+    }
+
+    Ok(())
+}
+
+fn trash_files(paths: Vec<PathBuf>) -> io::Result<usize> {
+    let mut seen = BTreeSet::new();
+    let paths: Vec<PathBuf> = paths
+        .into_iter()
+        .filter(|path| seen.insert(path.clone()))
+        .collect();
+    let path_count = paths.len();
+    if path_count == 0 {
+        return Ok(0);
+    }
+
+    trash::delete_all(&paths).map_err(io::Error::other)?;
+    Ok(path_count)
 }
 
 pub fn import_to_folder(
@@ -495,19 +551,59 @@ fn is_library_file(path: &Path) -> bool {
 fn read_scan_record(category: Category, path: &Path) -> io::Result<FileScanRecord> {
     let metadata = fs::metadata(path)?;
     let tags = read_tags(category, path).unwrap_or_default();
+    read_scan_record_with_tags(path, metadata.len(), modified_secs(&metadata), tags)
+}
+
+fn read_scan_record_cached(
+    category: Category,
+    path: &Path,
+    fingerprints: &BTreeMap<String, (u64, i64)>,
+    scan: &mut CategoryScan,
+) -> io::Result<FileScanRecord> {
+    let metadata = fs::metadata(path)?;
+    let size = metadata.len();
+    let modified = modified_secs(&metadata);
+    let path_key = path.to_string_lossy().to_string();
+    let unchanged = fingerprints
+        .get(&path_key)
+        .is_some_and(|(cached_size, cached_modified)| {
+            *cached_size == size && *cached_modified == modified
+        });
+
+    let tags = if unchanged {
+        scan.reused_seen += 1;
+        BTreeMap::new()
+    } else {
+        scan.tags_read += 1;
+        read_tags(category, path).unwrap_or_default()
+    };
+
+    read_scan_record_with_tags(path, size, modified, tags)
+}
+
+fn read_scan_record_with_tags(
+    path: &Path,
+    size: u64,
+    modified: i64,
+    tags: BTreeMap<String, Vec<String>>,
+) -> io::Result<FileScanRecord> {
     Ok(FileScanRecord {
         path: path.to_path_buf(),
         stem: file_stem(path),
         extension: extension(path).unwrap_or_default(),
-        size: metadata.len(),
-        modified: metadata
-            .modified()
-            .ok()
-            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-            .map(|duration| duration.as_secs() as i64)
-            .unwrap_or_default(),
+        size,
+        modified,
         tags,
     })
+}
+
+fn modified_secs(metadata: &fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
 }
 
 fn file_stem(path: &Path) -> String {
@@ -657,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn scans_supported_audio_non_recursively_and_groups_variants() {
+    fn scans_supported_audio_recursively_and_groups_variants() {
         let dir = unique_dir("extensions");
         fixture(&dir, "top.opus", &[]);
         fixture(&dir, "top.flac", &[]);
@@ -671,9 +767,9 @@ mod tests {
         backend.set_category_folder(Category::Music, dir).unwrap();
 
         let records = backend.filter(Category::Music, "", &BTreeMap::new());
-        assert_eq!(names(records.clone()), vec!["clip", "top"]);
+        assert_eq!(names(records.clone()), vec!["clip", "nested", "skip", "top"]);
         assert_eq!(
-            records[1]
+            records[3]
                 .variants
                 .iter()
                 .map(|variant| variant.extension.as_str())
@@ -683,7 +779,66 @@ mod tests {
     }
 
     #[test]
-    fn unparsable_matching_extension_is_skipped() {
+    fn preserves_tags_when_file_moves_within_category_folder() {
+        let dir = unique_dir("move-tags");
+        let path = fixture(&dir, "song.flac", &[]);
+
+        let mut backend = backend("move-tags");
+        backend
+            .set_category_folder(Category::Sfx, dir.clone())
+            .unwrap();
+        backend
+            .add_tag(Category::Sfx, &path, "Type", "Foley")
+            .unwrap();
+
+        let nested = dir.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let nested_path = nested.join("song.flac");
+        fs::rename(&path, &nested_path).unwrap();
+        backend.refresh_category(Category::Sfx).unwrap();
+
+        let records = backend.filter(Category::Sfx, "", &BTreeMap::new());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].path, nested_path);
+        assert_eq!(records[0].tags["TYPE"], vec!["Foley"]);
+    }
+
+    #[test]
+    fn refresh_indexes_matching_extensions_without_probe() {
+        let dir = unique_dir("extension-only");
+        fs::write(dir.join("renamed.wav"), b"not actually audio").unwrap();
+
+        let mut backend = backend("extension-only");
+        backend.set_category_folder(Category::Music, dir).unwrap();
+        let records = backend.filter(Category::Music, "", &BTreeMap::new());
+
+        assert_eq!(names(records), vec!["renamed"]);
+    }
+
+    #[test]
+    fn unchanged_refresh_preserves_existing_tags_without_rereading_file_tags() {
+        let dir = unique_dir("unchanged-tags");
+        let path = fixture(&dir, "song.flac", &[("genre", "Embedded")]);
+
+        let mut backend = backend("unchanged-tags");
+        backend
+            .set_category_folder(Category::Music, dir.clone())
+            .unwrap();
+        backend
+            .remove_tag(Category::Music, &path, "genre", "Embedded")
+            .unwrap();
+        backend
+            .add_tag(Category::Music, &path, "genre", "Manual")
+            .unwrap();
+
+        backend.refresh_category(Category::Music).unwrap();
+
+        let records = backend.filter(Category::Music, "", &BTreeMap::new());
+        assert_eq!(records[0].tags["GENRE"], vec!["Manual"]);
+    }
+
+    #[test]
+    fn unparsable_matching_extension_is_indexed_without_tags() {
         let dir = unique_dir("unparsable");
         fs::write(dir.join("renamed.opus"), b"not actually ogg opus").unwrap();
         fixture(&dir, "valid.flac", &[("GENRE", "Ambient")]);
@@ -692,8 +847,9 @@ mod tests {
         backend.set_category_folder(Category::Music, dir).unwrap();
         let records = backend.filter(Category::Music, "", &BTreeMap::new());
 
-        assert_eq!(names(records.clone()), vec!["valid"]);
-        assert_eq!(records[0].tags["GENRE"], vec!["Ambient"]);
+        assert_eq!(names(records.clone()), vec!["renamed", "valid"]);
+        assert!(!records[0].tags.contains_key("GENRE"));
+        assert_eq!(records[1].tags["GENRE"], vec!["Ambient"]);
     }
 
     #[test]
