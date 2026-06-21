@@ -201,7 +201,6 @@ impl Library {
     pub fn add_tag(&mut self, path: PathBuf, key: &str, value: &str, cx: &mut Context<Self>) {
         match self.backend.add_tag(self.active, &path, key, value) {
             Ok(()) => {
-                eprintln!("tag add path={} key={key}", path.display());
                 self.apply_tag_add(&path, key, value);
                 let _ = self.refresh_category_state(self.active);
                 cx.emit(LibraryEvent::TagEdited { path });
@@ -219,7 +218,6 @@ impl Library {
     pub fn remove_tag(&mut self, path: PathBuf, key: &str, value: &str, cx: &mut Context<Self>) {
         match self.backend.remove_tag(self.active, &path, key, value) {
             Ok(()) => {
-                eprintln!("tag remove path={} key={key}", path.display());
                 self.apply_tag_remove(&path, key, value);
                 let _ = self.refresh_category_state(self.active);
                 cx.emit(LibraryEvent::TagEdited { path });
@@ -618,7 +616,6 @@ impl Library {
     }
 
     fn start_initial_rescan(&mut self, cx: &mut Context<Self>) {
-        eprintln!("lowcat initial scan scheduled");
         self.rescan_after_focus(cx);
     }
 
