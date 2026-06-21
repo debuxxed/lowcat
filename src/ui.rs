@@ -344,11 +344,9 @@ impl Render for UI {
         #[cfg(target_os = "macos")]
         let root = root
             .on_action(|_: &MinimizeWindow, window, _| {
-                eprintln!("macos-command: minimize-window");
                 window.minimize_window();
             })
             .on_action(|_: &CloseWindow, window, _| {
-                eprintln!("macos-command: close-window");
                 window.remove_window();
             });
 

@@ -38,7 +38,6 @@ fn main() {
         cx.on_action(|_: &Quit, cx| cx.quit());
         #[cfg(target_os = "macos")]
         cx.on_action(|_: &HideApp, cx| {
-            eprintln!("macos-command: hide-app");
             cx.hide();
         });
 
