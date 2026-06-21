@@ -222,6 +222,18 @@ impl Database {
                         .await?;
                 }
             }
+            sqlx::query(
+                "DELETE FROM tag_values
+                 WHERE category = ?
+                   AND NOT EXISTS (
+                       SELECT 1 FROM files
+                       WHERE files.category = tag_values.category
+                         AND files.stem = tag_values.stem
+                   )",
+            )
+            .bind(category_key)
+            .execute(&self.pool)
+            .await?;
 
             Ok::<_, sqlx::Error>(summary)
         })
@@ -260,9 +272,20 @@ impl Database {
         selected: &BTreeMap<String, BTreeSet<String>>,
         priority: &[AudioFormat],
     ) -> io::Result<Vec<FileRecord>> {
-        let rows = self.file_rows(category)?;
-        let tags = self.tags_for_category(category)?;
         let selected = canonical_selected(selected);
+        let has_filter = !search.is_empty() || selected.values().any(|values| !values.is_empty());
+        let (rows, tags) = if has_filter && search.is_ascii() {
+            let stems = self.matching_stems(category, search, &selected)?;
+            if stems.is_empty() {
+                return Ok(Vec::new());
+            }
+            (
+                self.file_rows_for_stems(category, &stems)?,
+                self.tags_for_stems(category, &stems)?,
+            )
+        } else {
+            (self.file_rows(category)?, self.tags_for_category(category)?)
+        };
         let mut grouped: BTreeMap<String, Vec<FileVariant>> = BTreeMap::new();
 
         for row in rows {
@@ -309,9 +332,14 @@ impl Database {
         let category_key = category_key(category);
         let rows = block_on(async {
             sqlx::query(
-                "SELECT key, value FROM tag_values
-                 WHERE category = ?
-                 ORDER BY key COLLATE NOCASE, value COLLATE NOCASE",
+                "SELECT DISTINCT tv.key, tv.value FROM tag_values tv
+                 WHERE tv.category = ?
+                   AND EXISTS (
+                       SELECT 1 FROM files f
+                       WHERE f.category = tv.category
+                         AND f.stem = tv.stem
+                   )
+                 ORDER BY tv.key COLLATE NOCASE, tv.value COLLATE NOCASE",
             )
             .bind(category_key)
             .fetch_all(&self.pool)
@@ -452,6 +480,99 @@ impl Database {
         block_on(async { sqlx::query(&sql).fetch_all(&self.pool).await }).map_err(io::Error::other)
     }
 
+    fn matching_stems(
+        &self,
+        category: Category,
+        search: &str,
+        selected: &BTreeMap<String, BTreeSet<String>>,
+    ) -> io::Result<Vec<String>> {
+        let mut sql = String::from(
+            "SELECT DISTINCT f.stem FROM files f
+             WHERE f.category = ?",
+        );
+        if !search.is_empty() {
+            sql.push_str(
+                " AND (
+                    lower(f.stem) LIKE ? ESCAPE '\\'
+                    OR lower(f.extension) LIKE ? ESCAPE '\\'
+                    OR EXISTS (
+                        SELECT 1 FROM tag_values tv
+                        WHERE tv.category = f.category
+                          AND tv.stem = f.stem
+                          AND (
+                            lower(tv.key) LIKE ? ESCAPE '\\'
+                            OR lower(tv.value) LIKE ? ESCAPE '\\'
+                          )
+                    )
+                )",
+            );
+        }
+        for values in selected.values() {
+            for _ in values {
+                sql.push_str(
+                    " AND EXISTS (
+                        SELECT 1 FROM tag_values selected_tv
+                        WHERE selected_tv.category = f.category
+                          AND selected_tv.stem = f.stem
+                          AND selected_tv.key = ?
+                          AND selected_tv.value = ?
+                    )",
+                );
+            }
+        }
+        sql.push_str(" ORDER BY lower(f.stem), f.stem");
+
+        let search_pattern = like_contains_pattern(search);
+        let rows = block_on(async {
+            let mut query = sqlx::query(&sql).bind(category_key(category));
+            if !search.is_empty() {
+                query = query
+                    .bind(&search_pattern)
+                    .bind(&search_pattern)
+                    .bind(&search_pattern)
+                    .bind(&search_pattern);
+            }
+            for (key, values) in selected {
+                for value in values {
+                    query = query.bind(key).bind(value);
+                }
+            }
+            query.fetch_all(&self.pool).await
+        })
+        .map_err(io::Error::other)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| row.get::<String, _>("stem"))
+            .collect())
+    }
+
+    fn file_rows_for_stems(
+        &self,
+        category: Category,
+        stems: &[String],
+    ) -> io::Result<Vec<sqlx::sqlite::SqliteRow>> {
+        let mut rows = Vec::new();
+        for chunk in stems.chunks(500) {
+            let placeholders = placeholders(chunk.len());
+            let sql = format!(
+                "SELECT path, stem, extension, size, modified FROM files
+                 WHERE category = ? AND stem IN ({placeholders})
+                 ORDER BY stem, extension"
+            );
+            let chunk_rows = block_on(async {
+                let mut query = sqlx::query(&sql).bind(category_key(category));
+                for stem in chunk {
+                    query = query.bind(stem);
+                }
+                query.fetch_all(&self.pool).await
+            })
+            .map_err(io::Error::other)?;
+            rows.extend(chunk_rows);
+        }
+        Ok(rows)
+    }
+
     fn tags_for_category(
         &self,
         category: Category,
@@ -477,6 +598,41 @@ impl Database {
                 .entry(key)
                 .or_default()
                 .push(value);
+        }
+        Ok(tags)
+    }
+
+    fn tags_for_stems(
+        &self,
+        category: Category,
+        stems: &[String],
+    ) -> io::Result<BTreeMap<String, BTreeMap<String, Vec<String>>>> {
+        let mut tags: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
+        for chunk in stems.chunks(500) {
+            let placeholders = placeholders(chunk.len());
+            let sql = format!(
+                "SELECT stem, key, value FROM tag_values
+                 WHERE category = ? AND stem IN ({placeholders})
+                 ORDER BY key COLLATE NOCASE, value COLLATE NOCASE"
+            );
+            let rows = block_on(async {
+                let mut query = sqlx::query(&sql).bind(category_key(category));
+                for stem in chunk {
+                    query = query.bind(stem);
+                }
+                query.fetch_all(&self.pool).await
+            })
+            .map_err(io::Error::other)?;
+            for row in rows {
+                let stem: String = row.get("stem");
+                let key: String = row.get("key");
+                let value: String = row.get("value");
+                tags.entry(stem)
+                    .or_default()
+                    .entry(key)
+                    .or_default()
+                    .push(value);
+            }
         }
         Ok(tags)
     }
@@ -529,6 +685,23 @@ fn category_key(category: Category) -> &'static str {
         Category::Music => "music",
         Category::Sfx => "sfx",
     }
+}
+
+fn placeholders(len: usize) -> String {
+    std::iter::repeat_n("?", len).collect::<Vec<_>>().join(", ")
+}
+
+fn like_contains_pattern(value: &str) -> String {
+    let mut pattern = String::with_capacity(value.len() + 2);
+    pattern.push('%');
+    for ch in value.to_lowercase().chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(ch);
+    }
+    pattern.push('%');
+    pattern
 }
 
 fn canonical_selected(
@@ -643,6 +816,117 @@ mod tests {
             )
             .unwrap();
         assert!(!rows[0].tags.contains_key("GENRE"));
+    }
+
+    #[test]
+    fn schema_ignores_tags_without_current_file_rows() {
+        let db = Database::open(&db_path("schema-orphan-tags")).unwrap();
+
+        db.sync_category(
+            Category::Music,
+            vec![scan("removed.flac", &[("GENRE", &["aaaaa"])])],
+        )
+        .unwrap();
+        db.sync_category(Category::Music, Vec::new()).unwrap();
+
+        let schema = db.schema_for(Category::Music).unwrap();
+
+        assert_eq!(schema["GENRE"], Vec::<String>::new());
+        assert_eq!(schema["MOOD"], Vec::<String>::new());
+    }
+
+    #[test]
+    fn sync_category_deletes_tags_for_removed_stems() {
+        let db = Database::open(&db_path("sync-removes-orphan-tags")).unwrap();
+
+        db.sync_category(
+            Category::Music,
+            vec![
+                scan("removed.flac", &[("GENRE", &["Stale"])]),
+                scan("kept.flac", &[("GENRE", &["Current"])]),
+            ],
+        )
+        .unwrap();
+        db.sync_category(
+            Category::Music,
+            vec![scan("kept.flac", &[("GENRE", &["Current"])])],
+        )
+        .unwrap();
+
+        let schema = db.schema_for(Category::Music).unwrap();
+        let rows = db
+            .query_visible_rows(
+                Category::Music,
+                "",
+                &BTreeMap::new(),
+                &default_format_priority(),
+            )
+            .unwrap();
+
+        assert_eq!(schema["GENRE"], vec!["Current"]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "kept");
+        assert_eq!(rows[0].tags["GENRE"], vec!["Current"]);
+    }
+
+    #[test]
+    fn query_visible_rows_filters_search_and_selected_in_sql() {
+        let db = Database::open(&db_path("sql-filter")).unwrap();
+
+        db.sync_category(
+            Category::Music,
+            vec![
+                scan("dark.flac", &[("MOOD", &["Dark"])]),
+                scan("bright.flac", &[("MOOD", &["Bright"])]),
+                scan("dark.mp3", &[]),
+            ],
+        )
+        .unwrap();
+        db.add_tag(Category::Music, "dark", "GENRE", "Electronic")
+            .unwrap();
+
+        let selected = BTreeMap::from([(
+            "Genre".to_string(),
+            BTreeSet::from(["Electronic".to_string()]),
+        )]);
+        let rows = db
+            .query_visible_rows(Category::Music, "dark", &selected, &default_format_priority())
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "dark");
+        assert_eq!(
+            rows[0]
+                .variants
+                .iter()
+                .map(|variant| variant.extension.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mp3", "flac"]
+        );
+        assert_eq!(rows[0].tags["GENRE"], vec!["Electronic"]);
+    }
+
+    #[test]
+    fn query_visible_rows_escapes_sql_like_wildcards() {
+        let db = Database::open(&db_path("sql-filter-like")).unwrap();
+
+        db.sync_category(
+            Category::Music,
+            vec![scan("100_percent.flac", &[]), scan("100Xpercent.flac", &[])],
+        )
+        .unwrap();
+
+        let rows = db
+            .query_visible_rows(
+                Category::Music,
+                "100_",
+                &BTreeMap::new(),
+                &default_format_priority(),
+            )
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "100_percent");
     }
 
     #[test]
