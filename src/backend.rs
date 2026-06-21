@@ -767,7 +767,10 @@ mod tests {
         backend.set_category_folder(Category::Music, dir).unwrap();
 
         let records = backend.filter(Category::Music, "", &BTreeMap::new());
-        assert_eq!(names(records.clone()), vec!["clip", "nested", "skip", "top"]);
+        assert_eq!(
+            names(records.clone()),
+            vec!["clip", "nested", "skip", "top"]
+        );
         assert_eq!(
             records[3]
                 .variants

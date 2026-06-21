@@ -8,7 +8,7 @@
 - For UI changes, Codex should run `cargo check` first.
 - If `cargo check` passes, kill existing `lowcat` processes and start `cargo run` in a live PTY session.
 - Keep the app running across turns while the user manually interacts with the UI.
-- Add targeted debug output for the affected interaction path.
+- Add targeted debug output for the affected interaction path, and remove it once user confirms the code works as expected.
 - Tell the user exactly what to try and what logs are expected.
 - Use the user's observation plus the live logs to iterate before declaring the UI fix verified.
 - Do not treat compile success alone as UI verification.

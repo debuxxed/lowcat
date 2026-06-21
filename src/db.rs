@@ -228,7 +228,10 @@ impl Database {
         .map_err(io::Error::other)
     }
 
-    pub fn file_fingerprints(&self, category: Category) -> io::Result<BTreeMap<String, (u64, i64)>> {
+    pub fn file_fingerprints(
+        &self,
+        category: Category,
+    ) -> io::Result<BTreeMap<String, (u64, i64)>> {
         let rows = block_on(async {
             sqlx::query("SELECT path, size, modified FROM files WHERE category = ?")
                 .bind(category_key(category))
@@ -503,7 +506,6 @@ impl Database {
         })
         .map_err(io::Error::other)
     }
-
 }
 
 fn sort_variants(variants: &mut [FileVariant], priority: &[AudioFormat]) {
