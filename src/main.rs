@@ -18,7 +18,7 @@ use gpui_platform::application;
 
 use crate::ui::{NextCategory, PreviousCategory, ToggleFilters, UI};
 
-actions!(app, [Quit]);
+actions!(app, [Quit, HideApp, MinimizeWindow, CloseWindow]);
 
 fn main() {
     if let Err(error) = check_media_tools() {
@@ -36,15 +36,21 @@ fn main() {
         Theme::global_mut(cx).font_family = ".ZedMono".into();
 
         cx.on_action(|_: &Quit, cx| cx.quit());
-        cx.bind_keys([
+        #[cfg(target_os = "macos")]
+        cx.on_action(|_: &HideApp, cx| {
+            eprintln!("macos-command: hide-app");
+            cx.hide();
+        });
+
+        let bindings = [
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-e", ToggleFilters, None),
             KeyBinding::new("ctrl-tab", NextCategory, None),
             KeyBinding::new("ctrl-shift-tab", PreviousCategory, None),
-        ]);
-        cx.set_menus(vec![
-            Menu::new("Lowcat").items([MenuItem::action("Quit", Quit)]),
-        ]);
+        ];
+        cx.bind_keys(bindings);
+        bind_macos_window_keys(cx);
+        cx.set_menus(app_menus());
 
         cx.on_window_closed(|app, _window_id| {
             app.quit();
@@ -70,6 +76,38 @@ fn main() {
         )
         .expect("Failed to open window");
     })
+}
+
+#[cfg(target_os = "macos")]
+fn bind_macos_window_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("cmd-h", HideApp, None),
+        KeyBinding::new("cmd-m", MinimizeWindow, None),
+        KeyBinding::new("cmd-w", CloseWindow, None),
+    ]);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn bind_macos_window_keys(_cx: &mut App) {}
+
+#[cfg(target_os = "macos")]
+fn app_menus() -> Vec<Menu> {
+    vec![
+        Menu::new("Lowcat").items([
+            MenuItem::action("Hide Lowcat", HideApp),
+            MenuItem::separator(),
+            MenuItem::action("Quit", Quit),
+        ]),
+        Menu::new("Window").items([
+            MenuItem::action("Minimize", MinimizeWindow),
+            MenuItem::action("Close Window", CloseWindow),
+        ]),
+    ]
+}
+
+#[cfg(not(target_os = "macos"))]
+fn app_menus() -> Vec<Menu> {
+    vec![Menu::new("Lowcat").items([MenuItem::action("Quit", Quit)])]
 }
 
 fn check_media_tools() -> Result<(), String> {

@@ -16,6 +16,8 @@ use gpui_component::{
 };
 
 use crate::model::Category;
+#[cfg(target_os = "macos")]
+use crate::{CloseWindow, MinimizeWindow};
 use crate::ui::titlebar::TITLEBAR_LEFT_OFFSET;
 
 actions!(library, [NextCategory, PreviousCategory, ToggleFilters]);
@@ -307,7 +309,7 @@ impl Render for UI {
             format!("filters_open={filters_open} import_progress={import_progress_active}")
         });
 
-        div()
+        let root = div()
             .track_focus(&self.focus_handle)
             .relative()
             .size_full()
@@ -337,7 +339,20 @@ impl Render for UI {
             }))
             .on_action(cx.listener(|this, _: &PreviousCategory, _, cx| {
                 this.library.update(cx, |lib, cx| lib.previous_category(cx));
-            }))
+            }));
+
+        #[cfg(target_os = "macos")]
+        let root = root
+            .on_action(|_: &MinimizeWindow, window, _| {
+                eprintln!("macos-command: minimize-window");
+                window.minimize_window();
+            })
+            .on_action(|_: &CloseWindow, window, _| {
+                eprintln!("macos-command: close-window");
+                window.remove_window();
+            });
+
+        root
             .child(self.titlebar.clone())
             .child(self.toolbar.clone())
             .when(filters_open, |el| el.child(self.filter_panel.clone()))
