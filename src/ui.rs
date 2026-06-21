@@ -67,6 +67,18 @@ impl UI {
 }
 
 impl UI {
+    fn should_activate_search(event: &KeyDownEvent) -> bool {
+        let modifiers = &event.keystroke.modifiers;
+        if modifiers.control || modifiers.alt || modifiers.platform || modifiers.function {
+            return false;
+        }
+
+        !matches!(
+            event.keystroke.key.as_str(),
+            "escape" | "shift" | "control" | "ctrl" | "alt" | "cmd" | "super" | "win" | "fn"
+        )
+    }
+
     fn cancel_file_drag(&mut self, cx: &mut Context<Self>) {
         self.table
             .update(cx, |table, cx| table.cancel_file_drag(cx));
@@ -321,7 +333,7 @@ impl Render for UI {
                 this.table
                     .update(cx, |table, cx| table.set_alt_down(event.modifiers.alt, cx));
             }))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
                     if this.cancel_delete(cx) {
                         cx.stop_propagation();
@@ -329,6 +341,16 @@ impl Render for UI {
                     }
                     this.cancel_file_drag(cx);
                     cx.stop_propagation();
+                } else if Self::should_activate_search(event)
+                    && !this.toolbar.read(cx).search_is_focused(window, cx)
+                {
+                    let keystroke = event.keystroke.clone();
+                    this.toolbar
+                        .update(cx, |toolbar, cx| toolbar.focus_search(window, cx));
+                    cx.stop_propagation();
+                    window.defer(cx, move |window, cx| {
+                        window.dispatch_keystroke(keystroke, cx);
+                    });
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleFilters, _, cx| {

@@ -1,10 +1,11 @@
 use gpui::{
-    AppContext, ClickEvent, Context, Entity, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, StatefulInteractiveElement, Styled, Window, div, red, relative,
+    App, AppContext, ClickEvent, Context, Entity, Focusable, InteractiveElement, IntoElement,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, div, red,
+    relative,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Selectable, Sizable, StyledExt,
-    button::Button,
+    button::{Button, ButtonVariants as _},
     input::{Input, InputEvent, InputState},
 };
 
@@ -49,6 +50,15 @@ impl Toolbar {
             cx.notify();
         }
     }
+
+    pub fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_input
+            .update(cx, |state, cx| state.focus(window, cx));
+    }
+
+    pub fn search_is_focused(&self, window: &Window, cx: &App) -> bool {
+        self.search_input.read(cx).focus_handle(cx).is_focused(window)
+    }
 }
 
 impl Render for Toolbar {
@@ -64,6 +74,27 @@ impl Render for Toolbar {
         };
         let chips_len = chips.len();
         let chip_delete_bg = red().opacity(0.18);
+        let has_search = !self.search_input.read(cx).value().is_empty();
+        let search_icon = if has_search {
+            div().child(
+                Button::new("clear-search")
+                    .icon(IconName::Close)
+                    .ghost()
+                    .xsmall()
+                    .compact()
+                    .tab_stop(false)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.search_input.update(cx, |state, cx| {
+                            state.set_value("", window, cx);
+                            state.focus(window, cx);
+                        });
+                        this.library
+                            .update(cx, |lib, cx| lib.set_search(String::new(), cx));
+                    })),
+            )
+        } else {
+            div().child(Icon::new(IconName::Search).small())
+        };
 
         let search = div()
             .h_flex()
@@ -77,7 +108,7 @@ impl Render for Toolbar {
             .bg(cx.theme().secondary)
             .border_1()
             .border_color(cx.theme().border)
-            .child(Icon::new(IconName::Search).small())
+            .child(search_icon)
             .child(Input::new(&self.search_input).appearance(false).flex_1());
 
         let mut chip_row = div()

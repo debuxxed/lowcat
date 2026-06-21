@@ -23,6 +23,7 @@ pub struct SettingsMenu {
     open: bool,
     position: Option<Point<Pixels>>,
     focus: FocusHandle,
+    previous_focus: Option<FocusHandle>,
     active_submenu: Option<SettingsSubmenu>,
     hovered_priority: Option<AudioFormat>,
 }
@@ -41,6 +42,7 @@ impl SettingsMenu {
             open: false,
             position: None,
             focus: cx.focus_handle(),
+            previous_focus: None,
             active_submenu: None,
             hovered_priority: None,
         }
@@ -51,6 +53,18 @@ impl SettingsMenu {
         self.open = false;
         self.active_submenu = None;
         self.hovered_priority = None;
+    }
+
+    fn close_and_restore_focus(
+        &mut self,
+        reason: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close(reason);
+        if let Some(focus) = self.previous_focus.take() {
+            focus.focus(window, cx);
+        }
     }
 
     fn activate_submenu(
@@ -99,10 +113,11 @@ impl Render for SettingsMenu {
                     this.open = !this.open;
                     this.position = Some(event.position);
                     if this.open {
+                        this.previous_focus = window.focused(cx);
                         this.focus.focus(window, cx);
                         this.active_submenu = None;
                     } else {
-                        this.close("settings-button");
+                        this.close_and_restore_focus("settings-button", window, cx);
                     }
                     cx.stop_propagation();
                     cx.notify();
@@ -134,9 +149,9 @@ impl Render for SettingsMenu {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
                     cx.stop_propagation();
                 })
-                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                     if event.keystroke.key == "escape" {
-                        this.close("escape");
+                        this.close_and_restore_focus("escape", window, cx);
                         cx.notify();
                     }
                 }))
@@ -328,8 +343,8 @@ impl Render for SettingsMenu {
                         .occlude()
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                                this.close("outside-click");
+                            cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                this.close_and_restore_focus("outside-click", window, cx);
                                 cx.notify();
                             }),
                         )
