@@ -597,6 +597,19 @@ impl FileTable {
         }
     }
 
+    pub fn has_visible_selection(&self, cx: &mut Context<Self>) -> bool {
+        if self.selected.is_empty() {
+            return false;
+        }
+
+        self.library
+            .read(cx)
+            .active_state()
+            .results
+            .iter()
+            .any(|record| self.selected.contains(record.path.as_path()))
+    }
+
     fn clear_selection(&mut self, cx: &mut Context<Self>) -> bool {
         if self.selected.is_empty() && self.selection_anchor.is_none() {
             return false;

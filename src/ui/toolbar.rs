@@ -62,6 +62,18 @@ impl Toolbar {
             .focus_handle(cx)
             .is_focused(window)
     }
+
+    pub fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.search_input.read(cx).value().is_empty() {
+            return false;
+        }
+
+        self.search_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.library
+            .update(cx, |lib, cx| lib.set_search(String::new(), cx));
+        true
+    }
 }
 
 impl Render for Toolbar {
@@ -87,12 +99,9 @@ impl Render for Toolbar {
                     .compact()
                     .tab_stop(false)
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.search_input.update(cx, |state, cx| {
-                            state.set_value("", window, cx);
-                            state.focus(window, cx);
-                        });
-                        this.library
-                            .update(cx, |lib, cx| lib.set_search(String::new(), cx));
+                        this.clear_search(window, cx);
+                        this.search_input
+                            .update(cx, |state, cx| state.focus(window, cx));
                     })),
             )
         } else {

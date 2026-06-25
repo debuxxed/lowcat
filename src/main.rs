@@ -21,7 +21,10 @@ use gpui_platform::application;
 use crate::library::Library;
 use crate::ui::{NextCategory, PreviousCategory, ToggleFilters, UI};
 
-actions!(app, [Quit, HideApp, MinimizeWindow, CloseWindow, ShowWindow]);
+actions!(
+    app,
+    [Quit, HideApp, MinimizeWindow, CloseWindow, ShowWindow]
+);
 
 fn main() {
     if let Err(error) = check_media_tools() {

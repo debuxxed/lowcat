@@ -91,6 +91,27 @@ impl UI {
         self.table.update(cx, |table, cx| table.cancel_delete(cx))
     }
 
+    fn cancel_search_if_no_selection(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self
+            .table
+            .update(cx, |table, cx| table.has_visible_selection(cx))
+        {
+            return false;
+        }
+
+        let cleared = self
+            .toolbar
+            .update(cx, |toolbar, cx| toolbar.clear_search(window, cx));
+        if cleared {
+            debug_ui_interaction(|| "escape cleared search".to_string());
+        }
+        cleared
+    }
+
     /// Full-window overlay that fades in while OS files are dragged over the
     /// window, aligned with the titlebar categories.
     fn render_drop_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -350,6 +371,10 @@ impl Render for UI {
                         cx.stop_propagation();
                         return;
                     }
+                    if this.cancel_search_if_no_selection(window, cx) {
+                        cx.stop_propagation();
+                        return;
+                    }
                     this.cancel_file_drag(cx);
                     cx.stop_propagation();
                 } else if Self::should_activate_search(event)
@@ -397,4 +422,13 @@ impl Render for UI {
 
 fn pluralize(count: usize, singular: &'static str, plural: &'static str) -> &'static str {
     if count == 1 { singular } else { plural }
+}
+
+fn debug_ui_interaction(details: impl FnOnce() -> String) {
+    let enabled = std::env::var("LOWCAT_DEBUG")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if enabled {
+        eprintln!("[lowcat:ui] {}", details());
+    }
 }
