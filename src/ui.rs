@@ -28,7 +28,10 @@ pub(crate) const CONTENT_PX: Pixels = px(12.);
 
 use crate::library::Library;
 use crate::ui::{
-    filter_panel::FilterPanel, table::FileTable, titlebar::AppTitleBar, toolbar::Toolbar,
+    filter_panel::FilterPanel,
+    table::{FileTable, PendingDeleteKind},
+    titlebar::AppTitleBar,
+    toolbar::Toolbar,
 };
 
 pub struct UI {
@@ -216,16 +219,25 @@ impl UI {
     }
 
     fn render_delete_confirmation_modal(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (row_count, file_count) = self.table.read(cx).pending_delete_counts()?;
-        let title = if row_count == 1 {
-            "Move row to Trash?"
-        } else {
-            "Move rows to Trash?"
+        let counts = self.table.read(cx).pending_delete_counts()?;
+        let title = match counts.kind {
+            PendingDeleteKind::Rows if counts.row_count == 1 => "Move row to Trash?",
+            PendingDeleteKind::Rows => "Move rows to Trash?",
+            PendingDeleteKind::Format => "Move format file to Trash?",
         };
-        let row_label = pluralize(row_count, "row", "rows");
-        let file_label = pluralize(file_count, "file", "files");
-        let description =
-            format!("Move {row_count} {row_label} ({file_count} {file_label}) to Trash?");
+        let file_label = pluralize(counts.file_count, "file", "files");
+        let description = match counts.kind {
+            PendingDeleteKind::Rows => {
+                let row_label = pluralize(counts.row_count, "row", "rows");
+                format!(
+                    "Move {} {} ({} {}) to Trash?",
+                    counts.row_count, row_label, counts.file_count, file_label
+                )
+            }
+            PendingDeleteKind::Format => {
+                format!("Move {} {} to Trash?", counts.file_count, file_label)
+            }
+        };
 
         Some(
             div()

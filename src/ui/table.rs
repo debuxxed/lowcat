@@ -40,7 +40,7 @@ const CONVERT_MENU_PANE_WIDTH: f32 = 160.;
 const ROW_HEIGHT: Pixels = px(32.);
 
 struct PendingFileDrag {
-    extension: String,
+    label: String,
     paths: Vec<PathBuf>,
     origin: Point<Pixels>,
 }
@@ -60,13 +60,31 @@ struct ConversionAction {
 
 #[derive(Clone)]
 struct DeleteTarget {
+    kind: DeleteKind,
     row_count: usize,
     paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Copy)]
+enum DeleteKind {
+    Rows,
+    Format,
 }
 
 #[derive(Clone)]
 struct PendingDelete {
     target: DeleteTarget,
+}
+
+pub(crate) struct PendingDeleteCounts {
+    pub(crate) kind: PendingDeleteKind,
+    pub(crate) row_count: usize,
+    pub(crate) file_count: usize,
+}
+
+pub(crate) enum PendingDeleteKind {
+    Rows,
+    Format,
 }
 
 pub struct FileTable {
@@ -77,6 +95,7 @@ pub struct FileTable {
     alt_down: bool,
     hovered_row: Option<PathBuf>,
     hovered_tag_chip: Option<PathBuf>,
+    hovered_format_chip: Option<PathBuf>,
     hovered_delete_row: Option<PathBuf>,
     pending_delete: Option<PendingDelete>,
     pending_context_menu_delete: Option<DeleteTarget>,
@@ -171,6 +190,7 @@ impl FileTable {
             alt_down: false,
             hovered_row: None,
             hovered_tag_chip: None,
+            hovered_format_chip: None,
             hovered_delete_row: None,
             pending_delete: None,
             pending_context_menu_delete: None,
@@ -278,7 +298,30 @@ impl FileTable {
         }
     }
 
-    fn start_pending_drag(
+    fn start_pending_row_drag(
+        &mut self,
+        record: &FileRecord,
+        origin: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let start = crate::perf::start();
+        let state = self.library.read(cx);
+        let paths = self.selected_priority_paths(&state.active_state().results, &record.path);
+        let path_count = paths.len();
+        self.pending_drag = Some(PendingFileDrag {
+            label: "priority".to_string(),
+            paths,
+            origin,
+        });
+        crate::perf::finish("table.pending_drag", start, || {
+            format!("paths={path_count}")
+        });
+        debug_table_interaction(|| {
+            format!("pending row drag stem={} paths={path_count}", record.stem)
+        });
+    }
+
+    fn start_pending_format_drag(
         &mut self,
         record: &FileRecord,
         extension: String,
@@ -291,16 +334,21 @@ impl FileTable {
             &state.active_state().results,
             &record.path,
             &extension,
-            state.format_priority(),
         );
         let path_count = paths.len();
         self.pending_drag = Some(PendingFileDrag {
-            extension,
+            label: extension.clone(),
             paths,
             origin,
         });
         crate::perf::finish("table.pending_drag", start, || {
             format!("paths={path_count}")
+        });
+        debug_table_interaction(|| {
+            format!(
+                "pending format drag stem={} extension={extension} paths={path_count}",
+                record.stem
+            )
         });
     }
 
@@ -351,33 +399,34 @@ impl FileTable {
         });
     }
 
+    fn selected_priority_paths(&self, records: &[FileRecord], path: &Path) -> Vec<PathBuf> {
+        if self.selected.len() > 1 && self.selected.contains(path) {
+            records
+                .iter()
+                .filter(|record| self.selected.contains(record.path.as_path()))
+                .map(|record| record.path.clone())
+                .collect()
+        } else {
+            records
+                .iter()
+                .find(|record| record.path.as_path() == path)
+                .map(|record| vec![record.path.clone()])
+                .unwrap_or_default()
+        }
+    }
+
     fn selected_paths_for_extension(
         &self,
         records: &[FileRecord],
         path: &Path,
         extension: &str,
-        priority: &[AudioFormat],
     ) -> Vec<PathBuf> {
         if self.selected.len() > 1 && self.selected.contains(path) {
             records
                 .iter()
                 .filter(|record| self.selected.contains(record.path.as_path()))
-                .filter_map(|record| {
-                    if let Some(variant) = record.variant_for_extension(extension) {
-                        return Some(variant.path.clone());
-                    }
-
-                    let fallback = priority
-                        .iter()
-                        .filter_map(|format| record.variant_for_extension(format.extension()))
-                        .next()
-                        .or_else(|| record.variants.first());
-                    if let Some(variant) = fallback {
-                        Some(variant.path.clone())
-                    } else {
-                        None
-                    }
-                })
+                .filter_map(|record| record.variant_for_extension(extension))
+                .map(|variant| variant.path.clone())
                 .collect()
         } else {
             records
@@ -435,7 +484,21 @@ impl FileTable {
             .collect();
 
         DeleteTarget {
+            kind: DeleteKind::Rows,
             row_count: records.len(),
+            paths,
+        }
+    }
+
+    fn format_delete_target(&self, record: &FileRecord, extension: &str) -> DeleteTarget {
+        let paths = record
+            .variant_for_extension(extension)
+            .map(|variant| vec![variant.path.clone()])
+            .unwrap_or_default();
+
+        DeleteTarget {
+            kind: DeleteKind::Format,
+            row_count: 1,
             paths,
         }
     }
@@ -465,6 +528,7 @@ impl FileTable {
             .collect();
 
         Some(DeleteTarget {
+            kind: DeleteKind::Rows,
             row_count: selected_records.len(),
             paths,
         })
@@ -511,9 +575,17 @@ impl FileTable {
         self.confirm_delete_target(target, "context-menu", window, cx);
     }
 
-    pub fn pending_delete_counts(&self) -> Option<(usize, usize)> {
+    pub fn pending_delete_counts(&self) -> Option<PendingDeleteCounts> {
         let pending = self.pending_delete.as_ref()?;
-        Some((pending.target.row_count, pending.target.paths.len()))
+        let kind = match pending.target.kind {
+            DeleteKind::Rows => PendingDeleteKind::Rows,
+            DeleteKind::Format => PendingDeleteKind::Format,
+        };
+        Some(PendingDeleteCounts {
+            kind,
+            row_count: pending.target.row_count,
+            file_count: pending.target.paths.len(),
+        })
     }
 
     pub fn cancel_delete(&mut self, cx: &mut Context<Self>) -> bool {
@@ -546,6 +618,7 @@ impl FileTable {
         self.selection_anchor = None;
         self.hovered_row = None;
         self.hovered_tag_chip = None;
+        self.hovered_format_chip = None;
         self.hovered_delete_row = None;
         self.library
             .update(cx, |lib, cx| lib.trash_files(paths, cx));
@@ -576,6 +649,18 @@ impl FileTable {
             }
         } else if self.hovered_tag_chip.as_ref() == Some(&path) {
             self.hovered_tag_chip = None;
+            cx.notify();
+        }
+    }
+
+    fn set_format_chip_hovered(&mut self, path: PathBuf, hovered: bool, cx: &mut Context<Self>) {
+        if hovered {
+            if self.hovered_format_chip.as_ref() != Some(&path) {
+                self.hovered_format_chip = Some(path);
+                cx.notify();
+            }
+        } else if self.hovered_format_chip.as_ref() == Some(&path) {
+            self.hovered_format_chip = None;
             cx.notify();
         }
     }
@@ -612,7 +697,7 @@ impl FileTable {
         }
 
         let drag_start = crate::perf::start();
-        let extension = pending.extension.clone();
+        let drag_label = pending.label.clone();
         let drag_paths = pending.paths.clone();
         let drag_path_count = drag_paths.len();
         self.clear_pending_drag();
@@ -648,10 +733,13 @@ impl FileTable {
         });
         window.refresh();
         crate::perf::finish("table.drag_start", drag_start, || {
-            format!("extension={extension} paths={drag_path_count}")
+            format!("drag={drag_label} paths={drag_path_count}")
         });
         crate::perf::finish("table.drag_move", move_start, || {
-            format!("started extension={extension} paths={drag_path_count}")
+            format!("started drag={drag_label} paths={drag_path_count}")
+        });
+        debug_table_interaction(|| {
+            format!("native drag queued drag={drag_label} paths={drag_path_count}")
         });
     }
 
@@ -738,9 +826,14 @@ impl FileTable {
         let convertible_bg = hsla(0.095, 1., 0.55, 0.12);
         let chip_delete_bg = red().opacity(0.18);
         let row_delete_bg = red().opacity(0.18);
-        let chip_hovered = self.hovered_tag_chip.as_ref() == Some(&path);
-        let row_hovered = !chip_hovered && self.hovered_row.as_ref() == Some(&path);
-        let row_delete_hover_enabled = self.hovered_tag_chip.is_none();
+        let format_chip_hovered = self.hovered_format_chip.as_ref().is_some_and(|hovered| {
+            record
+                .variants
+                .iter()
+                .any(|variant| &variant.path == hovered)
+        });
+        let row_hovered = self.hovered_row.as_ref() == Some(&path);
+        let row_delete_hover_enabled = self.hovered_tag_chip.is_none() && !format_chip_hovered;
         let delete_hovered = row_delete_hover_enabled
             && self.alt_down
             && self.hovered_delete_row.as_ref().is_some_and(|hovered| {
@@ -751,7 +844,7 @@ impl FileTable {
                 }
             });
         let name = div()
-            .w_full()
+            .flex_shrink(1.)
             .min_w_0()
             .truncate()
             .child(record.name.clone());
@@ -805,6 +898,14 @@ impl FileTable {
                         }
                         if event.modifiers.shift || !this.selected.contains(&select_path) {
                             this.select_row(select_path.clone(), event.modifiers.shift, window, cx);
+                        }
+                        if event.click_count == 1 {
+                            let records = this.library.read(cx).active_state().results.clone();
+                            if let Some(record) =
+                                records.iter().find(|record| record.path == select_path)
+                            {
+                                this.start_pending_row_drag(record, event.position, cx);
+                            }
                         }
                     }
                 }),
@@ -875,51 +976,87 @@ impl FileTable {
             .child(
                 div()
                     .h_full()
-                    .flex()
+                    .h_flex()
                     .items_center()
                     .flex_1()
                     .min_w_0()
                     .px(CONTENT_PX)
                     .py(px(4.))
-                    .relative()
+                    .gap_1()
+                    .overflow_hidden()
+                    .child(name)
                     .child(
                         div()
-                            .absolute()
-                            .left(CONTENT_PX)
-                            .right(CONTENT_PX)
-                            .top_0()
-                            .bottom_0()
                             .h_flex()
                             .items_center()
                             .gap_1()
-                            .opacity(0.)
-                            .group_hover(row_group.clone(), |style| style.opacity(1.))
-                            .children(record.variants.iter().map(|variant| {
+                            .flex_shrink_0()
+                            .children(unique_format_variants(record).into_iter().map(|variant| {
                                 let record = record.clone();
                                 let extension = variant.extension.clone();
-                                let label = extension.to_ascii_uppercase();
+                                let label = extension.clone();
+                                let variant_path = variant.path.clone();
+                                let format_delete_target =
+                                    self.format_delete_target(&record, &extension);
+                                let chip_bg = if self.alt_down
+                                    && self.hovered_format_chip.as_ref() == Some(&variant_path)
+                                {
+                                    chip_delete_bg
+                                } else {
+                                    cx.theme().muted
+                                };
                                 div()
                                     .id(SharedString::from(format!(
                                         "extension-chip:{}:{extension}",
                                         record.path.display()
                                     )))
-                                    .w(px(56.))
-                                    .h_full()
+                                    .h(px(18.))
+                                    .min_w(px(26.))
+                                    .px_1()
                                     .flex_shrink_0()
                                     .h_flex()
                                     .items_center()
                                     .justify_center()
                                     .rounded_md()
-                                    .text_base()
-                                    .bg(cx.theme().muted)
+                                    .text_size(px(10.))
+                                    .bg(chip_bg)
                                     .text_color(cx.theme().muted_foreground)
                                     .cursor_pointer()
                                     .child(SharedString::from(label))
+                                    .on_hover(cx.listener({
+                                        let variant_path = variant_path.clone();
+                                        move |this, hovered: &bool, _, cx| {
+                                            this.set_format_chip_hovered(
+                                                variant_path.clone(),
+                                                *hovered,
+                                                cx,
+                                            );
+                                        }
+                                    }))
+                                    .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
                                     .on_mouse_down(
                                         MouseButton::Left,
-                                        cx.listener(
+                                        cx.listener({
+                                            let variant_path = variant_path.clone();
                                             move |this, event: &MouseDownEvent, window, cx| {
                                                 if event.click_count == 1 {
+                                                    if event.modifiers.alt {
+                                                        this.clear_pending_drag();
+                                                        this.confirm_delete_target(
+                                                            format_delete_target.clone(),
+                                                            "format-opt-click",
+                                                            window,
+                                                            cx,
+                                                        );
+                                                        debug_table_interaction(|| {
+                                                            format!(
+                                                                "format delete requested path={}",
+                                                                variant_path.display()
+                                                            )
+                                                        });
+                                                        cx.stop_propagation();
+                                                        return;
+                                                    }
                                                     if event.modifiers.shift
                                                         || !this.selected.contains(&record.path)
                                                     {
@@ -930,19 +1067,32 @@ impl FileTable {
                                                             cx,
                                                         );
                                                     }
-                                                    this.start_pending_drag(
+                                                    this.start_pending_format_drag(
                                                         &record,
                                                         extension.clone(),
                                                         event.position,
                                                         cx,
                                                     );
                                                 }
-                                            },
-                                        ),
+                                                cx.stop_propagation();
+                                            }
+                                        }),
+                                    )
+                                    .on_mouse_move(cx.listener(
+                                        |this, event: &MouseMoveEvent, window, cx| {
+                                            this.maybe_start_file_drag(event, window, cx);
+                                            cx.stop_propagation();
+                                        },
+                                    ))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                            this.clear_pending_drag();
+                                            cx.stop_propagation();
+                                        }),
                                     )
                             })),
-                    )
-                    .child(name.group_hover(row_group.clone(), |style| style.opacity(0.))),
+                    ),
             );
 
         for (key, tag_width) in keys.iter().zip(tag_widths) {
@@ -1204,5 +1354,23 @@ impl Render for FileTable {
 fn open_in_default_app(path: &Path) {
     if let Err(err) = open::that(path) {
         eprintln!("failed to open {}: {err}", path.display());
+    }
+}
+
+fn unique_format_variants(record: &FileRecord) -> Vec<&crate::model::FileVariant> {
+    let mut seen = BTreeSet::new();
+    record
+        .variants
+        .iter()
+        .filter(|variant| seen.insert(variant.extension.to_ascii_lowercase()))
+        .collect()
+}
+
+fn debug_table_interaction(details: impl FnOnce() -> String) {
+    let enabled = std::env::var("LOWCAT_DEBUG")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if enabled {
+        eprintln!("[lowcat:table] {}", details());
     }
 }
