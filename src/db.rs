@@ -3,6 +3,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::executor::block_on;
 use sea_query::{Alias, Expr, Query, SqliteQueryBuilder};
@@ -19,6 +20,15 @@ const CONVERT_CONFLICT_KEY: &str = "convert_conflict";
 
 pub struct Database {
     pool: SqlitePool,
+}
+
+struct FileRow {
+    path: PathBuf,
+    stem: String,
+    extension: String,
+    size: u64,
+    modified: i64,
+    first_seen_at: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +78,7 @@ impl Database {
                     extension TEXT NOT NULL,
                     size INTEGER NOT NULL,
                     modified INTEGER NOT NULL,
+                    first_seen_at INTEGER NOT NULL DEFAULT 0,
                     search_text TEXT NOT NULL
                 )",
                 "CREATE INDEX IF NOT EXISTS files_category_stem ON files(category, stem)",
@@ -90,6 +101,7 @@ impl Database {
             ] {
                 sqlx::query(sql).execute(&self.pool).await?;
             }
+            migrate_files_first_seen_at(&self.pool).await?;
 
             for category in Category::ALL {
                 for key in category.tag_keys() {
@@ -112,6 +124,7 @@ impl Database {
     ) -> io::Result<SyncSummary> {
         block_on(async {
             let category_key = category_key(category);
+            let mut next_first_seen_at = current_unix_millis();
             let existing_rows =
                 sqlx::query("SELECT path, stem, size, modified FROM files WHERE category = ?")
                     .bind(category_key)
@@ -161,8 +174,8 @@ impl Database {
                 }
 
                 sqlx::query(
-                    "INSERT INTO files(category, path, stem, extension, size, modified, search_text)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)
+                    "INSERT INTO files(category, path, stem, extension, size, modified, first_seen_at, search_text)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                      ON CONFLICT(path) DO UPDATE SET
                         category = excluded.category,
                         stem = excluded.stem,
@@ -177,9 +190,11 @@ impl Database {
                 .bind(&record.extension)
                 .bind(record.size as i64)
                 .bind(record.modified)
+                .bind(next_first_seen_at)
                 .bind(search_text)
                 .execute(&self.pool)
                 .await?;
+                next_first_seen_at += 1;
 
                 let tag_count: i64 = sqlx::query(
                     "SELECT COUNT(*) AS count FROM tag_values WHERE category = ? AND stem = ?",
@@ -271,6 +286,7 @@ impl Database {
         search: &str,
         selected: &BTreeMap<String, BTreeSet<String>>,
         priority: &[AudioFormat],
+        category_folder: Option<&Path>,
     ) -> io::Result<Vec<FileRecord>> {
         let selected = canonical_selected(selected);
         let has_filter = !search.is_empty() || selected.values().any(|values| !values.is_empty());
@@ -286,28 +302,39 @@ impl Database {
         } else {
             (self.file_rows(category)?, self.tags_for_category(category)?)
         };
+        let rows: Vec<FileRow> = rows.into_iter().map(file_row_from_sql).collect();
+        let display_names = display_names_for_rows(&rows, category_folder);
         let mut grouped: BTreeMap<String, Vec<FileVariant>> = BTreeMap::new();
+        let mut stems: BTreeMap<String, String> = BTreeMap::new();
 
         for row in rows {
-            let stem: String = row.get("stem");
-            grouped.entry(stem).or_default().push(FileVariant {
-                path: PathBuf::from(row.get::<String, _>("path")),
-                extension: row.get("extension"),
-                size: row.get::<i64, _>("size") as u64,
-                modified: row.get("modified"),
+            let display_name = display_names
+                .get(&row.path)
+                .cloned()
+                .unwrap_or_else(|| row.stem.clone());
+            stems
+                .entry(display_name.clone())
+                .or_insert_with(|| row.stem.clone());
+            grouped.entry(display_name).or_default().push(FileVariant {
+                path: row.path,
+                extension: row.extension,
+                size: row.size,
+                modified: row.modified,
+                first_seen_at: row.first_seen_at,
             });
         }
 
         let mut records = Vec::new();
-        for (stem, mut variants) in grouped {
+        for (name, mut variants) in grouped {
             sort_variants(&mut variants, priority);
             let path = variants
                 .first()
                 .map(|variant| variant.path.clone())
                 .unwrap_or_default();
+            let stem = stems.remove(&name).unwrap_or_else(|| name.clone());
             let tags = tags.get(&stem).cloned().unwrap_or_default();
             let record = FileRecord {
-                name: stem.clone(),
+                name,
                 path,
                 support: FileSupport::Native,
                 stem,
@@ -469,6 +496,7 @@ impl Database {
                 Alias::new("extension"),
                 Alias::new("size"),
                 Alias::new("modified"),
+                Alias::new("first_seen_at"),
             ])
             .from(files)
             .and_where(Expr::col(Alias::new("category")).eq(category_key(category)));
@@ -556,7 +584,7 @@ impl Database {
         for chunk in stems.chunks(500) {
             let placeholders = placeholders(chunk.len());
             let sql = format!(
-                "SELECT path, stem, extension, size, modified FROM files
+                "SELECT path, stem, extension, size, modified, first_seen_at FROM files
                  WHERE category = ? AND stem IN ({placeholders})
                  ORDER BY stem, extension"
             );
@@ -664,6 +692,31 @@ impl Database {
     }
 }
 
+async fn migrate_files_first_seen_at(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let columns = sqlx::query("PRAGMA table_info(files)")
+        .fetch_all(pool)
+        .await?;
+    let has_first_seen_at = columns
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "first_seen_at");
+    if !has_first_seen_at {
+        sqlx::query("ALTER TABLE files ADD COLUMN first_seen_at INTEGER NOT NULL DEFAULT 0")
+            .execute(pool)
+            .await?;
+    }
+    sqlx::query("UPDATE files SET first_seen_at = rowid WHERE first_seen_at = 0")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+fn current_unix_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
+}
+
 fn sort_variants(variants: &mut [FileVariant], priority: &[AudioFormat]) {
     variants.sort_by(|a, b| {
         priority_index(&a.extension, priority)
@@ -671,6 +724,58 @@ fn sort_variants(variants: &mut [FileVariant], priority: &[AudioFormat]) {
             .then_with(|| a.extension.cmp(&b.extension))
             .then_with(|| a.path.cmp(&b.path))
     });
+}
+
+fn file_row_from_sql(row: sqlx::sqlite::SqliteRow) -> FileRow {
+    FileRow {
+        path: PathBuf::from(row.get::<String, _>("path")),
+        stem: row.get("stem"),
+        extension: row.get("extension"),
+        size: row.get::<i64, _>("size") as u64,
+        modified: row.get("modified"),
+        first_seen_at: row.get("first_seen_at"),
+    }
+}
+
+fn display_names_for_rows(
+    rows: &[FileRow],
+    category_folder: Option<&Path>,
+) -> BTreeMap<PathBuf, String> {
+    let mut duplicate_keys: BTreeMap<(String, String), Vec<&FileRow>> = BTreeMap::new();
+    for row in rows {
+        duplicate_keys
+            .entry((row.stem.clone(), row.extension.to_ascii_lowercase()))
+            .or_default()
+            .push(row);
+    }
+
+    let mut display_names = BTreeMap::new();
+    for duplicates in duplicate_keys.values_mut().filter(|rows| rows.len() > 1) {
+        duplicates.sort_by(|a, b| {
+            a.first_seen_at
+                .cmp(&b.first_seen_at)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        for row in duplicates.iter().skip(1) {
+            display_names.insert(
+                row.path.clone(),
+                prefixed_duplicate_name(row, category_folder),
+            );
+        }
+    }
+    display_names
+}
+
+fn prefixed_duplicate_name(row: &FileRow, category_folder: Option<&Path>) -> String {
+    let relative_parent = category_folder
+        .and_then(|folder| row.path.strip_prefix(folder).ok())
+        .and_then(Path::parent)
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.to_string_lossy().replace('\\', "/"));
+
+    relative_parent
+        .map(|parent| format!("{parent}/{}", row.stem))
+        .unwrap_or_else(|| row.stem.clone())
 }
 
 fn priority_index(extension: &str, priority: &[AudioFormat]) -> usize {
@@ -754,6 +859,23 @@ mod tests {
         }
     }
 
+    fn scan_path(path: &str) -> FileScanRecord {
+        let file_name = Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap();
+        let stem = file_name.rsplit_once('.').map(|(stem, _)| stem).unwrap();
+        let extension = file_name.rsplit_once('.').map(|(_, ext)| ext).unwrap();
+        FileScanRecord {
+            path: PathBuf::from(path),
+            stem: stem.to_string(),
+            extension: extension.to_string(),
+            size: 1,
+            modified: 1,
+            tags: BTreeMap::new(),
+        }
+    }
+
     #[test]
     fn sync_groups_variants_and_seeds_tags() {
         let db = Database::open(&db_path("group")).unwrap();
@@ -775,6 +897,7 @@ mod tests {
                 "",
                 &BTreeMap::new(),
                 &default_format_priority(),
+                None,
             )
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -788,6 +911,92 @@ mod tests {
             vec!["mp3", "flac"]
         );
         assert_eq!(rows[0].tags["GENRE"], vec!["Ambient"]);
+    }
+
+    #[test]
+    fn duplicate_same_format_prefixes_newer_row_with_relative_parent() {
+        let db = Database::open(&db_path("duplicate-format-prefix")).unwrap();
+        db.sync_category(
+            Category::Music,
+            vec![scan_path("/tmp/music/ambient/song.wav")],
+        )
+        .unwrap();
+        db.sync_category(
+            Category::Music,
+            vec![
+                scan_path("/tmp/music/ambient/song.wav"),
+                scan_path("/tmp/music/ambient/alt/song.wav"),
+            ],
+        )
+        .unwrap();
+
+        let rows = db
+            .query_visible_rows(
+                Category::Music,
+                "",
+                &BTreeMap::new(),
+                &default_format_priority(),
+                Some(Path::new("/tmp/music")),
+            )
+            .unwrap();
+        let names = rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["ambient/alt/song", "song"]);
+        assert_eq!(rows[0].variants.len(), 1);
+        assert_eq!(rows[1].variants.len(), 1);
+    }
+
+    #[test]
+    fn open_migrates_legacy_files_table_with_first_seen_at() {
+        let path = db_path("legacy-first-seen");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        block_on(async {
+            let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+                .unwrap()
+                .create_if_missing(true);
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(options)
+                .await
+                .unwrap();
+            sqlx::query(
+                "CREATE TABLE files (
+                    category TEXT NOT NULL,
+                    path TEXT NOT NULL PRIMARY KEY,
+                    stem TEXT NOT NULL,
+                    extension TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    modified INTEGER NOT NULL,
+                    search_text TEXT NOT NULL
+                )",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO files(category, path, stem, extension, size, modified, search_text)
+                 VALUES ('music', '/tmp/song.wav', 'song', 'wav', 1, 1, 'song wav music')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        });
+
+        let db = Database::open(&path).unwrap();
+        let rows = db
+            .query_visible_rows(
+                Category::Music,
+                "",
+                &BTreeMap::new(),
+                &default_format_priority(),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(rows[0].variants[0].first_seen_at, 1);
     }
 
     #[test]
@@ -813,6 +1022,7 @@ mod tests {
                 "",
                 &BTreeMap::new(),
                 &default_format_priority(),
+                None,
             )
             .unwrap();
         assert!(!rows[0].tags.contains_key("GENRE"));
@@ -860,6 +1070,7 @@ mod tests {
                 "",
                 &BTreeMap::new(),
                 &default_format_priority(),
+                None,
             )
             .unwrap();
 
@@ -895,6 +1106,7 @@ mod tests {
                 "dark",
                 &selected,
                 &default_format_priority(),
+                None,
             )
             .unwrap();
 
@@ -927,6 +1139,7 @@ mod tests {
                 "100_",
                 &BTreeMap::new(),
                 &default_format_priority(),
+                None,
             )
             .unwrap();
 

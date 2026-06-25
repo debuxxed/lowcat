@@ -92,6 +92,7 @@ pub struct FileVariant {
     pub extension: String,
     pub size: u64,
     pub modified: i64,
+    pub first_seen_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -299,6 +300,7 @@ mod tests {
                     .unwrap_or_default(),
                 size: 0,
                 modified: 0,
+                first_seen_at: 0,
             }],
             tags: tags
                 .iter()

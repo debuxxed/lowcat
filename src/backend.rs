@@ -99,6 +99,7 @@ impl Backend {
         search: &str,
         selected: &BTreeMap<String, BTreeSet<String>>,
     ) -> Vec<FileRecord> {
+        let category_folder = self.folders.get(&category).map(PathBuf::as_path);
         self.db
             .query_visible_rows(
                 category,
@@ -107,6 +108,7 @@ impl Backend {
                 &self
                     .format_priority()
                     .unwrap_or_else(|_| crate::model::default_format_priority()),
+                category_folder,
             )
             .unwrap_or_default()
     }
@@ -626,6 +628,7 @@ fn read_record(category: Category, path: &Path) -> io::Result<FileRecord> {
             extension: scan.extension,
             size: scan.size,
             modified: scan.modified,
+            first_seen_at: 0,
         }],
         tags: scan.tags,
     })
