@@ -192,6 +192,7 @@ impl Render for Toolbar {
         }
 
         let filters_open = self.library.read(cx).filters_open();
+        let downloader_open = self.library.read(cx).downloader_open();
         let filter_button = Button::new("filter-toggle")
             .icon(IconName::Settings2)
             .small()
@@ -199,6 +200,14 @@ impl Render for Toolbar {
             .selected(filters_open)
             .on_click(cx.listener(|this, _, _, cx| {
                 this.library.update(cx, |lib, cx| lib.toggle_filters(cx));
+            }));
+        let downloader_button = Button::new("downloader-toggle")
+            .icon(IconName::Globe)
+            .small()
+            .tooltip("Downloader")
+            .selected(downloader_open)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.library.update(cx, |lib, cx| lib.toggle_downloader(cx));
             }));
 
         let toolbar = div()
@@ -210,6 +219,7 @@ impl Render for Toolbar {
             .px(CONTENT_PX)
             .child(self.settings_menu.clone())
             .child(filter_button)
+            .child(downloader_button)
             .child(chip_row)
             .child(search);
 

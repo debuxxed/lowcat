@@ -1,3 +1,4 @@
+mod downloader_panel;
 mod filter_panel;
 mod settings_menu;
 mod table;
@@ -5,7 +6,7 @@ mod titlebar;
 mod toolbar;
 
 use gpui::{
-    AnyElement, App, AppContext, Context, Entity, ExternalPaths, FocusHandle, Focusable,
+    AnyElement, App, AppContext as _, Context, Entity, ExternalPaths, FocusHandle, Focusable,
     InteractiveElement, IntoElement, KeyDownEvent, ModifiersChangedEvent, ParentElement, Pixels,
     Render, SharedString, Styled, Window, actions, div, prelude::FluentBuilder, px, rgba,
 };
@@ -20,14 +21,25 @@ use crate::ui::titlebar::TITLEBAR_LEFT_OFFSET;
 #[cfg(target_os = "macos")]
 use crate::{CloseWindow, MinimizeWindow};
 
-actions!(library, [NextCategory, PreviousCategory, ToggleFilters]);
+actions!(
+    library,
+    [
+        NextCategory,
+        PreviousCategory,
+        ToggleFilters,
+        ToggleDownloader
+    ]
+);
 
 /// Horizontal inset shared by all window content (toolbar, filter panel, table
 /// cells). Change this in one place to adjust the padding everywhere.
 pub(crate) const CONTENT_PX: Pixels = px(12.);
+pub(crate) const ROW_PANEL_HEIGHT: Pixels = px(32.);
+const ROW_PANEL_SEPARATOR_HEIGHT: Pixels = px(1.);
 
 use crate::library::Library;
 use crate::ui::{
+    downloader_panel::DownloaderPanel,
     filter_panel::FilterPanel,
     table::{FileTable, PendingDeleteKind},
     titlebar::AppTitleBar,
@@ -39,6 +51,7 @@ pub struct UI {
     titlebar: Entity<AppTitleBar>,
     toolbar: Entity<Toolbar>,
     filter_panel: Entity<FilterPanel>,
+    downloader_panel: Entity<DownloaderPanel>,
     table: Entity<FileTable>,
     focus_handle: FocusHandle,
 }
@@ -61,6 +74,7 @@ impl UI {
             titlebar: cx.new(|cx| AppTitleBar::new(library.clone(), cx)),
             toolbar: cx.new(|cx| Toolbar::new(library.clone(), window, cx)),
             filter_panel: cx.new(|cx| FilterPanel::new(library.clone(), cx)),
+            downloader_panel: cx.new(|cx| DownloaderPanel::new(library.clone(), cx)),
             table: cx.new(|cx| FileTable::new(library.clone(), window, cx)),
             library,
             focus_handle,
@@ -74,10 +88,22 @@ impl UI {
         if modifiers.control || modifiers.alt || modifiers.platform || modifiers.function {
             return false;
         }
+        if modifiers.shift && event.keystroke.key == "e" {
+            return false;
+        }
 
         !matches!(
             event.keystroke.key.as_str(),
-            "escape" | "shift" | "control" | "ctrl" | "alt" | "cmd" | "super" | "win" | "fn"
+            "enter"
+                | "escape"
+                | "shift"
+                | "control"
+                | "ctrl"
+                | "alt"
+                | "cmd"
+                | "super"
+                | "win"
+                | "fn"
         )
     }
 
@@ -89,6 +115,21 @@ impl UI {
 
     fn cancel_delete(&mut self, cx: &mut Context<Self>) -> bool {
         self.table.update(cx, |table, cx| table.cancel_delete(cx))
+    }
+
+    fn confirm_delete(&mut self, cx: &mut Context<Self>) -> bool {
+        let confirmed = self
+            .table
+            .update(cx, |table, cx| table.confirm_pending_delete(cx));
+        if confirmed {
+            debug_ui_interaction(|| "enter confirmed delete".to_string());
+        }
+        confirmed
+    }
+
+    fn text_input_is_focused(&self, window: &Window, cx: &App) -> bool {
+        self.toolbar.read(cx).search_is_focused(window, cx)
+            || self.table.read(cx).tag_editor_is_focused(window, cx)
     }
 
     fn cancel_search_if_no_selection(
@@ -110,6 +151,14 @@ impl UI {
             debug_ui_interaction(|| "escape cleared search".to_string());
         }
         cleared
+    }
+
+    fn paste_download_for_active_category(&mut self, cx: &mut Context<Self>) {
+        let category = self.library.read(cx).active();
+        let clipboard_text = cx.read_from_clipboard().and_then(|item| item.text());
+        self.library.update(cx, |lib, cx| {
+            lib.download_from_clipboard(category, clipboard_text, cx);
+        });
     }
 
     /// Full-window overlay that fades in while OS files are dragged over the
@@ -346,11 +395,14 @@ impl Render for UI {
         crate::perf::sample("ui.render.rate");
         let render_start = crate::perf::start();
         let filters_open = self.library.read(cx).filters_open();
+        let downloader_open = self.library.read(cx).downloader_open();
         let internal_drag_active = self.library.read(cx).internal_file_drag_active();
         let import_progress_active = self.library.read(cx).import_progress().is_some();
         let drop_overlay = self.render_drop_overlay(cx);
         crate::perf::finish("ui.render", render_start, || {
-            format!("filters_open={filters_open} import_progress={import_progress_active}")
+            format!(
+                "filters_open={filters_open} downloader_open={downloader_open} import_progress={import_progress_active}"
+            )
         });
 
         let root = div()
@@ -377,8 +429,17 @@ impl Render for UI {
                     }
                     this.cancel_file_drag(cx);
                     cx.stop_propagation();
+                } else if event.keystroke.key == "enter" && this.confirm_delete(cx) {
+                    cx.stop_propagation();
+                } else if this.library.read(cx).downloader_open()
+                    && event.keystroke.modifiers.platform
+                    && event.keystroke.key == "v"
+                    && !this.text_input_is_focused(window, cx)
+                {
+                    this.paste_download_for_active_category(cx);
+                    cx.stop_propagation();
                 } else if Self::should_activate_search(event)
-                    && !this.toolbar.read(cx).search_is_focused(window, cx)
+                    && !this.text_input_is_focused(window, cx)
                 {
                     let keystroke = event.keystroke.clone();
                     this.toolbar
@@ -391,6 +452,9 @@ impl Render for UI {
             }))
             .on_action(cx.listener(|this, _: &ToggleFilters, _, cx| {
                 this.library.update(cx, |lib, cx| lib.toggle_filters(cx));
+            }))
+            .on_action(cx.listener(|this, _: &ToggleDownloader, _, cx| {
+                this.library.update(cx, |lib, cx| lib.toggle_downloader(cx));
             }))
             .on_action(cx.listener(|this, _: &NextCategory, _, cx| {
                 this.library.update(cx, |lib, cx| lib.next_category(cx));
@@ -410,7 +474,19 @@ impl Render for UI {
 
         root.child(self.titlebar.clone())
             .child(self.toolbar.clone())
+            .when(filters_open || downloader_open, |el| {
+                el.child(
+                    div()
+                        .h(ROW_PANEL_SEPARATOR_HEIGHT)
+                        .w_full()
+                        .flex_shrink_0()
+                        .bg(cx.theme().border),
+                )
+            })
             .when(filters_open, |el| el.child(self.filter_panel.clone()))
+            .when(downloader_open, |el| {
+                el.child(self.downloader_panel.clone())
+            })
             .child(self.table.clone())
             .when(!internal_drag_active, |el| el.child(drop_overlay))
             .when(import_progress_active, |el| {

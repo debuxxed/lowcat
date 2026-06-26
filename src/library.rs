@@ -7,6 +7,10 @@ use futures::{StreamExt as _, channel::mpsc};
 use gpui::{AppContext as _, Context, EventEmitter};
 
 use crate::backend::{Backend, import_to_folder};
+use crate::downloader::{
+    self, DownloadCancel, DownloadError, DownloadErrorKind, DownloadOutput, DownloadProgressEvent,
+    DownloadRequest, DownloadState, DownloadStatus,
+};
 use crate::model::{
     AudioFormat, Category, CategoryState, ConvertConflictBehavior, FileRecord, canonical_tag_key,
     default_format_priority, tag_label,
@@ -24,6 +28,9 @@ pub struct Library {
     format_priority: Vec<AudioFormat>,
     convert_conflict_behavior: ConvertConflictBehavior,
     filters_open: bool,
+    downloader_open: bool,
+    download_state: DownloadState,
+    download_cancel: Option<DownloadCancel>,
     internal_file_drag: Option<InternalFileDrag>,
     importing: bool,
     import_progress: Option<ImportProgress>,
@@ -65,6 +72,11 @@ struct TrashBatchResult {
     category: Category,
     file_count: usize,
     result: io::Result<usize>,
+}
+
+struct DownloadBatchResult {
+    category: Category,
+    result: Result<DownloadOutput, DownloadError>,
 }
 
 enum ImportProgressEvent {
@@ -112,6 +124,9 @@ impl Library {
             format_priority,
             convert_conflict_behavior,
             filters_open: false,
+            downloader_open: false,
+            download_state: DownloadState::Idle,
+            download_cancel: None,
             internal_file_drag: None,
             importing: false,
             import_progress: None,
@@ -137,6 +152,14 @@ impl Library {
         self.filters_open
     }
 
+    pub fn downloader_open(&self) -> bool {
+        self.downloader_open
+    }
+
+    pub fn download_state(&self) -> DownloadState {
+        self.download_state.clone()
+    }
+
     pub fn import_progress(&self) -> Option<&ImportProgress> {
         self.import_progress.as_ref()
     }
@@ -151,6 +174,18 @@ impl Library {
 
     pub fn toggle_filters(&mut self, cx: &mut Context<Self>) {
         self.filters_open = !self.filters_open;
+        if self.filters_open {
+            self.downloader_open = false;
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_downloader(&mut self, cx: &mut Context<Self>) {
+        self.downloader_open = !self.downloader_open;
+        if self.downloader_open {
+            self.filters_open = false;
+        }
+        debug_downloader_interaction(|| format!("panel_open={}", self.downloader_open));
         cx.notify();
     }
 
@@ -196,6 +231,119 @@ impl Library {
             }
         }
         self.refresh(cx);
+    }
+
+    pub fn download_from_clipboard(
+        &mut self,
+        category: Category,
+        clipboard_text: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.downloader_open = true;
+        self.filters_open = false;
+
+        if matches!(self.download_state, DownloadState::Running(_)) {
+            debug_downloader_interaction(|| {
+                format!("paste_ignored=running category={}", category.label())
+            });
+            cx.notify();
+            return;
+        }
+
+        let Some(clipboard_text) = clipboard_text else {
+            debug_downloader_interaction(|| {
+                format!(
+                    "paste_rejected=empty_clipboard category={}",
+                    category.label()
+                )
+            });
+            self.set_download_error(DownloadError::clipboard_empty(), cx);
+            return;
+        };
+        let url = match downloader::extract_youtube_url(&clipboard_text) {
+            Ok(url) => url,
+            Err(error) => {
+                debug_downloader_interaction(|| {
+                    format!("paste_rejected=invalid_url category={}", category.label())
+                });
+                self.set_download_error(error, cx);
+                return;
+            }
+        };
+        let Some(folder) = self
+            .settings
+            .category_folder(category)
+            .map(Path::to_path_buf)
+        else {
+            debug_downloader_interaction(|| {
+                format!(
+                    "paste_rejected=missing_folder category={}",
+                    category.label()
+                )
+            });
+            self.set_download_error(DownloadError::missing_category_folder(category), cx);
+            return;
+        };
+
+        let request = DownloadRequest {
+            category,
+            url,
+            folder,
+        };
+        let cancel = DownloadCancel::default();
+        self.download_cancel = Some(cancel.clone());
+        self.download_state = DownloadState::Running(DownloadStatus {
+            category,
+            label: "Preparing download".to_string(),
+            progress: 0.,
+        });
+        debug_downloader_interaction(|| format!("download_start category={}", category.label()));
+        cx.notify();
+
+        let (progress_tx, mut progress_rx) = mpsc::unbounded();
+        cx.spawn(async move |this, cx| {
+            while let Some(event) = progress_rx.next().await {
+                this.update(cx, |lib, cx| {
+                    lib.apply_download_progress(event, cx);
+                })
+                .ok();
+            }
+        })
+        .detach();
+
+        let download_task = cx.background_spawn(async move {
+            let result = downloader::download_audio(request, cancel, |event| {
+                let _ = progress_tx.unbounded_send(event);
+            });
+            DownloadBatchResult { category, result }
+        });
+
+        cx.spawn(async move |this, cx| {
+            let result = download_task.await;
+            this.update(cx, |lib, cx| {
+                lib.finish_download(result, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn cancel_download(&mut self, cx: &mut Context<Self>) {
+        if let Some(cancel) = &self.download_cancel {
+            cancel.cancel();
+            if let DownloadState::Running(status) = &mut self.download_state {
+                status.label = "Canceling".to_string();
+            }
+            debug_downloader_interaction(|| "cancel_requested".to_string());
+        }
+        cx.notify();
+    }
+
+    pub fn dismiss_download_error(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.download_state, DownloadState::Error(_)) {
+            self.download_state = DownloadState::Idle;
+            cx.notify();
+        }
     }
 
     pub fn add_tag(&mut self, path: PathBuf, key: &str, value: &str, cx: &mut Context<Self>) {
@@ -644,6 +792,60 @@ impl Library {
         cx.notify();
     }
 
+    fn set_download_error(&mut self, error: DownloadError, cx: &mut Context<Self>) {
+        self.download_cancel = None;
+        self.download_state = DownloadState::Error(error);
+        cx.notify();
+    }
+
+    fn apply_download_progress(&mut self, event: DownloadProgressEvent, cx: &mut Context<Self>) {
+        let DownloadState::Running(status) = &mut self.download_state else {
+            return;
+        };
+
+        match event {
+            DownloadProgressEvent::Label(label) => {
+                if !label.is_empty() {
+                    status.label = label;
+                }
+            }
+            DownloadProgressEvent::Progress(progress) => {
+                status.progress = progress.clamp(0., 100.);
+            }
+        }
+        cx.notify();
+    }
+
+    fn finish_download(&mut self, result: DownloadBatchResult, cx: &mut Context<Self>) {
+        self.download_cancel = None;
+        match result.result {
+            Ok(output) => {
+                let _ = output.path;
+                self.download_state = DownloadState::Idle;
+                let _ = self.backend.refresh_category(result.category);
+                let _ = self.refresh_category_state(result.category);
+                debug_downloader_interaction(|| {
+                    format!("download_finished category={}", result.category.label())
+                });
+            }
+            Err(error) if error.kind == DownloadErrorKind::Canceled => {
+                self.download_state = DownloadState::Idle;
+                debug_downloader_interaction(|| "download_canceled".to_string());
+            }
+            Err(error) => {
+                debug_downloader_interaction(|| {
+                    format!(
+                        "download_failed category={} reason={}",
+                        result.category.label(),
+                        error.message
+                    )
+                });
+                self.download_state = DownloadState::Error(error);
+            }
+        }
+        cx.notify();
+    }
+
     fn finish_import(&mut self, result: ImportBatchResult, cx: &mut Context<Self>) {
         self.importing = false;
         self.import_progress = None;
@@ -876,6 +1078,15 @@ fn display_record(record: FileRecord) -> FileRecord {
         stem: record.stem,
         variants: record.variants,
         tags: display_schema(record.tags),
+    }
+}
+
+fn debug_downloader_interaction(details: impl FnOnce() -> String) {
+    let enabled = std::env::var("LOWCAT_DEBUG")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if enabled {
+        eprintln!("[lowcat:downloader] {}", details());
     }
 }
 

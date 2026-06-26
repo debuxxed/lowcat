@@ -262,6 +262,10 @@ impl FileTable {
         }
     }
 
+    pub(crate) fn tag_editor_is_focused(&self, window: &Window, cx: &App) -> bool {
+        self.tag_input.read(cx).focus_handle(cx).is_focused(window)
+    }
+
     fn start_editing(
         &mut self,
         path: PathBuf,
@@ -621,9 +625,9 @@ impl FileTable {
         true
     }
 
-    pub fn confirm_pending_delete(&mut self, cx: &mut Context<Self>) {
+    pub fn confirm_pending_delete(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(pending) = self.pending_delete.take() else {
-            return;
+            return false;
         };
 
         let paths = pending.target.paths;
@@ -636,6 +640,7 @@ impl FileTable {
         self.library
             .update(cx, |lib, cx| lib.trash_files(paths, cx));
         cx.notify();
+        true
     }
 
     fn set_row_hovered(&mut self, path: PathBuf, hovered: bool, cx: &mut Context<Self>) {

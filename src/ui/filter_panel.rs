@@ -1,11 +1,14 @@
 use gpui::{
-    Context, Entity, InteractiveElement as _, IntoElement, ParentElement, Render, SharedString,
-    StatefulInteractiveElement as _, Styled, Window, div,
+    Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled, Window, div,
+    prelude::FluentBuilder as _,
 };
-use gpui_component::{ActiveTheme as _, StyledExt};
+use gpui_component::{
+    ActiveTheme as _, Selectable as _, Sizable as _, StyledExt,
+    button::{Button, ButtonVariants as _},
+};
 
 use crate::library::Library;
-use crate::ui::CONTENT_PX;
+use crate::ui::{CONTENT_PX, ROW_PANEL_HEIGHT};
 
 pub struct FilterPanel {
     library: Entity<Library>,
@@ -28,9 +31,9 @@ impl Render for FilterPanel {
             .flex_wrap()
             .items_center()
             .w_full()
+            .min_h(ROW_PANEL_HEIGHT)
             .px(CONTENT_PX)
             .py_1()
-            .mb_2()
             .gap_x_4()
             .gap_y_2();
 
@@ -53,33 +56,13 @@ impl Render for FilterPanel {
                 let key_owned = key.clone();
                 let value_owned = value.clone();
 
-                let (border, bg, fg) = if is_active {
-                    (
-                        cx.theme().primary,
-                        cx.theme().primary.opacity(0.15),
-                        cx.theme().primary,
-                    )
-                } else {
-                    (
-                        cx.theme().border,
-                        cx.theme().transparent,
-                        cx.theme().foreground,
-                    )
-                };
-
                 group = group.child(
-                    div()
-                        .id(SharedString::from(format!("{key}:{value}")))
-                        .px_2()
-                        .py_0p5()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(border)
-                        .bg(bg)
-                        .text_xs()
-                        .text_color(fg)
-                        .cursor_pointer()
-                        .child(SharedString::from(value.clone()))
+                    Button::new(format!("filter-{key}:{value}"))
+                        .xsmall()
+                        .compact()
+                        .label(value.clone())
+                        .selected(is_active)
+                        .when(is_active, |button| button.primary())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let key = key_owned.clone();
                             let value = value_owned.clone();

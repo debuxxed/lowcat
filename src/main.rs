@@ -1,5 +1,6 @@
 mod backend;
 mod db;
+mod downloader;
 mod library;
 mod media_tools;
 mod model;
@@ -19,7 +20,7 @@ use gpui_component_assets::Assets;
 use gpui_platform::application;
 
 use crate::library::Library;
-use crate::ui::{NextCategory, PreviousCategory, ToggleFilters, UI};
+use crate::ui::{NextCategory, PreviousCategory, ToggleDownloader, ToggleFilters, UI};
 
 actions!(
     app,
@@ -69,6 +70,7 @@ fn main() {
         let bindings = [
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-e", ToggleFilters, None),
+            KeyBinding::new("shift-e", ToggleDownloader, None),
             KeyBinding::new("ctrl-tab", NextCategory, None),
             KeyBinding::new("ctrl-shift-tab", PreviousCategory, None),
         ];
