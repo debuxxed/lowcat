@@ -1,13 +1,14 @@
 <h1 align="center">lowcat</h1>
 
 <p align="center">
-  Lightweight and cross-platform sound library app that runs locally.<br>
+  Lightweight and cross-platform sound library app that runs locally, powered by
+  <a href="https://www.gpui.rs/">gpui</a> library.<br>
   Forget about using file manager!
 </p>
 <p align="center">
-  Powered by
-  <a href="https://www.gpui.rs/">gpui</a> library.
+  Join our <a href="https://discord.gg/MPDehxzDHT">discord</a> btw!
 </p>
+
 <img alt="yes, i love zed's UI" src="https://github.com/user-attachments/assets/833b1164-188c-4c0e-a256-a589c5fc5ac0" style="width:100%; height: auto;" />
 
 ## Features
@@ -32,11 +33,14 @@ The files of each category can have _tags_ — those, and other data are stored 
 If there are files with the same name, but different extension — they are grouped into _stems_, which are displayed as rows in UI.
 
 ## Contribute
-You can help A LOT by spreading a word, or document the app (YouTube tutorials, guides).
+### Tutorials
+You can help A LOT by creating YouTube tutorials or blogposts about the app.
 
-If you prefer donating instead, you'd get to suggest features and have quick bugfixes.
+### Donation
+If you prefer [sponsoring development](https://ko-fi.com/debuxxed), you get to suggest features and have quick bugfixes, as thanks from me.
 
-Join our <a href="https://discord.gg/MPDehxzDHT">discord</a> btw!
+### Spread a word
+Just share with some editors you might think this is useful for =)
 
 ## Why?
 
