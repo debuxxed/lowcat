@@ -29,6 +29,7 @@ gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac10
 productName = "Lowcat"
 identifier = "me.debuxxed.lowcat"
 before-packaging-command = "cargo build --release"
+icons = ["assets/logo.png"]
 
 [package.metadata.packager.macos]
 infoPlistPath = "packaging/macos/Info.plist"
