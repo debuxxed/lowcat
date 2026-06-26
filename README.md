@@ -9,7 +9,7 @@
   Join our <a href="https://discord.gg/MPDehxzDHT">discord</a> btw!
 </p>
 
-<img alt="yes, i love zed's UI" src="https://github.com/user-attachments/assets/833b1164-188c-4c0e-a256-a589c5fc5ac0" style="width:100%; height: auto;" />
+<img style="width:100%; height: auto;" alt="yes, i love zed's UI" src="https://github.com/user-attachments/assets/8ccef7b0-0ae7-4edd-9925-d09d055c981a" />
 
 ## Features
 
