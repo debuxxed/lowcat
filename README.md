@@ -1,4 +1,7 @@
-<h1 align="center">lowcat</h1>
+<h1 align="center">
+  <img width="128" alt="Lowcat" src="https://github.com/user-attachments/assets/e4f90ae3-80d0-4eff-93b5-9a67003cc373" />
+  <br>lowcat
+</h1>
 
 <p align="center">
   Lightweight and cross-platform sound library app that runs locally, powered by
