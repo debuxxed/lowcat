@@ -22,14 +22,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - uses: FedericoCarboni/setup-ffmpeg@v3
-        id: setup-ffmpeg
-        with:
-          ffmpeg-version: release
-          architecture: ''
-          linking-type: static
-          # needed for Windows builds
-          github-token: ${{ github.server_url == 'https://github.com' && github.token || '' }}
+      - name: Install FFmpeg
+        run: brew install ffmpeg
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
