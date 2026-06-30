@@ -6,9 +6,9 @@
 
 ## UI Verification Workflow
 - For UI changes, Codex should run `cargo check` first.
-- If `cargo check` passes, kill existing `lowcat` processes and start `cargo run` in a live PTY session.
-- Keep the app running across turns while the user manually interacts with the UI.
-- Add targeted debug output for the affected interaction path, and remove it once user confirms the code works as expected.
-- Tell the user exactly what to try and what logs are expected.
+- If Codex can verify the UI behavior without user assistance, run `cargo run` and complete verification directly.
+- If Codex needs user assistance to verify the UI behavior, ask for manual verification and stop; do not start or keep a live app session just for the user to interact with.
+- Add targeted debug output only when it is needed for the affected interaction path, and remove it once the behavior is confirmed.
+- When asking for manual verification, tell the user exactly what to try and what result or log is expected.
 - Use the user's observation plus the live logs to iterate before declaring the UI fix verified.
 - Do not treat compile success alone as UI verification.

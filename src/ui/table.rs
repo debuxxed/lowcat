@@ -668,7 +668,7 @@ impl FileTable {
         true
     }
 
-    fn clear_selection(&mut self, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn clear_selection(&mut self, cx: &mut Context<Self>) -> bool {
         if self.selected.is_empty() && self.selection_anchor.is_none() {
             return false;
         }

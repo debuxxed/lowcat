@@ -26,6 +26,7 @@ pub struct Library {
     settings: config::Settings,
     settings_path: PathBuf,
     format_priority: Vec<AudioFormat>,
+    download_format: AudioFormat,
     convert_conflict_behavior: ConvertConflictBehavior,
     filters_open: bool,
     downloader_open: bool,
@@ -115,6 +116,7 @@ impl Library {
         let convert_conflict_behavior = backend
             .convert_conflict_behavior()
             .unwrap_or(ConvertConflictBehavior::AddCopy);
+        let download_format = settings.download_format();
         Self {
             backend,
             active: Category::Music,
@@ -122,6 +124,7 @@ impl Library {
             settings,
             settings_path,
             format_priority,
+            download_format,
             convert_conflict_behavior,
             filters_open: false,
             downloader_open: false,
@@ -168,6 +171,10 @@ impl Library {
         &self.format_priority
     }
 
+    pub fn download_format(&self) -> AudioFormat {
+        self.download_format
+    }
+
     pub fn convert_conflict_behavior(&self) -> ConvertConflictBehavior {
         self.convert_conflict_behavior
     }
@@ -192,6 +199,10 @@ impl Library {
     pub fn set_category(&mut self, category: Category, cx: &mut Context<Self>) {
         if self.active != category {
             self.active = category;
+            debug_library_interaction(|| {
+                let results = self.active_state().results.len();
+                format!("category={} results={results}", category.label())
+            });
             cx.notify();
         }
     }
@@ -205,11 +216,23 @@ impl Library {
     }
 
     pub fn set_search(&mut self, search: String, cx: &mut Context<Self>) {
-        let active = self.active;
-        if let Some(state) = self.states.get_mut(&active) {
-            state.search = search;
+        for category in Category::ALL {
+            let state = self.states.entry(category).or_default();
+            state.search = search.clone();
         }
-        self.refresh(cx);
+        for category in Category::ALL {
+            let _ = self.refresh_category_state(category);
+        }
+        debug_library_interaction(|| {
+            let active = self.active;
+            let results = self.active_state().results.len();
+            format!(
+                "search_len={} active={} results={results}",
+                search.len(),
+                active.label()
+            )
+        });
+        cx.notify();
     }
 
     pub fn toggle_value(&mut self, key: &str, value: &str, cx: &mut Context<Self>) {
@@ -289,6 +312,7 @@ impl Library {
             category,
             url,
             folder,
+            format: self.download_format,
         };
         let cancel = DownloadCancel::default();
         self.download_cancel = Some(cancel.clone());
@@ -432,6 +456,21 @@ impl Library {
         }
         if self.backend.set_convert_conflict_behavior(behavior).is_ok() {
             self.convert_conflict_behavior = behavior;
+        }
+        cx.notify();
+    }
+
+    pub fn set_download_format(&mut self, format: AudioFormat, cx: &mut Context<Self>) {
+        if self.download_format == format {
+            cx.notify();
+            return;
+        }
+
+        let mut settings = self.settings.clone();
+        settings.set_download_format(format);
+        if settings.save(&self.settings_path).is_ok() {
+            self.settings = settings;
+            self.download_format = format;
         }
         cx.notify();
     }
@@ -1090,6 +1129,15 @@ fn debug_downloader_interaction(details: impl FnOnce() -> String) {
     }
 }
 
+fn debug_library_interaction(details: impl FnOnce() -> String) {
+    let enabled = std::env::var("LOWCAT_DEBUG")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if enabled {
+        eprintln!("[lowcat:library] {}", details());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1316,6 +1364,23 @@ mod tests {
     }
 
     #[gpui::test]
+    fn download_format_persists(cx: &mut gpui::TestAppContext) {
+        let settings_path = settings_path("download-format");
+        let library = cx.new(|_| Library::new_with_settings_path(settings_path.clone()));
+
+        let initial = library.read_with(cx, |lib, _| lib.download_format());
+        assert_eq!(initial, AudioFormat::Opus);
+
+        library.update(cx, |lib, cx| {
+            lib.set_download_format(AudioFormat::Wav, cx);
+        });
+
+        let restarted = cx.new(|_| Library::new_with_settings_path(settings_path));
+        let persisted = restarted.read_with(cx, |lib, _| lib.download_format());
+        assert_eq!(persisted, AudioFormat::Wav);
+    }
+
+    #[gpui::test]
     fn supported_wav_is_indexed_and_searchable(cx: &mut gpui::TestAppContext) {
         let settings_path = settings_path("supported-wav");
         let (music_dir, _) = settings_with_folders(&settings_path);
@@ -1334,6 +1399,29 @@ mod tests {
         });
 
         assert_eq!(visible, vec!["hidden"]);
+    }
+
+    #[gpui::test]
+    fn search_filters_both_categories_when_switching(cx: &mut gpui::TestAppContext) {
+        let settings_path = settings_path("search-both-categories");
+        let (music_dir, sfx_dir) = settings_with_folders(&settings_path);
+        fixture(&music_dir, "hit-music.flac", &[("GENRE", "Ambient")]);
+        fixture(&music_dir, "miss-music.flac", &[("GENRE", "Ambient")]);
+        fixture(&sfx_dir, "hit-sfx.flac", &[("TYPE", "Impact")]);
+        fixture(&sfx_dir, "miss-sfx.flac", &[("TYPE", "Impact")]);
+        let library = cx.new(|_| Library::new_with_settings_path(settings_path));
+
+        library.update(cx, |lib, cx| lib.set_search("hit".to_string(), cx));
+        let music_count = library.read_with(cx, |lib, _| lib.active_state().results.len());
+        assert_eq!(music_count, 1);
+
+        library.update(cx, |lib, cx| lib.set_category(Category::Sfx, cx));
+        let sfx_count = library.read_with(cx, |lib, _| lib.active_state().results.len());
+        assert_eq!(sfx_count, 1);
+
+        library.update(cx, |lib, cx| lib.set_category(Category::Music, cx));
+        let music_count = library.read_with(cx, |lib, _| lib.active_state().results.len());
+        assert_eq!(music_count, 1);
     }
 
     #[gpui::test]

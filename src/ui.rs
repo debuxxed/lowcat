@@ -117,6 +117,10 @@ impl UI {
         self.table.update(cx, |table, cx| table.cancel_delete(cx))
     }
 
+    fn clear_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        self.table.update(cx, |table, cx| table.clear_selection(cx))
+    }
+
     fn confirm_delete(&mut self, cx: &mut Context<Self>) -> bool {
         let confirmed = self
             .table
@@ -431,9 +435,17 @@ impl Render for UI {
                         cx.stop_propagation();
                         return;
                     }
+                    if this.clear_selection(cx) {
+                        cx.stop_propagation();
+                        return;
+                    }
                     this.cancel_file_drag(cx);
                     cx.stop_propagation();
                 } else if event.keystroke.key == "enter" && this.confirm_delete(cx) {
+                    cx.stop_propagation();
+                } else if event.keystroke.modifiers.platform && event.keystroke.key == "f" {
+                    this.toolbar
+                        .update(cx, |toolbar, cx| toolbar.focus_search(window, cx));
                     cx.stop_propagation();
                 } else if event.keystroke.modifiers.platform
                     && event.keystroke.key == "a"

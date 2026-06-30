@@ -1,16 +1,19 @@
 use std::{
     env, fs, io,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::Category;
+use crate::model::{AudioFormat, Category};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
     category_folders: CategoryFolders,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    download_format: Option<String>,
 }
 
 impl Settings {
@@ -41,6 +44,17 @@ impl Settings {
             Category::Music => self.category_folders.music = Some(path),
             Category::Sfx => self.category_folders.sfx = Some(path),
         }
+    }
+
+    pub fn download_format(&self) -> AudioFormat {
+        self.download_format
+            .as_deref()
+            .and_then(|format| AudioFormat::from_str(format).ok())
+            .unwrap_or(AudioFormat::Opus)
+    }
+
+    pub fn set_download_format(&mut self, format: AudioFormat) {
+        self.download_format = Some(format.extension().to_string());
     }
 }
 

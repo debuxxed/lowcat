@@ -20,6 +20,7 @@ pub struct DownloadRequest {
     pub category: Category,
     pub url: String,
     pub folder: PathBuf,
+    pub format: AudioFormat,
 }
 
 #[derive(Debug, Clone)]
@@ -232,7 +233,7 @@ fn spawn_ytdlp(request: &DownloadRequest, temp_dir: &PathBuf) -> io::Result<Chil
             "--no-playlist",
             "--extract-audio",
             "--audio-format",
-            AudioFormat::Opus.extension(),
+            request.format.extension(),
             "--audio-quality",
             "0",
             "--format",
