@@ -180,6 +180,7 @@ impl Render for AppTitleBar {
         for category in Category::ALL {
             let selected = category == active;
             let hovered = self.hovered_category == Some(category);
+            let missing_folder = self.library.read(cx).category_needs_folder(category);
             let drag_hovered = self.drag_hovered_category == Some(category);
             let bg = if selected {
                 selected_bg
@@ -221,6 +222,8 @@ impl Render for AppTitleBar {
                 this.choose_category_folder(category, event, window, cx);
             }));
 
+            let show_folder_button = can_hover && (hovered || missing_folder);
+
             categories = categories.child(
                 div()
                     .id(SharedString::from(category.label()))
@@ -243,7 +246,7 @@ impl Render for AppTitleBar {
                         this.bg(drag_bg)
                     })
                     .when(can_hover, |this| this.hover(move |this| this.bg(hover_bg)))
-                    .when(can_hover && hovered, |this| {
+                    .when(show_folder_button, |this| {
                         this.child(div().absolute().right(px(6.)).child(folder_button))
                     })
                     .on_drag_move::<ExternalPaths>(cx.listener(

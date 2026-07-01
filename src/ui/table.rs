@@ -7,11 +7,11 @@ use std::rc::Rc;
 
 use futures::{StreamExt as _, channel::mpsc};
 use gpui::{
-    AnyElement, App, AppContext as _, ClickEvent, Context, DismissEvent, Entity, FocusHandle,
-    Focusable, InteractiveElement as _, IntoElement, KeyDownEvent, Keystroke, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
-    SharedString, Size, StatefulInteractiveElement as _, Styled, Window, div, hsla,
-    prelude::FluentBuilder as _, px, red, size,
+    AnyElement, App, AppContext as _, AsyncApp, ClickEvent, Context, DismissEvent, Entity,
+    FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyDownEvent, Keystroke,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions,
+    Pixels, Point, Render, SharedString, Size, StatefulInteractiveElement as _, Styled, Window,
+    div, hsla, prelude::FluentBuilder as _, px, red, size,
 };
 use gpui_component::{
     ActiveTheme as _, Sizable, StyledExt, VirtualListScrollHandle,
@@ -25,7 +25,7 @@ use gpui_component::{
 use crate::ui::CONTENT_PX;
 use crate::{
     library::{Library, LibraryEvent},
-    model::{AudioFormat, FileRecord},
+    model::{AudioFormat, Category, FileRecord},
 };
 
 const TAG_CELL_X_PADDING_WIDTH: f32 = 24.;
@@ -107,6 +107,7 @@ pub struct FileTable {
     row_sizes: Rc<Vec<Size<Pixels>>>,
     row_sizes_len: usize,
     tag_width_cache: Option<TagWidthCache>,
+    folder_prompt_active: bool,
 }
 
 impl FileTable {
@@ -202,7 +203,52 @@ impl FileTable {
             row_sizes: Rc::new(Vec::new()),
             row_sizes_len: 0,
             tag_width_cache: None,
+            folder_prompt_active: false,
         }
+    }
+
+    fn choose_category_folder(&mut self, category: Category, cx: &mut Context<Self>) {
+        if self.folder_prompt_active {
+            return;
+        }
+
+        self.folder_prompt_active = true;
+        cx.notify();
+
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(format!("Select {} folder", category.label()).into()),
+        });
+        let library = self.library.downgrade();
+
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let path = paths
+                .await
+                .ok()
+                .and_then(|paths| paths.ok())
+                .flatten()
+                .and_then(|paths| paths.into_iter().next());
+
+            this.update(cx, |this, cx| {
+                this.folder_prompt_active = false;
+                cx.notify();
+            })
+            .ok()?;
+
+            let Some(path) = path else {
+                return Some(());
+            };
+
+            library
+                .update(cx, |lib, cx| {
+                    let _ = lib.set_category_folder(category, path, cx);
+                })
+                .ok()?;
+            Some(())
+        })
+        .detach();
     }
 
     fn table_columns(&mut self, cx: &mut Context<Self>) -> (Vec<String>, Vec<Pixels>, usize) {
@@ -1345,7 +1391,16 @@ impl Render for FileTable {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::perf::sample("table.render.rate");
         let render_start = crate::perf::start();
-        let (keys, tag_widths, row_count) = self.table_columns(cx);
+        let missing_folder_category = {
+            let library = self.library.read(cx);
+            let active = library.active();
+            library.category_needs_folder(active).then_some(active)
+        };
+        let (keys, tag_widths, row_count) = if missing_folder_category.is_some() {
+            (Vec::new(), Vec::new(), 0)
+        } else {
+            self.table_columns(cx)
+        };
 
         let mut header_row = TableRow::new().child(
             TableHead::new()
@@ -1369,25 +1424,51 @@ impl Render for FileTable {
         let virtual_tag_widths = tag_widths.clone();
         let row_sizes = self.row_sizes(row_count);
         let row_scroll_handle = self.row_scroll_handle.clone();
-        let rows = div()
-            .size_full()
-            .child(
-                v_virtual_list(
-                    cx.entity().clone(),
-                    "file-table-rows",
-                    row_sizes,
-                    move |this, range, _, cx| {
-                        this.render_rows(
-                            range,
-                            virtual_keys.clone(),
-                            virtual_tag_widths.clone(),
-                            cx,
-                        )
-                    },
+        let rows: AnyElement = if let Some(category) = missing_folder_category {
+            div()
+                .id("missing-category-folder")
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .px(CONTENT_PX)
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .cursor_pointer()
+                .child(SharedString::from(format!(
+                    "Click this area to choose the {} folder.",
+                    category.label()
+                )))
+                .child("You can always change it via the category buttons above.")
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.choose_category_folder(category, cx);
+                    cx.stop_propagation();
+                }))
+                .into_any_element()
+        } else {
+            div()
+                .size_full()
+                .child(
+                    v_virtual_list(
+                        cx.entity().clone(),
+                        "file-table-rows",
+                        row_sizes,
+                        move |this, range, _, cx| {
+                            this.render_rows(
+                                range,
+                                virtual_keys.clone(),
+                                virtual_tag_widths.clone(),
+                                cx,
+                            )
+                        },
+                    )
+                    .track_scroll(&row_scroll_handle),
                 )
-                .track_scroll(&row_scroll_handle),
-            )
-            .scrollbar(&row_scroll_handle, ScrollbarAxis::Vertical);
+                .scrollbar(&row_scroll_handle, ScrollbarAxis::Vertical)
+                .into_any_element()
+        };
 
         let table = div()
             .track_focus(&self.focus_handle)

@@ -151,6 +151,12 @@ impl Library {
         self.settings.category_folder(category)
     }
 
+    pub fn category_needs_folder(&self, category: Category) -> bool {
+        self.settings
+            .category_folder(category)
+            .is_none_or(|path| !path.is_dir())
+    }
+
     pub fn filters_open(&self) -> bool {
         self.filters_open
     }
@@ -1232,6 +1238,9 @@ mod tests {
 
         let count = library.read_with(cx, |lib, _| lib.active_state().results.len());
         assert_eq!(count, 0);
+        let needs_folder =
+            library.read_with(cx, |lib, _| lib.category_needs_folder(Category::Music));
+        assert!(needs_folder);
     }
 
     #[gpui::test]
