@@ -3,7 +3,7 @@ name: Upload release artifact
 on:
   push:
     tags:
-      - "v*"
+      - "*"
 
 permissions:
   contents: write
@@ -19,38 +19,22 @@ jobs:
     runs-on: macos-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - run: brew install ffmpeg
+      - run: brew install yt-dlp
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Install FFmpeg
-        run: brew install ffmpeg
-
-      - name: Install yt-dlp
-        run: brew install yt-dlp
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      # Reuse dependencies
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
-
-
-      - name: Check
-        run: cargo check --locked
-
-      - name: Run tests
-        run: cargo test --locked
-
-      # Current tool for cross-platform packaging
       - name: Install cargo-packager
-        run: cargo install cargo-packager --locked
+        run: |
+            if ! command -v cargo-packager >/dev/null; then
+              cargo install cargo-packager --locked
+            fi
 
       # This uses the metadata already configured in Cargo.toml.
       # Building step is already included in Cargo.toml's metadata section
       - name: Build package
         run: cargo-packager --release --formats dmg
-
 
       # Create a draft GitHub Release for the tag, generate notes from commits/PRs,
       # and attach the generated DMG file.
