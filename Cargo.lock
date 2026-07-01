@@ -3954,6 +3954,7 @@ dependencies = [
 name = "lowcat"
 version = "0.2.0"
 dependencies = [
+ "cocoa 0.26.0",
  "drag",
  "futures",
  "gpui",
