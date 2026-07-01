@@ -1,4 +1,5 @@
 use std::{
+    env,
     error::Error,
     fmt, fs,
     io::{self, BufRead, BufReader},
@@ -155,6 +156,7 @@ pub fn download_audio(
     fs::create_dir_all(&temp_dir).map_err(|_| DownloadError::failed("Download failed"))?;
 
     let mut child = spawn_ytdlp(&request, &temp_dir).map_err(|error| {
+        debug_ytdlp(|| format!("spawn_failed kind={:?} error={}", error.kind(), error));
         cleanup_temp_dir(&temp_dir);
         if error.kind() == io::ErrorKind::NotFound {
             DownloadError::tool_missing()
@@ -198,8 +200,20 @@ pub fn download_audio(
                 if cancel.is_canceled() {
                     return Err(DownloadError::canceled());
                 }
+                debug_ytdlp(|| {
+                    format!(
+                        "exit status={} output_path={} stderr_tail={}",
+                        status,
+                        output_path
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "<none>".to_string()),
+                        log_tail(&error_text)
+                    )
+                });
                 if status.success() {
                     let Some(path) = output_path else {
+                        debug_ytdlp(|| "success_without_output_path".to_string());
                         return Err(DownloadError::failed("Download failed"));
                     };
                     on_progress(DownloadProgressEvent::Progress(100.));
@@ -208,7 +222,8 @@ pub fn download_audio(
                 return Err(classify_ytdlp_error(&error_text));
             }
             Ok(None) => {}
-            Err(_) => {
+            Err(error) => {
+                debug_ytdlp(|| format!("wait_failed error={}", error));
                 terminate_child(&mut child);
                 join_readers(reader_threads);
                 cleanup_temp_dir(&temp_dir);
@@ -227,7 +242,9 @@ pub fn download_audio(
 }
 
 fn spawn_ytdlp(request: &DownloadRequest, temp_dir: &PathBuf) -> io::Result<Child> {
-    crate::media_tools::command("yt-dlp")
+    let mut command = crate::media_tools::command("yt-dlp");
+    let ffmpeg_location = ytdlp_ffmpeg_location();
+    command
         .args([
             "--newline",
             "--no-playlist",
@@ -252,11 +269,75 @@ fn spawn_ytdlp(request: &DownloadRequest, temp_dir: &PathBuf) -> io::Result<Chil
         .arg("--paths")
         .arg(format!("temp:{}", temp_dir.display()))
         .args(["--output", "%(title).200B [%(id)s].%(ext)s"])
-        .arg(&request.url)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .stdin(Stdio::null())
-        .spawn()
+        .stdin(Stdio::null());
+
+    if let Some(location) = &ffmpeg_location {
+        command.arg("--ffmpeg-location").arg(location);
+    }
+    command.arg(&request.url);
+
+    debug_ytdlp(|| {
+        format!(
+            "spawn program={} ffmpeg_location={} folder={} temp={} format={} path={}",
+            command.get_program().to_string_lossy(),
+            ffmpeg_location
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+            request.folder.display(),
+            temp_dir.display(),
+            request.format.extension(),
+            env::var("PATH").unwrap_or_else(|_| "<unset>".to_string())
+        )
+    });
+
+    command.spawn()
+}
+
+fn ytdlp_ffmpeg_location() -> Option<PathBuf> {
+    let ffmpeg = crate::media_tools::resolve("ffmpeg")?;
+    let Some(ffprobe) = crate::media_tools::resolve("ffprobe") else {
+        return Some(ffmpeg);
+    };
+    let Some(ffmpeg_dir) = ffmpeg.parent() else {
+        return Some(ffmpeg);
+    };
+    if ffprobe.parent() == Some(ffmpeg_dir) {
+        Some(ffmpeg_dir.to_path_buf())
+    } else {
+        Some(ffmpeg)
+    }
+}
+
+fn debug_ytdlp(details: impl FnOnce() -> String) {
+    let enabled = env::var("LOWCAT_DEBUG")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if enabled {
+        eprintln!("[lowcat:ytdlp] {}", details());
+    }
+}
+
+fn log_tail(text: &str) -> String {
+    const MAX_CHARS: usize = 1200;
+
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return "<empty>".to_string();
+    }
+
+    let mut start = trimmed.len().saturating_sub(MAX_CHARS);
+    while start > 0 && !trimmed.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = &trimmed[start..];
+    if start == 0 {
+        tail.to_string()
+    } else {
+        format!("<truncated> {tail}")
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

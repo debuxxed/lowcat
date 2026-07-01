@@ -4,13 +4,27 @@ use std::{
     process::Command,
 };
 
+const REQUIRED_TOOLS: &[&str] = &["ffmpeg", "ffprobe", "yt-dlp"];
+
+#[derive(Debug, Clone)]
+pub struct MissingTool {
+    pub name: &'static str,
+    pub search_locations: Vec<SearchLocation>,
+}
+
+#[derive(Debug, Clone)]
+pub enum SearchLocation {
+    Path,
+    Directory(PathBuf),
+}
+
 pub fn command(tool: &str) -> Command {
     Command::new(resolve(tool).unwrap_or_else(|| PathBuf::from(tool)))
 }
 
 pub fn available(tool: &str) -> bool {
     command(tool)
-        .arg("-version")
+        .arg(version_arg(tool))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -18,8 +32,31 @@ pub fn available(tool: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn resolve(tool: &str) -> Option<PathBuf> {
+pub fn missing_required_tools() -> Vec<MissingTool> {
+    REQUIRED_TOOLS
+        .iter()
+        .copied()
+        .filter(|tool| !available(tool))
+        .map(|tool| MissingTool {
+            name: tool,
+            search_locations: display_search_locations(),
+        })
+        .collect()
+}
+
+pub fn resolve(tool: &str) -> Option<PathBuf> {
     search_path(tool).or_else(|| search_common_dirs(tool))
+}
+
+fn display_search_locations() -> Vec<SearchLocation> {
+    let mut locations = Vec::new();
+    if env::var_os("PATH").is_some() {
+        locations.push(SearchLocation::Path);
+    }
+    for dir in common_tool_dirs() {
+        push_unique_location(&mut locations, dir.clone());
+    }
+    locations
 }
 
 fn search_path(tool: &str) -> Option<PathBuf> {
@@ -69,5 +106,20 @@ fn is_executable(path: &Path) -> bool {
     #[cfg(not(unix))]
     {
         path.is_file()
+    }
+}
+
+fn push_unique_location(locations: &mut Vec<SearchLocation>, path: PathBuf) {
+    if !locations.iter().any(
+        |location| matches!(location, SearchLocation::Directory(existing) if existing == &path),
+    ) {
+        locations.push(SearchLocation::Directory(path));
+    }
+}
+
+fn version_arg(tool: &str) -> &'static str {
+    match tool {
+        "yt-dlp" => "--version",
+        _ => "-version",
     }
 }

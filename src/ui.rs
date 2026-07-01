@@ -8,18 +8,22 @@ mod toolbar;
 use gpui::{
     AnyElement, App, AppContext as _, Context, Entity, ExternalPaths, FocusHandle, Focusable,
     InteractiveElement, IntoElement, KeyDownEvent, ModifiersChangedEvent, ParentElement, Pixels,
-    Render, SharedString, Styled, Window, actions, div, prelude::FluentBuilder, px, rgba,
+    Render, SharedString, Styled, Window, actions, div, prelude::FluentBuilder, px, relative, rgba,
 };
 use gpui_component::{
     ActiveTheme as _, Sizable as _, StyledExt,
     button::{Button, ButtonVariants as _},
     progress::Progress,
+    scroll::ScrollableElement,
 };
 
-use crate::model::Category;
-use crate::ui::titlebar::TITLEBAR_LEFT_OFFSET;
+use crate::ui::titlebar::{TITLEBAR_HEIGHT, TITLEBAR_LEFT_OFFSET};
 #[cfg(target_os = "macos")]
 use crate::{CloseWindow, MinimizeWindow};
+use crate::{
+    media_tools::{MissingTool, SearchLocation},
+    model::Category,
+};
 
 actions!(
     library,
@@ -49,6 +53,7 @@ use crate::ui::{
 
 pub struct UI {
     library: Entity<Library>,
+    media_tool_problems: Vec<MissingTool>,
     titlebar: Entity<AppTitleBar>,
     toolbar: Entity<Toolbar>,
     filter_panel: Entity<FilterPanel>,
@@ -58,7 +63,12 @@ pub struct UI {
 }
 
 impl UI {
-    pub fn new(library: Entity<Library>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        library: Entity<Library>,
+        media_tool_problems: Vec<MissingTool>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         cx.observe(&library, |_, _, cx| cx.notify()).detach();
         cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
@@ -72,6 +82,7 @@ impl UI {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
         Self {
+            media_tool_problems,
             titlebar: cx.new(|cx| AppTitleBar::new(library.clone(), cx)),
             toolbar: cx.new(|cx| Toolbar::new(library.clone(), window, cx)),
             filter_panel: cx.new(|cx| FilterPanel::new(library.clone(), cx)),
@@ -84,6 +95,10 @@ impl UI {
 }
 
 impl UI {
+    fn has_media_tool_problems(&self) -> bool {
+        !self.media_tool_problems.is_empty()
+    }
+
     fn should_activate_search(event: &KeyDownEvent) -> bool {
         let modifiers = &event.keystroke.modifiers;
         if modifiers.control || modifiers.alt || modifiers.platform || modifiers.function {
@@ -396,6 +411,92 @@ impl UI {
                 .into_any_element(),
         )
     }
+
+    fn render_media_tools_modal(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let problems = self
+            .media_tool_problems
+            .iter()
+            .map(|problem| render_media_tool_problem(problem, cx))
+            .collect::<Vec<_>>();
+
+        div()
+            .id("media-tools-overlay")
+            .absolute()
+            .top(TITLEBAR_HEIGHT)
+            .bottom_0()
+            .left_0()
+            .w_full()
+            .bg(rgba(0x00000099))
+            .occlude()
+            .hover(|style| style)
+            .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
+            .on_mouse_move(|_, _, cx| cx.stop_propagation())
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .on_drop(cx.listener(|_, _: &ExternalPaths, _, cx| {
+                cx.stop_propagation();
+            }))
+            .child(
+                div()
+                    .size_full()
+                    .h_flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w_full()
+                            .h(relative(0.86))
+                            .v_flex()
+                            .border_y_1()
+                            .border_color(cx.theme().border)
+                            .bg(cx.theme().popover)
+                            .shadow_lg()
+                            .child(
+                                div().w_full().flex_shrink_0().px(CONTENT_PX).py_3().child(
+                                    div()
+                                        .w_full()
+                                        .min_w_0()
+                                        .v_flex()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_base()
+                                                .font_weight(gpui::FontWeight::BOLD)
+                                                .child("Required tools missing"),
+                                        )
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .min_w_0()
+                                                .text_sm()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(
+                                                    "Lowcat can't function without these tools.",
+                                                ),
+                                        ),
+                                ),
+                            )
+                            .child(
+                                div().flex_1().min_h_0().overflow_hidden().child(
+                                    div()
+                                        .size_full()
+                                        .overflow_y_scrollbar()
+                                        .v_flex()
+                                        .gap_4()
+                                        .px(CONTENT_PX)
+                                        .pb_4()
+                                        .children(problems),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .h(px(1.))
+                                    .flex_shrink_0()
+                                    .bg(cx.theme().border),
+                            ),
+                    ),
+            )
+    }
 }
 
 impl Focusable for UI {
@@ -432,6 +533,10 @@ impl Render for UI {
                     .update(cx, |table, cx| table.set_alt_down(event.modifiers.alt, cx));
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if this.has_media_tool_problems() {
+                    cx.stop_propagation();
+                    return;
+                }
                 if event.keystroke.key == "escape" {
                     if this.cancel_delete(cx) {
                         cx.stop_propagation();
@@ -482,18 +587,33 @@ impl Render for UI {
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleFilters, _, cx| {
+                if this.has_media_tool_problems() {
+                    return;
+                }
                 this.library.update(cx, |lib, cx| lib.toggle_filters(cx));
             }))
             .on_action(cx.listener(|this, _: &ToggleDownloader, _, cx| {
+                if this.has_media_tool_problems() {
+                    return;
+                }
                 this.library.update(cx, |lib, cx| lib.toggle_downloader(cx));
             }))
             .on_action(cx.listener(|this, _: &ToggleSettings, window, cx| {
+                if this.has_media_tool_problems() {
+                    return;
+                }
                 this.toggle_settings(window, cx);
             }))
             .on_action(cx.listener(|this, _: &NextCategory, _, cx| {
+                if this.has_media_tool_problems() {
+                    return;
+                }
                 this.library.update(cx, |lib, cx| lib.next_category(cx));
             }))
             .on_action(cx.listener(|this, _: &PreviousCategory, _, cx| {
+                if this.has_media_tool_problems() {
+                    return;
+                }
                 this.library.update(cx, |lib, cx| lib.previous_category(cx));
             }));
 
@@ -506,7 +626,11 @@ impl Render for UI {
                 window.remove_window();
             });
 
-        root.child(self.titlebar.clone())
+        let has_media_tool_problems = self.has_media_tool_problems();
+        let content = div()
+            .size_full()
+            .v_flex()
+            .child(self.titlebar.clone())
             .child(self.toolbar.clone())
             .when(filters_open || downloader_open, |el| {
                 el.child(
@@ -522,16 +646,144 @@ impl Render for UI {
                 el.child(self.downloader_panel.clone())
             })
             .child(self.table.clone())
-            .when(!internal_drag_active, |el| el.child(drop_overlay))
-            .when(import_progress_active, |el| {
+            .when(has_media_tool_problems, |el| el.opacity(0.35));
+
+        root.child(content)
+            .when(!has_media_tool_problems && !internal_drag_active, |el| {
+                el.child(drop_overlay)
+            })
+            .when(!has_media_tool_problems && import_progress_active, |el| {
                 el.child(self.render_import_progress_modal(cx))
             })
-            .children(self.render_delete_confirmation_modal(cx))
+            .when(!has_media_tool_problems, |el| {
+                el.children(self.render_delete_confirmation_modal(cx))
+            })
+            .when(has_media_tool_problems, |el| {
+                el.child(self.render_media_tools_modal(cx))
+            })
     }
 }
 
 fn pluralize(count: usize, singular: &'static str, plural: &'static str) -> &'static str {
     if count == 1 { singular } else { plural }
+}
+
+fn render_media_tool_problem(problem: &MissingTool, cx: &mut Context<UI>) -> AnyElement {
+    let locations = if problem.search_locations.is_empty() {
+        "No PATH or standard fallback directories".to_string()
+    } else {
+        problem
+            .search_locations
+            .iter()
+            .map(|location| match location {
+                SearchLocation::Path => "PATH".to_string(),
+                SearchLocation::Directory(path) => path.display().to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let solution = tool_solution(problem.name);
+
+    div()
+        .w_full()
+        .min_w_0()
+        .v_flex()
+        .gap_2()
+        .pt_3()
+        .border_t_1()
+        .border_color(cx.theme().border)
+        .child(
+            div()
+                .w_full()
+                .min_w_0()
+                .text_sm()
+                .font_weight(gpui::FontWeight::BOLD)
+                .child(problem.name),
+        )
+        .child(
+            div()
+                .w_full()
+                .min_w_0()
+                .v_flex()
+                .gap_0()
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .text_xs()
+                        .line_height(relative(1.35))
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Looked up in"),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .text_xs()
+                        .line_height(relative(1.35))
+                        .text_color(cx.theme().muted_foreground)
+                        .child(locations),
+                ),
+        )
+        .child(
+            div()
+                .w_full()
+                .min_w_0()
+                .h_flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(SharedString::from(format!(
+                            "Possible solution: {}",
+                            solution.text
+                        ))),
+                )
+                .when_some(solution.url, |el, url| {
+                    el.child(
+                        Button::new(format!("download-{}", problem.name))
+                            .xsmall()
+                            .flex_shrink_0()
+                            .label("Download")
+                            .on_click(move |_, _, _| {
+                                if let Err(error) = open::that(url) {
+                                    eprintln!("failed to open {url}: {error}");
+                                }
+                            }),
+                    )
+                }),
+        )
+        .into_any_element()
+}
+
+struct ToolSolution {
+    text: &'static str,
+    url: Option<&'static str>,
+}
+
+fn tool_solution(tool: &str) -> ToolSolution {
+    match tool {
+        "ffmpeg" => ToolSolution {
+            text: "Install FFmpeg.",
+            url: cfg!(target_os = "macos").then_some("https://formulae.brew.sh/formula/ffmpeg"),
+        },
+        "ffprobe" => ToolSolution {
+            text: "Install FFmpeg; ffprobe is included with it.",
+            url: cfg!(target_os = "macos").then_some("https://formulae.brew.sh/formula/ffmpeg"),
+        },
+        "yt-dlp" => ToolSolution {
+            text: "Install yt-dlp.",
+            url: Some("https://github.com/yt-dlp/yt-dlp/wiki/Installation"),
+        },
+        _ => ToolSolution {
+            text: "Install the missing tool.",
+            url: None,
+        },
+    }
 }
 
 fn debug_ui_interaction(details: impl FnOnce() -> String) {

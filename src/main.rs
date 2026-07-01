@@ -30,19 +30,16 @@ actions!(
 );
 
 fn main() {
-    if let Err(error) = check_media_tools() {
-        eprintln!("{error}");
-        std::process::exit(1);
-    }
-
     let app = application().with_assets(Assets);
     let main_library = Rc::new(RefCell::new(None::<Entity<Library>>));
+    let media_tool_problems = Rc::new(media_tools::missing_required_tools());
 
     app.on_reopen({
         let main_library = main_library.clone();
+        let media_tool_problems = media_tool_problems.clone();
         move |cx| {
             if let Some(library) = main_library.borrow().clone() {
-                show_main_window(library, cx);
+                show_main_window(library, media_tool_problems.clone(), cx);
             }
         }
     });
@@ -64,8 +61,9 @@ fn main() {
         *main_library.borrow_mut() = Some(library.clone());
         cx.on_action({
             let library = library.clone();
+            let media_tool_problems = media_tool_problems.clone();
             move |_: &ShowWindow, cx| {
-                show_main_window(library.clone(), cx);
+                show_main_window(library.clone(), media_tool_problems.clone(), cx);
             }
         });
 
@@ -83,20 +81,28 @@ fn main() {
 
         cx.activate(true);
 
-        open_main_window(library, cx);
+        open_main_window(library, media_tool_problems.clone(), cx);
     })
 }
 
-fn show_main_window(library: Entity<Library>, cx: &mut App) {
+fn show_main_window(
+    library: Entity<Library>,
+    media_tool_problems: Rc<Vec<media_tools::MissingTool>>,
+    cx: &mut App,
+) {
     if let Some(window_handle) = cx.windows().first().copied() {
         cx.activate(true);
         let _ = window_handle.update(cx, |_, window, _| window.activate_window());
     } else {
-        open_main_window(library, cx);
+        open_main_window(library, media_tool_problems, cx);
     }
 }
 
-fn open_main_window(library: Entity<Library>, cx: &mut App) {
+fn open_main_window(
+    library: Entity<Library>,
+    media_tool_problems: Rc<Vec<media_tools::MissingTool>>,
+    cx: &mut App,
+) {
     cx.open_window(
         WindowOptions {
             titlebar: Some(title_bar_options()),
@@ -108,7 +114,8 @@ fn open_main_window(library: Entity<Library>, cx: &mut App) {
             ..Default::default()
         },
         |window, cx| {
-            let view = cx.new(|cx| UI::new(library, window, cx));
+            let view =
+                cx.new(|cx| UI::new(library, media_tool_problems.as_ref().clone(), window, cx));
             cx.new(|cx| Root::new(view, window, cx))
         },
     )
@@ -169,22 +176,6 @@ fn app_menus() -> Vec<Menu> {
             MenuItem::action("Previous Category", PreviousCategory),
         ]),
     ]
-}
-
-fn check_media_tools() -> Result<(), String> {
-    let missing: Vec<&str> = ["ffmpeg", "ffprobe"]
-        .into_iter()
-        .filter(|tool| !media_tools::available(tool))
-        .collect();
-
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "Lowcat requires ffmpeg and ffprobe in PATH or a standard Homebrew location. Missing: {}",
-            missing.join(", ")
-        ))
-    }
 }
 
 fn title_bar_options() -> gpui::TitlebarOptions {
