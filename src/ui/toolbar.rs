@@ -74,6 +74,11 @@ impl Toolbar {
             .update(cx, |lib, cx| lib.set_search(String::new(), cx));
         true
     }
+
+    pub fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_menu
+            .update(cx, |settings, cx| settings.toggle_from_shortcut(window, cx));
+    }
 }
 
 impl Render for Toolbar {

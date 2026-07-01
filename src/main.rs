@@ -20,7 +20,9 @@ use gpui_component_assets::Assets;
 use gpui_platform::application;
 
 use crate::library::Library;
-use crate::ui::{NextCategory, PreviousCategory, ToggleDownloader, ToggleFilters, UI};
+use crate::ui::{
+    NextCategory, PreviousCategory, ToggleDownloader, ToggleFilters, ToggleSettings, UI,
+};
 
 actions!(
     app,
@@ -69,6 +71,7 @@ fn main() {
 
         let bindings = [
             KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-,", ToggleSettings, None),
             KeyBinding::new("cmd-e", ToggleFilters, None),
             KeyBinding::new("shift-e", ToggleDownloader, None),
             KeyBinding::new("ctrl-tab", NextCategory, None),
@@ -128,11 +131,20 @@ fn bind_macos_window_keys(_cx: &mut App) {}
 fn app_menus() -> Vec<Menu> {
     vec![
         Menu::new("Lowcat").items([
+            MenuItem::action("Settings...", ToggleSettings),
+            MenuItem::separator(),
             MenuItem::action("Hide Lowcat", HideApp),
             MenuItem::separator(),
             MenuItem::action("Quit", Quit),
         ]),
         Menu::new("File").items([MenuItem::action("Show Window", ShowWindow)]),
+        Menu::new("View").items([
+            MenuItem::action("Toggle Filters", ToggleFilters),
+            MenuItem::action("Toggle Downloader", ToggleDownloader),
+            MenuItem::separator(),
+            MenuItem::action("Next Category", NextCategory),
+            MenuItem::action("Previous Category", PreviousCategory),
+        ]),
         Menu::new("Window").items([
             MenuItem::action("Minimize", MinimizeWindow),
             MenuItem::action("Close Window", CloseWindow),
@@ -142,11 +154,21 @@ fn app_menus() -> Vec<Menu> {
 
 #[cfg(not(target_os = "macos"))]
 fn app_menus() -> Vec<Menu> {
-    vec![Menu::new("Lowcat").items([
-        MenuItem::action("Show Window", ShowWindow),
-        MenuItem::separator(),
-        MenuItem::action("Quit", Quit),
-    ])]
+    vec![
+        Menu::new("Lowcat").items([
+            MenuItem::action("Show Window", ShowWindow),
+            MenuItem::action("Settings...", ToggleSettings),
+            MenuItem::separator(),
+            MenuItem::action("Quit", Quit),
+        ]),
+        Menu::new("View").items([
+            MenuItem::action("Toggle Filters", ToggleFilters),
+            MenuItem::action("Toggle Downloader", ToggleDownloader),
+            MenuItem::separator(),
+            MenuItem::action("Next Category", NextCategory),
+            MenuItem::action("Previous Category", PreviousCategory),
+        ]),
+    ]
 }
 
 fn check_media_tools() -> Result<(), String> {

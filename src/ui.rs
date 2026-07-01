@@ -26,6 +26,7 @@ actions!(
     [
         NextCategory,
         PreviousCategory,
+        ToggleSettings,
         ToggleFilters,
         ToggleDownloader
     ]
@@ -167,6 +168,11 @@ impl UI {
         self.library.update(cx, |lib, cx| {
             lib.download_from_clipboard(category, clipboard_text, cx);
         });
+    }
+
+    fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toolbar
+            .update(cx, |toolbar, cx| toolbar.toggle_settings(window, cx));
     }
 
     /// Full-window overlay that fades in while OS files are dragged over the
@@ -480,6 +486,9 @@ impl Render for UI {
             }))
             .on_action(cx.listener(|this, _: &ToggleDownloader, _, cx| {
                 this.library.update(cx, |lib, cx| lib.toggle_downloader(cx));
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSettings, window, cx| {
+                this.toggle_settings(window, cx);
             }))
             .on_action(cx.listener(|this, _: &NextCategory, _, cx| {
                 this.library.update(cx, |lib, cx| lib.next_category(cx));

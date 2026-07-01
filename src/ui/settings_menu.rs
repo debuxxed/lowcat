@@ -11,6 +11,7 @@ use gpui_component::{
 
 use crate::library::Library;
 use crate::model::{AudioFormat, ConvertConflictBehavior};
+use crate::ui::{CONTENT_PX, titlebar::TITLEBAR_HEIGHT};
 
 const MENU_ROW_HEIGHT_PX: f32 = 28.;
 const MENU_ROW_PADDING_PX: f32 = 16.;
@@ -54,6 +55,32 @@ impl SettingsMenu {
         self.open = false;
         self.active_submenu = None;
         self.hovered_priority = None;
+    }
+
+    pub fn toggle_from_shortcut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.open {
+            self.close_and_restore_focus("settings-shortcut", window, cx);
+            cx.notify();
+        } else {
+            self.open_at(
+                Point {
+                    x: CONTENT_PX + px(12.),
+                    y: TITLEBAR_HEIGHT + px(20.),
+                },
+                window,
+                cx,
+            );
+        }
+    }
+
+    fn open_at(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        self.open = true;
+        self.position = Some(position);
+        self.previous_focus = window.focused(cx);
+        self.focus.focus(window, cx);
+        self.active_submenu = None;
+        self.hovered_priority = None;
+        cx.notify();
     }
 
     fn close_and_restore_focus(
@@ -111,17 +138,13 @@ impl Render for SettingsMenu {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    this.open = !this.open;
-                    this.position = Some(event.position);
                     if this.open {
-                        this.previous_focus = window.focused(cx);
-                        this.focus.focus(window, cx);
-                        this.active_submenu = None;
-                    } else {
                         this.close_and_restore_focus("settings-button", window, cx);
+                        cx.notify();
+                    } else {
+                        this.open_at(event.position, window, cx);
                     }
                     cx.stop_propagation();
-                    cx.notify();
                 }),
             );
 

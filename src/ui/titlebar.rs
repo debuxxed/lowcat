@@ -15,6 +15,7 @@ use crate::model::Category;
 /// lights. The drag-import overlay reuses this so its columns line up with the
 /// titlebar categories.
 pub(crate) const TITLEBAR_LEFT_OFFSET: Pixels = px(84.);
+pub(crate) const TITLEBAR_HEIGHT: Pixels = px(38.);
 
 pub struct AppTitleBar {
     library: Entity<Library>,
@@ -193,7 +194,7 @@ impl Render for AppTitleBar {
         }
 
         let titlebar = TitleBar::new()
-            .h(px(38.))
+            .h(TITLEBAR_HEIGHT)
             .pl(TITLEBAR_LEFT_OFFSET)
             .bg(cx.theme().background)
             .child(categories);
