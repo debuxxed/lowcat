@@ -449,6 +449,129 @@ impl Database {
         .map_err(io::Error::other)
     }
 
+    pub fn rename_stem_tag_value(
+        &self,
+        category: Category,
+        stem: &str,
+        key: &str,
+        old_value: &str,
+        new_value: &str,
+    ) -> io::Result<()> {
+        let Some(key) = canonical_tag_key(key) else {
+            return Ok(());
+        };
+        if !category.tag_keys().contains(&key) || old_value == new_value {
+            return Ok(());
+        }
+        block_on(async {
+            let category = category_key(category);
+            let mut tx = self.pool.begin().await?;
+            sqlx::query(
+                "INSERT OR IGNORE INTO tag_values(category, stem, key, value)
+                 SELECT category, stem, key, ?
+                 FROM tag_values
+                 WHERE category = ? AND stem = ? AND key = ? AND value = ?",
+            )
+            .bind(new_value)
+            .bind(category)
+            .bind(stem)
+            .bind(key)
+            .bind(old_value)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "DELETE FROM tag_values
+                 WHERE category = ? AND stem = ? AND key = ? AND value = ?",
+            )
+            .bind(category)
+            .bind(stem)
+            .bind(key)
+            .bind(old_value)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(())
+        })
+        .map_err(io::Error::other)
+    }
+
+    pub fn rename_stem_tags(
+        &self,
+        category: Category,
+        old_stem: &str,
+        new_stem: &str,
+    ) -> io::Result<()> {
+        if old_stem == new_stem {
+            return Ok(());
+        }
+        block_on(async {
+            let category = category_key(category);
+            let mut tx = self.pool.begin().await?;
+            sqlx::query(
+                "INSERT OR IGNORE INTO tag_values(category, stem, key, value)
+                 SELECT category, ?, key, value
+                 FROM tag_values
+                 WHERE category = ? AND stem = ?",
+            )
+            .bind(new_stem)
+            .bind(category)
+            .bind(old_stem)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("DELETE FROM tag_values WHERE category = ? AND stem = ?")
+                .bind(category)
+                .bind(old_stem)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(())
+        })
+        .map_err(io::Error::other)
+    }
+
+    pub fn rename_tag_value(
+        &self,
+        category: Category,
+        key: &str,
+        old_value: &str,
+        new_value: &str,
+    ) -> io::Result<()> {
+        let Some(key) = canonical_tag_key(key) else {
+            return Ok(());
+        };
+        if !category.tag_keys().contains(&key) || old_value == new_value {
+            return Ok(());
+        }
+        block_on(async {
+            let category = category_key(category);
+            let mut tx = self.pool.begin().await?;
+            sqlx::query(
+                "INSERT OR IGNORE INTO tag_values(category, stem, key, value)
+                 SELECT category, stem, key, ?
+                 FROM tag_values
+                 WHERE category = ? AND key = ? AND value = ?",
+            )
+            .bind(new_value)
+            .bind(category)
+            .bind(key)
+            .bind(old_value)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "DELETE FROM tag_values
+                 WHERE category = ? AND key = ? AND value = ?",
+            )
+            .bind(category)
+            .bind(key)
+            .bind(old_value)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(())
+        })
+        .map_err(io::Error::other)
+    }
+
     pub fn folder_tag_values(
         &self,
         category: Category,

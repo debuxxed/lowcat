@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use futures::{StreamExt as _, channel::mpsc};
 use gpui::{AppContext as _, Context, EventEmitter};
 
-use crate::backend::{Backend, import_to_folder};
+use crate::backend::{Backend, RenameRecord, import_to_folder};
 use crate::downloader::{
     self, DownloadCancel, DownloadError, DownloadErrorKind, DownloadOutput, DownloadProgressEvent,
     DownloadRequest, DownloadState, DownloadStatus,
@@ -406,6 +406,100 @@ impl Library {
                     "tag remove failed path={} key={key} error={error}",
                     path.display()
                 );
+            }
+        }
+    }
+
+    pub fn rename_tag(
+        &mut self,
+        path: PathBuf,
+        key: &str,
+        old_value: &str,
+        new_value: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let category = self.active;
+        match self
+            .backend
+            .rename_tag(category, &path, key, old_value, new_value)
+        {
+            Ok(()) => {
+                let _ = self
+                    .refresh_category_state_after_tag_rename(category, key, old_value, new_value);
+                debug_library_interaction(|| {
+                    format!("rename_tag key={key} old={old_value} new={new_value}")
+                });
+                cx.emit(LibraryEvent::TagEdited { path });
+                cx.notify();
+            }
+            Err(error) => {
+                eprintln!(
+                    "tag rename failed path={} key={key} old={old_value} error={error}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    pub fn rename_records(
+        &mut self,
+        records: Vec<RenameRecord>,
+        new_stem: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let category = self.active;
+        match self.backend.rename_records(category, &records, new_stem) {
+            Ok(file_count) => {
+                let _ = self.refresh_category_state(category);
+                debug_library_interaction(|| {
+                    format!(
+                        "rename_records category={} records={} files={file_count}",
+                        category.label(),
+                        records.len()
+                    )
+                });
+                cx.notify();
+            }
+            Err(error) => {
+                eprintln!(
+                    "lowcat rename failed category={} records={} error={error}",
+                    category.label(),
+                    records.len()
+                );
+                cx.notify();
+            }
+        }
+    }
+
+    pub fn rename_tag_value(
+        &mut self,
+        key: &str,
+        old_value: &str,
+        new_value: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let category = self.active;
+        match self
+            .backend
+            .rename_tag_value(category, key, old_value, new_value)
+        {
+            Ok(()) => {
+                let _ = self
+                    .refresh_category_state_after_tag_rename(category, key, old_value, new_value);
+                debug_library_interaction(|| {
+                    format!(
+                        "rename_tag_value category={} key={key} old={old_value} new={new_value}",
+                        category.label()
+                    )
+                });
+                cx.notify();
+            }
+            Err(error) => {
+                eprintln!(
+                    "lowcat tag rename failed category={} key={key} old={old_value} error={error}",
+                    category.label()
+                );
+                cx.notify();
             }
         }
     }
@@ -972,8 +1066,26 @@ impl Library {
     }
 
     fn refresh_category_state(&mut self, category: Category) -> io::Result<()> {
+        self.refresh_category_state_with_tag_rename(category, None)
+    }
+
+    fn refresh_category_state_after_tag_rename(
+        &mut self,
+        category: Category,
+        key: &str,
+        old_value: &str,
+        new_value: &str,
+    ) -> io::Result<()> {
+        self.refresh_category_state_with_tag_rename(category, Some((key, old_value, new_value)))
+    }
+
+    fn refresh_category_state_with_tag_rename(
+        &mut self,
+        category: Category,
+        renamed_tag: Option<(&str, &str, &str)>,
+    ) -> io::Result<()> {
         let total_start = crate::perf::start();
-        let (search, selected) = if let Some(state) = self.states.get(&category) {
+        let (search, mut selected) = if let Some(state) = self.states.get(&category) {
             (state.search.clone(), state.selected.clone())
         } else {
             (String::new(), BTreeMap::new())
@@ -983,6 +1095,7 @@ impl Library {
         crate::perf::finish("library.schema", schema_start, || {
             format!("category={} keys={}", category.label(), schema.len())
         });
+        reconcile_selected_filters(&mut selected, &schema, renamed_tag);
         let filter_start = crate::perf::start();
         let results = display_records(self.backend.filter(category, &search, &selected));
         crate::perf::finish("library.filter", filter_start, || {
@@ -995,6 +1108,7 @@ impl Library {
             )
         });
         let state = self.states.entry(category).or_default();
+        state.selected = selected;
         state.schema = schema;
         state.results = results;
         crate::perf::finish("library.refresh_category_state", total_start, || {
@@ -1185,6 +1299,38 @@ fn display_record(record: FileRecord) -> FileRecord {
         variants: record.variants,
         tags: display_schema(record.tags),
     }
+}
+
+fn reconcile_selected_filters(
+    selected: &mut BTreeMap<String, BTreeSet<String>>,
+    schema: &BTreeMap<String, Vec<String>>,
+    renamed_tag: Option<(&str, &str, &str)>,
+) {
+    if let Some((key, old_value, new_value)) = renamed_tag
+        && let Some(key) = display_tag_key(key)
+    {
+        let old_exists = schema
+            .get(&key)
+            .is_some_and(|values| values.iter().any(|value| value == old_value));
+        let new_exists = schema
+            .get(&key)
+            .is_some_and(|values| values.iter().any(|value| value == new_value));
+        if !old_exists
+            && new_exists
+            && let Some(values) = selected.get_mut(&key)
+            && values.remove(old_value)
+        {
+            values.insert(new_value.to_string());
+        }
+    }
+
+    selected.retain(|key, values| {
+        let Some(available) = schema.get(key) else {
+            return false;
+        };
+        values.retain(|value| available.contains(value));
+        !values.is_empty()
+    });
 }
 
 fn debug_downloader_interaction(details: impl FnOnce() -> String) {
@@ -1614,6 +1760,69 @@ mod tests {
         library.update(cx, |lib, cx| lib.set_category(Category::Music, cx));
         let count = library.read_with(cx, |lib, _| lib.active_state().results.len());
         assert_eq!(count, 1);
+    }
+
+    #[gpui::test]
+    fn removing_last_tag_value_clears_selected_filter(cx: &mut gpui::TestAppContext) {
+        let settings_path = settings_path("remove-selected-filter");
+        let (music_dir, _) = settings_with_folders(&settings_path);
+        let path = fixture(&music_dir, "tagged.flac", &[]);
+        let library = cx.new(|_| Library::new_with_settings_path(settings_path));
+
+        library.update(cx, |lib, cx| lib.add_tag(path.clone(), "Genre", "Hype", cx));
+        library.update(cx, |lib, cx| lib.toggle_value("Genre", "Hype", cx));
+
+        let selected = library.read_with(cx, |lib, _| {
+            lib.active_state().selected["Genre"].contains("Hype")
+        });
+        assert!(selected);
+
+        library.update(cx, |lib, cx| {
+            lib.remove_tag(path.clone(), "Genre", "Hype", cx)
+        });
+
+        let (selected_empty, schema_values, result_count) = library.read_with(cx, |lib, _| {
+            let state = lib.active_state();
+            (
+                state.selected.is_empty(),
+                state.schema["Genre"].clone(),
+                state.results.len(),
+            )
+        });
+        assert!(selected_empty);
+        assert!(!schema_values.contains(&"Hype".to_string()));
+        assert_eq!(result_count, 1);
+    }
+
+    #[gpui::test]
+    fn renaming_last_tag_value_renames_selected_filter(cx: &mut gpui::TestAppContext) {
+        let settings_path = settings_path("rename-selected-filter");
+        let (music_dir, _) = settings_with_folders(&settings_path);
+        let path = fixture(&music_dir, "tagged.flac", &[]);
+        let library = cx.new(|_| Library::new_with_settings_path(settings_path));
+
+        library.update(cx, |lib, cx| lib.add_tag(path.clone(), "Genre", "Hype", cx));
+        library.update(cx, |lib, cx| lib.toggle_value("Genre", "Hype", cx));
+        library.update(cx, |lib, cx| {
+            lib.rename_tag(path.clone(), "Genre", "Hype", "Mad", cx)
+        });
+
+        let (has_old_selection, has_new_selection, schema_values, result_tags) =
+            library.read_with(cx, |lib, _| {
+                let state = lib.active_state();
+                let selected = state.selected.get("Genre");
+                (
+                    selected.is_some_and(|values| values.contains("Hype")),
+                    selected.is_some_and(|values| values.contains("Mad")),
+                    state.schema["Genre"].clone(),
+                    state.results[0].tags["Genre"].clone(),
+                )
+            });
+        assert!(!has_old_selection);
+        assert!(has_new_selection);
+        assert!(!schema_values.contains(&"Hype".to_string()));
+        assert!(schema_values.contains(&"Mad".to_string()));
+        assert_eq!(result_tags, vec!["Mad"]);
     }
 
     #[gpui::test]

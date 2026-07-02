@@ -14,6 +14,7 @@ use gpui::{
 use gpui_component::{
     ActiveTheme as _, Sizable as _, StyledExt,
     button::{Button, ButtonVariants as _},
+    input::Input,
     progress::Progress,
     scroll::ScrollableElement,
 };
@@ -34,7 +35,8 @@ actions!(
         ToggleSettings,
         ToggleFilters,
         ToggleDownloader,
-        AssignFolderTags
+        AssignFolderTags,
+        RenameSelection
     ]
 );
 
@@ -49,7 +51,7 @@ use crate::ui::{
     downloader_panel::DownloaderPanel,
     filter_panel::FilterPanel,
     folder_tags::FolderTagModalState,
-    table::{FileTable, PendingDeleteKind},
+    table::{FileTable, PendingDeleteKind, PendingRenameKind},
     titlebar::AppTitleBar,
     toolbar::Toolbar,
 };
@@ -138,6 +140,16 @@ impl UI {
         self.table.update(cx, |table, cx| table.cancel_delete(cx))
     }
 
+    fn cancel_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.table
+            .update(cx, |table, cx| table.cancel_rename(window, cx))
+    }
+
+    fn cancel_tag_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.table
+            .update(cx, |table, cx| table.cancel_tag_edit(window, cx))
+    }
+
     fn clear_selection(&mut self, cx: &mut Context<Self>) -> bool {
         self.table.update(cx, |table, cx| table.clear_selection(cx))
     }
@@ -152,9 +164,20 @@ impl UI {
         confirmed
     }
 
+    fn confirm_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let confirmed = self
+            .table
+            .update(cx, |table, cx| table.confirm_pending_rename(window, cx));
+        if confirmed {
+            debug_ui_interaction(|| "enter confirmed rename".to_string());
+        }
+        confirmed
+    }
+
     fn text_input_is_focused(&self, window: &Window, cx: &App) -> bool {
         self.toolbar.read(cx).search_is_focused(window, cx)
             || self.table.read(cx).tag_editor_is_focused(window, cx)
+            || self.table.read(cx).rename_input_is_focused(window, cx)
     }
 
     fn tag_editor_is_focused(&self, window: &Window, cx: &App) -> bool {
@@ -417,6 +440,105 @@ impl UI {
         )
     }
 
+    fn render_rename_modal(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let details = self.table.read(cx).pending_rename_details()?;
+        let input = self.table.read(cx).rename_input();
+        let title = match details.kind {
+            PendingRenameKind::Rows if details.item_count == 1 => "Rename row",
+            PendingRenameKind::Rows => "Rename files",
+            PendingRenameKind::TagAll => "Rename tag",
+        };
+        let description = match details.kind {
+            PendingRenameKind::Rows if details.item_count == 1 => {
+                let name = details.current_name.unwrap_or_else(|| "row".to_string());
+                format!("Rename {name}")
+            }
+            PendingRenameKind::Rows => {
+                let file_label = pluralize(details.file_count, "file", "files");
+                format!("Rename {} {}", details.file_count, file_label)
+            }
+            PendingRenameKind::TagAll => {
+                let name = details.current_name.unwrap_or_else(|| "tag".to_string());
+                format!("Rename all {name} tags")
+            }
+        };
+
+        Some(
+            div()
+                .id("rename-overlay")
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .bg(rgba(0x00000099))
+                .occlude()
+                .hover(|style| style)
+                .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
+                .on_mouse_move(|_, _, cx| cx.stop_propagation())
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .size_full()
+                        .h_flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .w(px(360.))
+                                .max_w(px(520.))
+                                .v_flex()
+                                .gap_3()
+                                .p_4()
+                                .rounded(px(8.))
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .bg(cx.theme().popover)
+                                .shadow_lg()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .child(title),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(description),
+                                )
+                                .child(Input::new(&input).small())
+                                .child(
+                                    div()
+                                        .h_flex()
+                                        .justify_end()
+                                        .gap_2()
+                                        .child(
+                                            Button::new("rename-cancel")
+                                                .small()
+                                                .label("Cancel")
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.cancel_rename(window, cx);
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("rename-confirm")
+                                                .small()
+                                                .when(details.bulk, |button| button.warning())
+                                                .when(!details.bulk, |button| button.primary())
+                                                .label("Apply")
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.table.update(cx, |table, cx| {
+                                                        table.confirm_pending_rename(window, cx);
+                                                    });
+                                                })),
+                                        ),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_media_tools_modal(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let problems = self
             .media_tool_problems
@@ -556,7 +678,15 @@ impl Render for UI {
                     return;
                 }
                 if event.keystroke.key == "escape" {
+                    if this.cancel_rename(window, cx) {
+                        cx.stop_propagation();
+                        return;
+                    }
                     if this.cancel_delete(cx) {
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if this.cancel_tag_edit(window, cx) {
                         cx.stop_propagation();
                         return;
                     }
@@ -570,8 +700,10 @@ impl Render for UI {
                     }
                     this.cancel_file_drag(cx);
                     cx.stop_propagation();
-                } else if event.keystroke.key == "enter" && this.confirm_delete(cx) {
-                    cx.stop_propagation();
+                } else if event.keystroke.key == "enter" {
+                    if this.confirm_rename(window, cx) || this.confirm_delete(cx) {
+                        cx.stop_propagation();
+                    }
                 } else if event.keystroke.modifiers.platform && event.keystroke.key == "f" {
                     this.toolbar
                         .update(cx, |toolbar, cx| toolbar.focus_search(window, cx));
@@ -628,6 +760,14 @@ impl Render for UI {
                 }
                 this.open_folder_tag_modal(cx);
             }))
+            .on_action(cx.listener(|this, _: &RenameSelection, window, cx| {
+                if this.has_media_tool_problems() {
+                    return;
+                }
+                this.table.update(cx, |table, cx| {
+                    table.start_selected_rename(window, cx);
+                });
+            }))
             .on_action(cx.listener(|this, _: &NextCategory, _, cx| {
                 if this.has_media_tool_problems() {
                     return;
@@ -681,6 +821,9 @@ impl Render for UI {
             })
             .when(!has_media_tool_problems, |el| {
                 el.children(self.render_folder_tag_modal(_window, cx))
+            })
+            .when(!has_media_tool_problems, |el| {
+                el.children(self.render_rename_modal(cx))
             })
             .when(!has_media_tool_problems, |el| {
                 el.children(self.render_delete_confirmation_modal(cx))

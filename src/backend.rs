@@ -16,6 +16,12 @@ use crate::model::{
     canonical_tag_key, supported_audio_extension,
 };
 
+#[derive(Clone, Debug)]
+pub struct RenameRecord {
+    pub stem: String,
+    pub paths: Vec<PathBuf>,
+}
+
 pub struct Backend {
     db: Database,
     folders: BTreeMap<Category, PathBuf>,
@@ -149,6 +155,48 @@ impl Backend {
         };
         let stem = file_stem(path);
         self.db.remove_tag(category, &stem, key, value)
+    }
+
+    pub fn rename_tag(
+        &mut self,
+        category: Category,
+        path: &Path,
+        key: &str,
+        old_value: &str,
+        new_value: &str,
+    ) -> io::Result<()> {
+        let Some(key) = canonical_category_key(category, key) else {
+            return Ok(());
+        };
+        let stem = file_stem(path);
+        self.db
+            .rename_stem_tag_value(category, &stem, key, old_value, new_value)
+    }
+
+    pub fn rename_records(
+        &mut self,
+        category: Category,
+        records: &[RenameRecord],
+        new_stem: &str,
+    ) -> io::Result<usize> {
+        rename_record_files(records, new_stem)?;
+        for record in records {
+            self.db.rename_stem_tags(category, &record.stem, new_stem)?;
+        }
+        self.refresh_category(category)?;
+        Ok(records.iter().map(|record| record.paths.len()).sum())
+    }
+
+    pub fn rename_tag_value(
+        &mut self,
+        category: Category,
+        key: &str,
+        old_value: &str,
+        new_value: &str,
+    ) -> io::Result<()> {
+        self.db
+            .rename_tag_value(category, key, old_value, new_value)?;
+        self.refresh_category(category)
     }
 
     pub fn folder_tag_values(&self, category: Category) -> io::Result<Vec<String>> {
@@ -293,6 +341,77 @@ fn trash_files(paths: Vec<PathBuf>) -> io::Result<usize> {
 
     trash::delete_all(&paths).map_err(io::Error::other)?;
     Ok(path_count)
+}
+
+fn rename_record_files(records: &[RenameRecord], new_stem: &str) -> io::Result<usize> {
+    let new_stem = valid_file_stem(new_stem)?;
+    let mut source_paths = BTreeSet::new();
+    let mut planned = Vec::new();
+
+    for record in records {
+        for source in &record.paths {
+            source_paths.insert(source.clone());
+            let extension = source
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "file has no extension")
+                })?;
+            let parent = source.parent().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "file has no parent folder")
+            })?;
+            planned.push((
+                source.clone(),
+                parent.join(format!("{new_stem}.{extension}")),
+            ));
+        }
+    }
+
+    let mut destination_paths = BTreeSet::new();
+    for (source, destination) in &planned {
+        if source == destination {
+            continue;
+        }
+        if !destination_paths.insert(destination.clone()) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("rename would create duplicate {}", destination.display()),
+            ));
+        }
+        if destination.exists() && !source_paths.contains(destination) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} already exists", destination.display()),
+            ));
+        }
+    }
+
+    let mut renamed = 0;
+    for (source, destination) in planned {
+        if source == destination {
+            continue;
+        }
+        fs::rename(&source, &destination)?;
+        renamed += 1;
+    }
+    Ok(renamed)
+}
+
+fn valid_file_stem(stem: &str) -> io::Result<&str> {
+    let stem = stem.trim();
+    if stem.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "new name cannot be empty",
+        ));
+    }
+    if stem.contains('/') || stem.contains('\\') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "new name cannot contain path separators",
+        ));
+    }
+    Ok(stem)
 }
 
 pub fn import_to_folder(
@@ -831,6 +950,67 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].path, nested_path);
         assert_eq!(records[0].tags["TYPE"], vec!["Foley"]);
+    }
+
+    #[test]
+    fn rename_records_moves_variants_and_preserves_tags() {
+        let dir = unique_dir("rename-records");
+        fs::write(dir.join("song.wav"), b"not actually audio").unwrap();
+        fs::write(dir.join("song.mp3"), b"not actually audio").unwrap();
+        let paths = vec![dir.join("song.wav"), dir.join("song.mp3")];
+
+        let mut backend = backend("rename-records");
+        backend
+            .set_category_folder(Category::Music, dir.clone())
+            .unwrap();
+        backend
+            .add_tag(Category::Music, &paths[0], "Genre", "Ambient")
+            .unwrap();
+
+        backend
+            .rename_records(
+                Category::Music,
+                &[RenameRecord {
+                    stem: "song".to_string(),
+                    paths,
+                }],
+                "renamed",
+            )
+            .unwrap();
+
+        assert!(!dir.join("song.wav").exists());
+        assert!(!dir.join("song.mp3").exists());
+        assert!(dir.join("renamed.wav").exists());
+        assert!(dir.join("renamed.mp3").exists());
+        let records = backend.filter(Category::Music, "", &BTreeMap::new());
+        assert_eq!(names(records.clone()), vec!["renamed"]);
+        assert_eq!(records[0].tags["GENRE"], vec!["Ambient"]);
+    }
+
+    #[test]
+    fn rename_tag_value_updates_all_matching_stems() {
+        let dir = unique_dir("rename-tag-value");
+        let first = dir.join("first.wav");
+        let second = dir.join("second.wav");
+        fs::write(&first, b"not actually audio").unwrap();
+        fs::write(&second, b"not actually audio").unwrap();
+
+        let mut backend = backend("rename-tag-value");
+        backend.set_category_folder(Category::Music, dir).unwrap();
+        backend
+            .add_tag(Category::Music, &first, "Genre", "Ambient")
+            .unwrap();
+        backend
+            .add_tag(Category::Music, &second, "Genre", "Ambient")
+            .unwrap();
+
+        backend
+            .rename_tag_value(Category::Music, "Genre", "Ambient", "Drone")
+            .unwrap();
+
+        let records = backend.filter(Category::Music, "", &BTreeMap::new());
+        assert_eq!(records[0].tags["GENRE"], vec!["Drone"]);
+        assert_eq!(records[1].tags["GENRE"], vec!["Drone"]);
     }
 
     #[test]

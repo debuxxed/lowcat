@@ -24,6 +24,7 @@ use gpui_component::{
 
 use crate::ui::CONTENT_PX;
 use crate::{
+    backend::RenameRecord,
     library::{Library, LibraryEvent},
     model::{AudioFormat, Category, FileRecord},
 };
@@ -47,7 +48,7 @@ struct PendingFileDrag {
 
 struct TagWidthCache {
     keys: Vec<String>,
-    editing: Option<(PathBuf, String)>,
+    editing: Option<TagEditCacheKey>,
     row_count: usize,
     widths: Vec<Pixels>,
 }
@@ -83,6 +84,48 @@ struct PendingDelete {
     target: DeleteTarget,
 }
 
+#[derive(Clone)]
+struct RenameTarget {
+    kind: RenameKind,
+}
+
+#[derive(Clone)]
+enum RenameKind {
+    Rows { records: Vec<RowRenameTarget> },
+    TagAll { key: String, old_value: String },
+}
+
+#[derive(Clone)]
+struct RowRenameTarget {
+    name: String,
+    stem: String,
+    paths: Vec<PathBuf>,
+}
+
+#[derive(Clone)]
+struct PendingRename {
+    target: RenameTarget,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum TagEdit {
+    Add {
+        path: PathBuf,
+        key: String,
+    },
+    Rename {
+        path: PathBuf,
+        key: String,
+        old_value: String,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum TagEditCacheKey {
+    Add { path: PathBuf, key: String },
+    Rename { path: PathBuf, key: String },
+}
+
 pub(crate) struct PendingDeleteCounts {
     pub(crate) kind: PendingDeleteKind,
     pub(crate) row_count: usize,
@@ -94,10 +137,24 @@ pub(crate) enum PendingDeleteKind {
     Format,
 }
 
+pub(crate) struct PendingRenameDetails {
+    pub(crate) kind: PendingRenameKind,
+    pub(crate) item_count: usize,
+    pub(crate) file_count: usize,
+    pub(crate) current_name: Option<String>,
+    pub(crate) bulk: bool,
+}
+
+pub(crate) enum PendingRenameKind {
+    Rows,
+    TagAll,
+}
+
 pub struct FileTable {
     library: Entity<Library>,
     tag_input: Entity<InputState>,
-    editing: Option<(PathBuf, String)>,
+    rename_input: Entity<InputState>,
+    editing: Option<TagEdit>,
     focus_handle: FocusHandle,
     alt_down: bool,
     hovered_row: Option<PathBuf>,
@@ -106,6 +163,9 @@ pub struct FileTable {
     hovered_delete_row: Option<PathBuf>,
     pending_delete: Option<PendingDelete>,
     pending_context_menu_delete: Option<DeleteTarget>,
+    pending_rename: Option<PendingRename>,
+    pending_context_menu_rename: Option<RenameTarget>,
+    pending_context_menu_tag_rename: Option<TagChipTarget>,
     row_context_menu_open: bool,
     pending_drag: Option<PendingFileDrag>,
     selected: BTreeSet<PathBuf>,
@@ -118,6 +178,46 @@ pub struct FileTable {
 }
 
 impl FileTable {
+    fn editing_cache_key(editing: Option<&TagEdit>) -> Option<TagEditCacheKey> {
+        match editing {
+            Some(TagEdit::Add { path, key }) => Some(TagEditCacheKey::Add {
+                path: path.clone(),
+                key: key.clone(),
+            }),
+            Some(TagEdit::Rename { path, key, .. }) => Some(TagEditCacheKey::Rename {
+                path: path.clone(),
+                key: key.clone(),
+            }),
+            None => None,
+        }
+    }
+
+    fn editing_is_add(editing: Option<&TagEdit>, path: &Path, key: &str) -> bool {
+        matches!(
+            editing,
+            Some(TagEdit::Add {
+                path: editing_path,
+                key: editing_key
+            }) if editing_path == path && editing_key == key
+        )
+    }
+
+    fn editing_is_rename_value(
+        editing: Option<&TagEdit>,
+        path: &Path,
+        key: &str,
+        value: &str,
+    ) -> bool {
+        matches!(
+            editing,
+            Some(TagEdit::Rename {
+                path: editing_path,
+                key: editing_key,
+                old_value
+            }) if editing_path == path && editing_key == key && old_value == value
+        )
+    }
+
     fn tag_values_width(values: &[String]) -> f32 {
         values
             .iter()
@@ -129,7 +229,7 @@ impl FileTable {
     fn tag_column_width(
         state: &crate::model::CategoryState,
         key: &str,
-        editing: Option<(&PathBuf, &str)>,
+        editing: Option<&TagEdit>,
     ) -> Pixels {
         let header_width = key.chars().count() as f32 * TAG_TEXT_WIDTH + TAG_CELL_X_PADDING_WIDTH;
         let mut width = header_width;
@@ -139,10 +239,8 @@ impl FileTable {
                 .tags
                 .get(key)
                 .map_or(0., |values| Self::tag_values_width(values));
-            let is_editing = editing
-                .is_some_and(|(path, editing_key)| path == &record.path && editing_key == key);
             let gap_width = if value_width > 0. { TAG_GAP_WIDTH } else { 0. };
-            let action_width = if is_editing {
+            let action_width = if Self::editing_is_add(editing, &record.path, key) {
                 TAG_EDITOR_WIDTH
             } else if record.is_convertible() {
                 0.
@@ -175,6 +273,7 @@ impl FileTable {
         .detach();
 
         let tag_input = cx.new(|cx| InputState::new(window, cx));
+        let rename_input = cx.new(|cx| InputState::new(window, cx));
 
         cx.subscribe_in(
             &tag_input,
@@ -182,10 +281,21 @@ impl FileTable {
             |this, state, event: &InputEvent, window, cx| match event {
                 InputEvent::PressEnter { .. } => {
                     let value = state.read(cx).value().to_string();
-                    this.commit_tag(value, window, cx);
+                    this.commit_tag_edit(value, window, cx);
                 }
                 InputEvent::Blur => this.cancel_tag(window, cx),
                 _ => {}
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &rename_input,
+            window,
+            |this, state, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    let value = state.read(cx).value().to_string();
+                    this.confirm_rename_with_value(value, window, cx);
+                }
             },
         )
         .detach();
@@ -193,6 +303,7 @@ impl FileTable {
         Self {
             library,
             tag_input,
+            rename_input,
             editing: None,
             focus_handle: cx.focus_handle(),
             alt_down: false,
@@ -202,6 +313,9 @@ impl FileTable {
             hovered_delete_row: None,
             pending_delete: None,
             pending_context_menu_delete: None,
+            pending_rename: None,
+            pending_context_menu_rename: None,
+            pending_context_menu_tag_rename: None,
             row_context_menu_open: false,
             pending_drag: None,
             selected: BTreeSet::new(),
@@ -259,7 +373,7 @@ impl FileTable {
     }
 
     fn table_columns(&mut self, cx: &mut Context<Self>) -> (Vec<String>, Vec<Pixels>, usize) {
-        let editing = self.editing.clone();
+        let editing = Self::editing_cache_key(self.editing.as_ref());
         let (keys, row_count, widths) = {
             let state = self.library.read(cx).active_state();
             let keys: Vec<String> = state.schema.keys().cloned().collect();
@@ -274,10 +388,9 @@ impl FileTable {
             }
 
             let width_start = crate::perf::start();
-            let editing_ref = editing.as_ref().map(|(path, key)| (path, key.as_str()));
             let widths: Vec<Pixels> = keys
                 .iter()
-                .map(|key| Self::tag_column_width(state, key, editing_ref))
+                .map(|key| Self::tag_column_width(state, key, self.editing.as_ref()))
                 .collect();
             crate::perf::finish("table.widths", width_start, || {
                 format!(
@@ -319,6 +432,17 @@ impl FileTable {
         self.tag_input.read(cx).focus_handle(cx).is_focused(window)
     }
 
+    pub(crate) fn rename_input_is_focused(&self, window: &Window, cx: &App) -> bool {
+        self.rename_input
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
+    }
+
+    pub(crate) fn rename_input(&self) -> Entity<InputState> {
+        self.rename_input.clone()
+    }
+
     fn start_editing(
         &mut self,
         path: PathBuf,
@@ -326,7 +450,7 @@ impl FileTable {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.editing = Some((path, key));
+        self.editing = Some(TagEdit::Add { path, key });
         self.tag_input.update(cx, |state, cx| {
             state.set_value("", window, cx);
             state.focus(window, cx);
@@ -334,25 +458,61 @@ impl FileTable {
         cx.notify();
     }
 
-    fn commit_tag(&mut self, raw: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((path, key)) = self.editing.take() else {
+    fn start_renaming_tag(
+        &mut self,
+        target: TagChipTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editing = Some(TagEdit::Rename {
+            path: target.path,
+            key: target.key,
+            old_value: target.value,
+        });
+        self.tag_input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+            state.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn commit_tag_edit(&mut self, raw: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editing) = self.editing.take() else {
             return;
         };
         let value = raw.trim();
-        if !value.is_empty() {
-            let paths = {
-                let library = self.library.read(cx);
-                self.selected_tag_paths(&library.active_state().results, &path)
-            };
-            let path_count = paths.len();
-            debug_table_interaction(|| {
-                format!("tag add key={key} value={value} paths={path_count}")
-            });
-            self.library.update(cx, |lib, cx| {
-                for path in paths {
-                    lib.add_tag(path, &key, value, cx);
+        match editing {
+            TagEdit::Add { path, key } => {
+                if !value.is_empty() {
+                    let paths = {
+                        let library = self.library.read(cx);
+                        self.selected_tag_paths(&library.active_state().results, &path)
+                    };
+                    let path_count = paths.len();
+                    debug_table_interaction(|| {
+                        format!("tag add key={key} value={value} paths={path_count}")
+                    });
+                    self.library.update(cx, |lib, cx| {
+                        for path in paths {
+                            lib.add_tag(path, &key, value, cx);
+                        }
+                    });
                 }
-            });
+            }
+            TagEdit::Rename {
+                path,
+                key,
+                old_value,
+            } => {
+                if !value.is_empty() && value != old_value {
+                    debug_table_interaction(|| {
+                        format!("tag rename key={key} old={old_value} new={value}")
+                    });
+                    self.library.update(cx, |lib, cx| {
+                        lib.rename_tag(path, &key, &old_value, value, cx);
+                    });
+                }
+            }
         }
         self.focus_handle.focus(window, cx);
         window.refresh();
@@ -363,6 +523,15 @@ impl FileTable {
         if self.editing.take().is_some() {
             self.focus_handle.focus(window, cx);
             cx.notify();
+        }
+    }
+
+    pub(crate) fn cancel_tag_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.editing.is_some() {
+            self.cancel_tag(window, cx);
+            true
+        } else {
+            false
         }
     }
 
@@ -573,6 +742,21 @@ impl FileTable {
         }
     }
 
+    fn rename_target(&self, record: &FileRecord, selected_records: &[FileRecord]) -> RenameTarget {
+        let records: Vec<&FileRecord> =
+            if self.selected.len() > 1 && self.selected.contains(record.path.as_path()) {
+                selected_records.iter().collect()
+            } else {
+                vec![record]
+            };
+
+        RenameTarget {
+            kind: RenameKind::Rows {
+                records: records.into_iter().map(row_rename_target).collect(),
+            },
+        }
+    }
+
     fn format_delete_target(&self, record: &FileRecord, extension: &str) -> DeleteTarget {
         let paths = record
             .variant_for_extension(extension)
@@ -617,6 +801,25 @@ impl FileTable {
         })
     }
 
+    fn selected_rename_target(&self, cx: &mut Context<Self>) -> Option<RenameTarget> {
+        if self.selected.is_empty() {
+            return None;
+        }
+
+        let state = self.library.read(cx);
+        let records: Vec<RowRenameTarget> = state
+            .active_state()
+            .results
+            .iter()
+            .filter(|record| self.selected.contains(record.path.as_path()))
+            .map(row_rename_target)
+            .collect();
+
+        (!records.is_empty()).then_some(RenameTarget {
+            kind: RenameKind::Rows { records },
+        })
+    }
+
     fn confirm_delete_target(
         &mut self,
         target: DeleteTarget,
@@ -656,6 +859,126 @@ impl FileTable {
         };
 
         self.confirm_delete_target(target, "context-menu", window, cx);
+    }
+
+    fn start_rename_target(
+        &mut self,
+        target: RenameTarget,
+        initial_value: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_rename = Some(PendingRename { target });
+        self.rename_input.update(cx, |state, cx| {
+            state.set_value(initial_value, window, cx);
+            state.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn start_selected_rename(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(target) = self.selected_rename_target(cx) else {
+            return false;
+        };
+        let initial_value = target.default_value();
+        self.start_rename_target(target, initial_value, window, cx);
+        true
+    }
+
+    fn request_context_menu_rename(&mut self, target: RenameTarget) {
+        self.pending_context_menu_rename = Some(target);
+    }
+
+    fn request_context_menu_tag_rename(&mut self, target: TagChipTarget) {
+        self.pending_context_menu_tag_rename = Some(target);
+    }
+
+    fn confirm_pending_context_menu_tag_rename(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self.pending_context_menu_tag_rename.take() else {
+            return;
+        };
+        self.start_renaming_tag(target, window, cx);
+    }
+
+    fn confirm_pending_context_menu_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.pending_context_menu_rename.take() else {
+            return;
+        };
+        let initial_value = target.default_value();
+        self.start_rename_target(target, initial_value, window, cx);
+    }
+
+    pub fn pending_rename_details(&self) -> Option<PendingRenameDetails> {
+        self.pending_rename
+            .as_ref()
+            .map(|pending| pending.target.details())
+    }
+
+    pub fn cancel_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.pending_rename.take().is_some() {
+            self.focus_handle.focus(window, cx);
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn confirm_pending_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let value = self.rename_input.read(cx).value().to_string();
+        self.confirm_rename_with_value(value, window, cx)
+    }
+
+    fn confirm_rename_with_value(
+        &mut self,
+        raw: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(pending) = self.pending_rename.take() else {
+            return false;
+        };
+        let value = raw.trim().to_string();
+        if value.is_empty() {
+            self.focus_handle.focus(window, cx);
+            cx.notify();
+            return true;
+        }
+
+        match pending.target.kind {
+            RenameKind::Rows { records } => {
+                let rename_records = records
+                    .into_iter()
+                    .map(|record| RenameRecord {
+                        stem: record.stem,
+                        paths: record.paths,
+                    })
+                    .collect::<Vec<_>>();
+                self.library.update(cx, |lib, cx| {
+                    lib.rename_records(rename_records, &value, cx);
+                });
+                self.selected.clear();
+                self.selection_anchor = None;
+            }
+            RenameKind::TagAll { key, old_value } => {
+                if value != old_value {
+                    self.library.update(cx, |lib, cx| {
+                        lib.rename_tag_value(&key, &old_value, &value, cx);
+                    });
+                }
+            }
+        }
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+        true
     }
 
     fn remove_tag_from_target(
@@ -982,6 +1305,7 @@ impl FileTable {
         let convertible = record.is_convertible();
         let selected = self.selected.contains(path.as_path());
         let delete_target = self.delete_target(record, selected_records);
+        let rename_target = self.rename_target(record, selected_records);
         let row_hover_bg = if convertible {
             hsla(0.095, 1., 0.55, 0.2)
         } else {
@@ -1088,6 +1412,7 @@ impl FileTable {
                 let table = table.clone();
                 let actions = conversion_actions.clone();
                 let target = delete_target.clone();
+                let row_rename_target = rename_target.clone();
                 let row_count = target.row_count;
                 menu_cx.update_entity(&table, |this, cx| {
                     this.row_context_menu_open = true;
@@ -1100,6 +1425,8 @@ impl FileTable {
                         move |_, _: &DismissEvent, window, cx| {
                             cx.update_entity(&table, |this, cx| {
                                 this.row_context_menu_open = false;
+                                this.confirm_pending_context_menu_tag_rename(window, cx);
+                                this.confirm_pending_context_menu_rename(window, cx);
                                 this.confirm_pending_context_menu_delete(window, cx);
                                 cx.notify();
                             });
@@ -1152,23 +1479,44 @@ impl FileTable {
                     }));
                 }
                 if let Some(target) = tag_context_target {
-                    let table = table.clone();
+                    let remove_table = table.clone();
+                    let rename_table = table.clone();
+                    let rename_all_table = table.clone();
                     let label = if target.value.is_empty() {
                         SharedString::from("Remove Tag")
                     } else {
                         SharedString::from(format!("Remove {}", target.value))
                     };
-                    return menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                        cx.update_entity(&table, |this, cx| {
-                            this.remove_tag_from_target(
-                                &target.path,
-                                &target.key,
-                                &target.value,
-                                window,
-                                cx,
-                            );
-                        });
-                    }));
+                    let rename_target = target.clone();
+                    let rename_all_target = RenameTarget {
+                        kind: RenameKind::TagAll {
+                            key: target.key.clone(),
+                            old_value: target.value.clone(),
+                        },
+                    };
+                    return menu
+                        .item(PopupMenuItem::new("Rename").on_click(move |_, _, cx| {
+                            cx.update_entity(&rename_table, |this, _| {
+                                this.request_context_menu_tag_rename(rename_target.clone());
+                            });
+                        }))
+                        .item(PopupMenuItem::new("Rename all").on_click(move |_, _, cx| {
+                            cx.update_entity(&rename_all_table, |this, _| {
+                                this.request_context_menu_rename(rename_all_target.clone());
+                            });
+                        }))
+                        .separator()
+                        .item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                            cx.update_entity(&remove_table, |this, cx| {
+                                this.remove_tag_from_target(
+                                    &target.path,
+                                    &target.key,
+                                    &target.value,
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }));
                 }
                 for action in actions {
                     let table = table.clone();
@@ -1186,14 +1534,20 @@ impl FileTable {
                 if !conversion_actions.is_empty() {
                     menu = menu.separator();
                 }
-                let table = table.clone();
+                let rename_table = table.clone();
+                menu = menu.item(PopupMenuItem::new("Rename").on_click(move |_, _, cx| {
+                    cx.update_entity(&rename_table, |this, _| {
+                        this.request_context_menu_rename(row_rename_target.clone());
+                    });
+                }));
+                let delete_table = table.clone();
                 let label = if row_count == 1 {
                     SharedString::from("Delete")
                 } else {
                     SharedString::from(format!("Delete {row_count} Rows"))
                 };
                 menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                    cx.update_entity(&table, |this, _| {
+                    cx.update_entity(&delete_table, |this, _| {
                         this.request_context_menu_delete(target.clone());
                     });
                 }));
@@ -1335,10 +1689,6 @@ impl FileTable {
 
         for (key, tag_width) in keys.iter().zip(tag_widths) {
             let group = SharedString::from(format!("cell:{}:{key}", path.display()));
-            let is_editing = self
-                .editing
-                .as_ref()
-                .is_some_and(|(p, k)| p == &path && k == key);
 
             let mut cell = div()
                 .id(group.clone())
@@ -1363,23 +1713,65 @@ impl FileTable {
                     };
                     let chip_group =
                         SharedString::from(format!("chip-group:{}:{key}:{value}", path.display()));
+                    let is_renaming =
+                        Self::editing_is_rename_value(self.editing.as_ref(), &path, &key, &value);
+                    let chip_width =
+                        px(value.chars().count() as f32 * TAG_TEXT_WIDTH
+                            + TAG_CHIP_X_PADDING_WIDTH);
 
-                    cell = cell.child(
-                        div()
-                            .id(SharedString::from(format!(
-                                "chip:{}:{key}:{value}",
-                                path.display()
-                            )))
-                            .group(chip_group.clone())
-                            .relative()
-                            .h(ROW_HEIGHT)
-                            .h_flex()
-                            .items_center()
+                    let mut chip = div()
+                        .id(SharedString::from(format!(
+                            "chip:{}:{key}:{value}",
+                            path.display()
+                        )))
+                        .group(chip_group.clone())
+                        .relative()
+                        .h(ROW_HEIGHT)
+                        .h_flex()
+                        .items_center();
+
+                    if is_renaming {
+                        chip = chip.child(
+                            div()
+                                .w(chip_width)
+                                .min_w(chip_width)
+                                .h_flex()
+                                .items_center()
+                                .flex_shrink_0()
+                                .px_1p5()
+                                .rounded_md()
+                                .text_xs()
+                                .bg(cx.theme().muted)
+                                .overflow_hidden()
+                                .on_key_down(cx.listener(
+                                    |this, event: &KeyDownEvent, window, cx| {
+                                        if event.keystroke.key == "escape" {
+                                            this.cancel_tag(window, cx);
+                                            cx.stop_propagation();
+                                        }
+                                    },
+                                ))
+                                .child(
+                                    Input::new(&self.tag_input)
+                                        .appearance(false)
+                                        .xsmall()
+                                        .px_0()
+                                        .flex_1()
+                                        .mr(px(-10.))
+                                        .min_w_0(),
+                                ),
+                        );
+                    } else {
+                        let rename_target = tag_target.clone();
+                        chip = chip
                             .child(
                                 div()
                                     .px_1p5()
                                     .rounded_md()
                                     .text_xs()
+                                    .h(px(18.))
+                                    .h_flex()
+                                    .items_center()
                                     .whitespace_nowrap()
                                     .bg(cx.theme().muted)
                                     .text_color(cx.theme().muted_foreground)
@@ -1422,20 +1814,34 @@ impl FileTable {
                                     .on_mouse_move(|_, _, cx| cx.stop_propagation())
                                     .on_click(cx.listener(
                                         move |this, event: &ClickEvent, window, cx| {
-                                            if event.modifiers().alt {
+                                            let modifiers = event.modifiers();
+                                            if modifiers.alt {
                                                 this.remove_tag_from_target(
                                                     &path, &key, &value, window, cx,
+                                                );
+                                            } else if event.click_count() == 2
+                                                && !modifiers.control
+                                                && !modifiers.platform
+                                                && !modifiers.shift
+                                                && !modifiers.function
+                                            {
+                                                this.start_renaming_tag(
+                                                    rename_target.clone(),
+                                                    window,
+                                                    cx,
                                                 );
                                             }
                                             cx.stop_propagation();
                                         },
                                     )),
-                            ),
-                    );
+                            );
+                    }
+
+                    cell = cell.child(chip);
                 }
             }
 
-            if is_editing {
+            if Self::editing_is_add(self.editing.as_ref(), &path, key) {
                 cell = cell.child(
                     div()
                         .h_flex()
@@ -1446,12 +1852,22 @@ impl FileTable {
                         .rounded_md()
                         .text_xs()
                         .bg(cx.theme().muted)
+                        .overflow_hidden()
                         .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                             if event.keystroke.key == "escape" {
                                 this.cancel_tag(window, cx);
+                                cx.stop_propagation();
                             }
                         }))
-                        .child(Input::new(&self.tag_input).appearance(false).xsmall()),
+                        .child(
+                            Input::new(&self.tag_input)
+                                .appearance(false)
+                                .xsmall()
+                                .px_0()
+                                .flex_1()
+                                .mr(px(-10.))
+                                .min_w_0(),
+                        ),
                 );
             } else if !convertible {
                 let (key, path) = (key.clone(), path.clone());
@@ -1599,6 +2015,11 @@ impl Render for FileTable {
                             cx.stop_propagation();
                         }
                     }
+                    "f2" => {
+                        if this.start_selected_rename(window, cx) {
+                            cx.stop_propagation();
+                        }
+                    }
                     _ => {}
                 }
             }))
@@ -1627,6 +2048,50 @@ impl Render for FileTable {
             )
         });
         table
+    }
+}
+
+impl RenameTarget {
+    fn default_value(&self) -> String {
+        match &self.kind {
+            RenameKind::Rows { records } if records.len() == 1 => records[0].name.clone(),
+            RenameKind::Rows { .. } => String::new(),
+            RenameKind::TagAll { old_value, .. } => old_value.clone(),
+        }
+    }
+
+    fn details(&self) -> PendingRenameDetails {
+        match &self.kind {
+            RenameKind::Rows { records } => {
+                let file_count = records.iter().map(|record| record.paths.len()).sum();
+                PendingRenameDetails {
+                    kind: PendingRenameKind::Rows,
+                    item_count: records.len(),
+                    file_count,
+                    current_name: (records.len() == 1).then(|| records[0].name.clone()),
+                    bulk: records.len() > 1,
+                }
+            }
+            RenameKind::TagAll { old_value, .. } => PendingRenameDetails {
+                kind: PendingRenameKind::TagAll,
+                item_count: 1,
+                file_count: 0,
+                current_name: Some(old_value.clone()),
+                bulk: true,
+            },
+        }
+    }
+}
+
+fn row_rename_target(record: &FileRecord) -> RowRenameTarget {
+    RowRenameTarget {
+        name: record.name.clone(),
+        stem: record.stem.clone(),
+        paths: record
+            .variants
+            .iter()
+            .map(|variant| variant.path.clone())
+            .collect(),
     }
 }
 
