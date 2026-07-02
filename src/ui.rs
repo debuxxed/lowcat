@@ -1,5 +1,6 @@
 mod downloader_panel;
 mod filter_panel;
+mod folder_tags;
 mod settings_menu;
 mod table;
 mod titlebar;
@@ -32,7 +33,8 @@ actions!(
         PreviousCategory,
         ToggleSettings,
         ToggleFilters,
-        ToggleDownloader
+        ToggleDownloader,
+        AssignFolderTags
     ]
 );
 
@@ -46,6 +48,7 @@ use crate::library::Library;
 use crate::ui::{
     downloader_panel::DownloaderPanel,
     filter_panel::FilterPanel,
+    folder_tags::FolderTagModalState,
     table::{FileTable, PendingDeleteKind},
     titlebar::AppTitleBar,
     toolbar::Toolbar,
@@ -60,6 +63,7 @@ pub struct UI {
     downloader_panel: Entity<DownloaderPanel>,
     table: Entity<FileTable>,
     focus_handle: FocusHandle,
+    folder_tag_modal: Option<FolderTagModalState>,
 }
 
 impl UI {
@@ -90,6 +94,7 @@ impl UI {
             table: cx.new(|cx| FileTable::new(library.clone(), window, cx)),
             library,
             focus_handle,
+            folder_tag_modal: None,
         }
     }
 }
@@ -537,6 +542,19 @@ impl Render for UI {
                     cx.stop_propagation();
                     return;
                 }
+                if this.folder_tag_modal.is_some() {
+                    if event.keystroke.modifiers.platform && event.keystroke.key == "a" {
+                        this.select_all_folder_tag_rows(cx);
+                    } else if event.keystroke.key == "escape" {
+                        if !this.close_folder_tag_key_menu(cx)
+                            && !this.clear_folder_tag_selection(cx)
+                        {
+                            this.close_folder_tag_modal(cx);
+                        }
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
                 if event.keystroke.key == "escape" {
                     if this.cancel_delete(cx) {
                         cx.stop_propagation();
@@ -604,6 +622,12 @@ impl Render for UI {
                 }
                 this.toggle_settings(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &AssignFolderTags, _, cx| {
+                if this.has_media_tool_problems() {
+                    return;
+                }
+                this.open_folder_tag_modal(cx);
+            }))
             .on_action(cx.listener(|this, _: &NextCategory, _, cx| {
                 if this.has_media_tool_problems() {
                     return;
@@ -654,6 +678,9 @@ impl Render for UI {
             })
             .when(!has_media_tool_problems && import_progress_active, |el| {
                 el.child(self.render_import_progress_modal(cx))
+            })
+            .when(!has_media_tool_problems, |el| {
+                el.children(self.render_folder_tag_modal(_window, cx))
             })
             .when(!has_media_tool_problems, |el| {
                 el.children(self.render_delete_confirmation_modal(cx))

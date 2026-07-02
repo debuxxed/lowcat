@@ -65,6 +65,13 @@ struct DeleteTarget {
     paths: Vec<PathBuf>,
 }
 
+#[derive(Clone)]
+struct TagChipTarget {
+    path: PathBuf,
+    key: String,
+    value: String,
+}
+
 #[derive(Clone, Copy)]
 enum DeleteKind {
     Rows,
@@ -94,7 +101,7 @@ pub struct FileTable {
     focus_handle: FocusHandle,
     alt_down: bool,
     hovered_row: Option<PathBuf>,
-    hovered_tag_chip: Option<PathBuf>,
+    hovered_tag_chip: Option<TagChipTarget>,
     hovered_format_chip: Option<PathBuf>,
     hovered_delete_row: Option<PathBuf>,
     pending_delete: Option<PendingDelete>,
@@ -651,6 +658,31 @@ impl FileTable {
         self.confirm_delete_target(target, "context-menu", window, cx);
     }
 
+    fn remove_tag_from_target(
+        &mut self,
+        path: &Path,
+        key: &str,
+        value: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let paths = {
+            let library = self.library.read(cx);
+            self.selected_tag_paths(&library.active_state().results, path)
+        };
+        let path_count = paths.len();
+        debug_table_interaction(|| {
+            format!("tag remove key={key} value={value} paths={path_count}")
+        });
+        self.library.update(cx, |lib, cx| {
+            for path in paths {
+                lib.remove_tag(path, key, value, cx);
+            }
+        });
+        window.refresh();
+        cx.notify();
+    }
+
     pub fn pending_delete_counts(&self) -> Option<PendingDeleteCounts> {
         let pending = self.pending_delete.as_ref()?;
         let kind = match pending.target.kind {
@@ -759,13 +791,27 @@ impl FileTable {
         }
     }
 
-    fn set_tag_chip_hovered(&mut self, path: PathBuf, hovered: bool, cx: &mut Context<Self>) {
+    fn set_tag_chip_hovered(
+        &mut self,
+        target: TagChipTarget,
+        hovered: bool,
+        cx: &mut Context<Self>,
+    ) {
         if hovered {
-            if self.hovered_tag_chip.as_ref() != Some(&path) {
-                self.hovered_tag_chip = Some(path);
+            let changed = self.hovered_tag_chip.as_ref().is_none_or(|hovered| {
+                hovered.path != target.path
+                    || hovered.key != target.key
+                    || hovered.value != target.value
+            });
+            if changed {
+                self.hovered_tag_chip = Some(target);
                 cx.notify();
             }
-        } else if self.hovered_tag_chip.as_ref() == Some(&path) {
+        } else if self.hovered_tag_chip.as_ref().is_some_and(|hovered| {
+            hovered.path == target.path
+                && hovered.key == target.key
+                && hovered.value == target.value
+        }) {
             self.hovered_tag_chip = None;
             cx.notify();
         }
@@ -973,6 +1019,7 @@ impl FileTable {
         let conversion_actions = self.conversion_actions(record, selected_records);
         let table = cx.entity();
         let menu_action_context = self.focus_handle.clone();
+        let menu_record = record.clone();
         let row_group = SharedString::from(format!("row-group:{}", path.display()));
         let mut row = div()
             .id(SharedString::from(format!("row:{}", path.display())))
@@ -1062,6 +1109,67 @@ impl FileTable {
                 let mut menu = menu
                     .max_w(px(CONVERT_MENU_PANE_WIDTH))
                     .action_context(menu_action_context.clone());
+                let (format_context_target, tag_context_target) =
+                    menu_cx.update_entity(&table, |this, _| {
+                        let format_context_target =
+                            this.hovered_format_chip.as_ref().and_then(|hovered| {
+                                unique_format_variants(&menu_record)
+                                    .into_iter()
+                                    .find(|variant| variant.path == *hovered)
+                                    .map(|variant| {
+                                        (
+                                            variant.extension.clone(),
+                                            this.format_delete_target(
+                                                &menu_record,
+                                                &variant.extension,
+                                            ),
+                                        )
+                                    })
+                            });
+                        let tag_context_target =
+                            this.hovered_tag_chip.as_ref().and_then(|target| {
+                                if target.path == menu_record.path
+                                    && menu_record
+                                        .tags
+                                        .get(&target.key)
+                                        .is_some_and(|values| values.contains(&target.value))
+                                {
+                                    Some(target.clone())
+                                } else {
+                                    None
+                                }
+                            });
+                        (format_context_target, tag_context_target)
+                    });
+                if let Some((extension, target)) = format_context_target {
+                    let table = table.clone();
+                    let label =
+                        SharedString::from(format!("Delete {}", extension.to_ascii_uppercase()));
+                    return menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                        cx.update_entity(&table, |this, _| {
+                            this.request_context_menu_delete(target.clone());
+                        });
+                    }));
+                }
+                if let Some(target) = tag_context_target {
+                    let table = table.clone();
+                    let label = if target.value.is_empty() {
+                        SharedString::from("Remove Tag")
+                    } else {
+                        SharedString::from(format!("Remove {}", target.value))
+                    };
+                    return menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                        cx.update_entity(&table, |this, cx| {
+                            this.remove_tag_from_target(
+                                &target.path,
+                                &target.key,
+                                &target.value,
+                                window,
+                                cx,
+                            );
+                        });
+                    }));
+                }
                 for action in actions {
                     let table = table.clone();
                     let target = action.target;
@@ -1151,7 +1259,6 @@ impl FileTable {
                                             );
                                         }
                                     }))
-                                    .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener({
@@ -1196,6 +1303,19 @@ impl FileTable {
                                             }
                                         }),
                                     )
+                                    .on_mouse_down(
+                                        MouseButton::Right,
+                                        cx.listener({
+                                            let variant_path = variant_path.clone();
+                                            move |this, _: &MouseDownEvent, _, cx| {
+                                                this.set_format_chip_hovered(
+                                                    variant_path.clone(),
+                                                    true,
+                                                    cx,
+                                                );
+                                            }
+                                        }),
+                                    )
                                     .on_mouse_move(cx.listener(
                                         |this, event: &MouseMoveEvent, window, cx| {
                                             this.maybe_start_file_drag(event, window, cx);
@@ -1236,7 +1356,11 @@ impl FileTable {
             if let Some(values) = record.tags.get(key) {
                 for value in values {
                     let (key, value, path) = (key.clone(), value.clone(), path.clone());
-                    let chip_hover_path = path.clone();
+                    let tag_target = TagChipTarget {
+                        path: path.clone(),
+                        key: key.clone(),
+                        value: value.clone(),
+                    };
                     let chip_group =
                         SharedString::from(format!("chip-group:{}:{key}:{value}", path.display()));
 
@@ -1279,14 +1403,19 @@ impl FileTable {
                                     .bottom(px(-1.))
                                     .bg(cx.theme().transparent)
                                     .cursor_pointer()
-                                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                                        this.set_tag_chip_hovered(
-                                            chip_hover_path.clone(),
-                                            *hovered,
-                                            cx,
-                                        );
+                                    .on_hover(cx.listener({
+                                        let tag_target = tag_target.clone();
+                                        move |this, hovered: &bool, _, cx| {
+                                            this.set_tag_chip_hovered(
+                                                tag_target.clone(),
+                                                *hovered,
+                                                cx,
+                                            );
+                                        }
                                     }))
-                                    .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
                                     .on_mouse_up(MouseButton::Left, |_, _, cx| {
                                         cx.stop_propagation()
                                     })
@@ -1294,26 +1423,9 @@ impl FileTable {
                                     .on_click(cx.listener(
                                         move |this, event: &ClickEvent, window, cx| {
                                             if event.modifiers().alt {
-                                                let paths = {
-                                                    let library = this.library.read(cx);
-                                                    this.selected_tag_paths(
-                                                        &library.active_state().results,
-                                                        &path,
-                                                    )
-                                                };
-                                                let path_count = paths.len();
-                                                debug_table_interaction(|| {
-                                                    format!(
-                                                        "tag remove key={key} value={value} paths={path_count}"
-                                                    )
-                                                });
-                                                this.library.update(cx, |lib, cx| {
-                                                    for path in paths {
-                                                        lib.remove_tag(path, &key, &value, cx);
-                                                    }
-                                                });
-                                                window.refresh();
-                                                cx.notify();
+                                                this.remove_tag_from_target(
+                                                    &path, &key, &value, window, cx,
+                                                );
                                             }
                                             cx.stop_propagation();
                                         },

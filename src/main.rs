@@ -21,7 +21,8 @@ use gpui_platform::application;
 
 use crate::library::Library;
 use crate::ui::{
-    NextCategory, PreviousCategory, ToggleDownloader, ToggleFilters, ToggleSettings, UI,
+    AssignFolderTags, NextCategory, PreviousCategory, ToggleDownloader, ToggleFilters,
+    ToggleSettings, UI,
 };
 
 actions!(
@@ -71,6 +72,7 @@ fn main() {
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-,", ToggleSettings, None),
             KeyBinding::new("cmd-e", ToggleFilters, None),
+            KeyBinding::new("cmd-i", AssignFolderTags, None),
             KeyBinding::new("shift-e", ToggleDownloader, None),
             KeyBinding::new("ctrl-tab", NextCategory, None),
             KeyBinding::new("ctrl-shift-tab", PreviousCategory, None),
@@ -145,6 +147,7 @@ fn app_menus() -> Vec<Menu> {
             MenuItem::action("Quit", Quit),
         ]),
         Menu::new("File").items([MenuItem::action("Show Window", ShowWindow)]),
+        Menu::new("Library").items([MenuItem::action("Assign Folder Tags", AssignFolderTags)]),
         Menu::new("View").items([
             MenuItem::action("Toggle Filters", ToggleFilters),
             MenuItem::action("Toggle Downloader", ToggleDownloader),
@@ -168,6 +171,7 @@ fn app_menus() -> Vec<Menu> {
             MenuItem::separator(),
             MenuItem::action("Quit", Quit),
         ]),
+        Menu::new("Library").items([MenuItem::action("Assign Folder Tags", AssignFolderTags)]),
         Menu::new("View").items([
             MenuItem::action("Toggle Filters", ToggleFilters),
             MenuItem::action("Toggle Downloader", ToggleDownloader),

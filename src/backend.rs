@@ -12,8 +12,8 @@ use lofty::ogg::{OpusFile, VorbisComments};
 
 use crate::db::{Database, FileScanRecord};
 use crate::model::{
-    AudioFormat, Category, ConvertConflictBehavior, FileRecord, canonical_tag_key,
-    supported_audio_extension,
+    AudioFormat, Category, ConvertConflictBehavior, FileRecord, FolderTagAssignment,
+    canonical_tag_key, supported_audio_extension,
 };
 
 pub struct Backend {
@@ -149,6 +149,30 @@ impl Backend {
         };
         let stem = file_stem(path);
         self.db.remove_tag(category, &stem, key, value)
+    }
+
+    pub fn folder_tag_values(&self, category: Category) -> io::Result<Vec<String>> {
+        let Some(folder) = self.folders.get(&category) else {
+            return Ok(Vec::new());
+        };
+        if !folder.is_dir() {
+            return Ok(Vec::new());
+        }
+        self.db.folder_tag_values(category, folder)
+    }
+
+    pub fn assign_folder_tags(
+        &mut self,
+        category: Category,
+        assignments: &[FolderTagAssignment],
+    ) -> io::Result<usize> {
+        let Some(folder) = self.folders.get(&category) else {
+            return Ok(0);
+        };
+        if !folder.is_dir() {
+            return Ok(0);
+        }
+        self.db.assign_folder_tags(category, folder, assignments)
     }
 
     /// Import `source` into `category`'s folder. Supported formats are copied as-is.

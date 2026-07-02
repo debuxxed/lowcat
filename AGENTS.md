@@ -5,7 +5,6 @@
 - Do not set `LOWCAT_PROFILE` for normal `cargo run`; perf logs are only for explicit profiling.
 
 ## UI Verification Workflow
-- For UI changes, Codex should run `cargo check` first.
 - If Codex can verify the UI behavior without user assistance, run `cargo run` and complete verification directly.
 - If Codex needs user assistance to verify the UI behavior, ask for manual verification and stop; do not start or keep a live app session just for the user to interact with.
 - Add targeted debug output only when it is needed for the affected interaction path, and remove it once the behavior is confirmed.

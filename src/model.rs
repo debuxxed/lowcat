@@ -47,6 +47,13 @@ impl Category {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderTagAssignment {
+    pub value: String,
+    pub key: String,
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct FileRecord {
     pub name: String,

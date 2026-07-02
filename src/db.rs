@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -12,7 +12,8 @@ use sqlx::{Row, SqlitePool};
 
 use crate::model::{
     AudioFormat, Category, ConvertConflictBehavior, FileRecord, FileSupport, FileVariant,
-    canonical_tag_key, default_format_priority, normalize_format_priority, record_matches,
+    FolderTagAssignment, canonical_tag_key, default_format_priority, normalize_format_priority,
+    record_matches,
 };
 
 const FORMAT_PRIORITY_KEY: &str = "format_priority";
@@ -448,6 +449,93 @@ impl Database {
         .map_err(io::Error::other)
     }
 
+    pub fn folder_tag_values(
+        &self,
+        category: Category,
+        category_folder: &Path,
+    ) -> io::Result<Vec<String>> {
+        let rows = block_on(async {
+            sqlx::query(
+                "SELECT path FROM files
+                 WHERE category = ?
+                 ORDER BY path COLLATE NOCASE",
+            )
+            .bind(category_key(category))
+            .fetch_all(&self.pool)
+            .await
+        })
+        .map_err(io::Error::other)?;
+
+        let mut values = BTreeSet::new();
+        for row in rows {
+            let path = PathBuf::from(row.get::<String, _>("path"));
+            values.extend(folder_tag_values(category_folder, &path));
+        }
+
+        Ok(values.into_iter().collect())
+    }
+
+    pub fn assign_folder_tags(
+        &self,
+        category: Category,
+        category_folder: &Path,
+        assignments: &[FolderTagAssignment],
+    ) -> io::Result<usize> {
+        let assignments: BTreeMap<String, &'static str> = assignments
+            .iter()
+            .filter(|assignment| assignment.enabled)
+            .filter_map(|assignment| {
+                let key = canonical_tag_key(&assignment.key)?;
+                category
+                    .tag_keys()
+                    .contains(&key)
+                    .then(|| (assignment.value.clone(), key))
+            })
+            .collect();
+        if assignments.is_empty() {
+            return Ok(0);
+        }
+
+        block_on(async {
+            let category_key = category_key(category);
+            let rows = sqlx::query(
+                "SELECT path, stem FROM files
+                 WHERE category = ?
+                 ORDER BY path COLLATE NOCASE",
+            )
+            .bind(category_key)
+            .fetch_all(&self.pool)
+            .await?;
+            let mut tx = self.pool.begin().await?;
+            let mut inserted = 0;
+
+            for row in rows {
+                let path = PathBuf::from(row.get::<String, _>("path"));
+                let stem: String = row.get("stem");
+                for value in folder_tag_values(category_folder, &path) {
+                    let Some(key) = assignments.get(&value).copied() else {
+                        continue;
+                    };
+                    let result = sqlx::query(
+                        "INSERT OR IGNORE INTO tag_values(category, stem, key, value)
+                         VALUES (?, ?, ?, ?)",
+                    )
+                    .bind(category_key)
+                    .bind(&stem)
+                    .bind(key)
+                    .bind(value)
+                    .execute(&mut *tx)
+                    .await?;
+                    inserted += result.rows_affected() as usize;
+                }
+            }
+
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(inserted)
+        })
+        .map_err(io::Error::other)
+    }
+
     pub fn format_priority(&self) -> io::Result<Vec<AudioFormat>> {
         let value = self.setting(FORMAT_PRIORITY_KEY)?;
         let priority = value
@@ -809,6 +897,28 @@ fn like_contains_pattern(value: &str) -> String {
     pattern
 }
 
+fn folder_tag_values(category_folder: &Path, path: &Path) -> Vec<String> {
+    let Some(parent) = path
+        .strip_prefix(category_folder)
+        .ok()
+        .and_then(Path::parent)
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Vec::new();
+    };
+
+    let mut values = Vec::new();
+    for component in parent.components() {
+        if let Component::Normal(name) = component {
+            let value = name.to_string_lossy().trim().to_string();
+            if !value.is_empty() && !values.contains(&value) {
+                values.push(value);
+            }
+        }
+    }
+    values
+}
+
 fn canonical_selected(
     selected: &BTreeMap<String, BTreeSet<String>>,
 ) -> BTreeMap<String, BTreeSet<String>> {
@@ -944,6 +1054,91 @@ mod tests {
         assert_eq!(names, vec!["ambient/alt/song", "song"]);
         assert_eq!(rows[0].variants.len(), 1);
         assert_eq!(rows[1].variants.len(), 1);
+    }
+
+    #[test]
+    fn assign_folder_tags_uses_relative_parent_components_for_stems() {
+        let db = Database::open(&db_path("folder-tags")).unwrap();
+        db.sync_category(
+            Category::Music,
+            vec![
+                scan_path("/tmp/music/ambient/dark/song.wav"),
+                scan_path("/tmp/music/bright/song.wav"),
+                scan_path("/tmp/music/root.wav"),
+            ],
+        )
+        .unwrap();
+
+        let values = db
+            .folder_tag_values(Category::Music, Path::new("/tmp/music"))
+            .unwrap();
+        assert_eq!(values, vec!["ambient", "bright", "dark"]);
+
+        let inserted = db
+            .assign_folder_tags(
+                Category::Music,
+                Path::new("/tmp/music"),
+                &[
+                    FolderTagAssignment {
+                        value: "ambient".to_string(),
+                        key: "GENRE".to_string(),
+                        enabled: true,
+                    },
+                    FolderTagAssignment {
+                        value: "dark".to_string(),
+                        key: "MOOD".to_string(),
+                        enabled: true,
+                    },
+                    FolderTagAssignment {
+                        value: "bright".to_string(),
+                        key: "GENRE".to_string(),
+                        enabled: false,
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(inserted, 2);
+
+        let rows = db
+            .query_visible_rows(
+                Category::Music,
+                "",
+                &BTreeMap::new(),
+                &default_format_priority(),
+                Some(Path::new("/tmp/music")),
+            )
+            .unwrap();
+        let song_rows = rows
+            .iter()
+            .filter(|row| row.stem == "song")
+            .collect::<Vec<_>>();
+        assert_eq!(song_rows.len(), 2);
+        for row in song_rows {
+            assert_eq!(row.tags["GENRE"], vec!["ambient"]);
+            assert_eq!(row.tags["MOOD"], vec!["dark"]);
+        }
+        let root = rows.iter().find(|row| row.stem == "root").unwrap();
+        assert!(!root.tags.contains_key("GENRE"));
+
+        let inserted = db
+            .assign_folder_tags(
+                Category::Music,
+                Path::new("/tmp/music"),
+                &[
+                    FolderTagAssignment {
+                        value: "ambient".to_string(),
+                        key: "GENRE".to_string(),
+                        enabled: true,
+                    },
+                    FolderTagAssignment {
+                        value: "dark".to_string(),
+                        key: "MOOD".to_string(),
+                        enabled: true,
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(inserted, 0);
     }
 
     #[test]

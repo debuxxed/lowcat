@@ -12,8 +12,8 @@ use crate::downloader::{
     DownloadRequest, DownloadState, DownloadStatus,
 };
 use crate::model::{
-    AudioFormat, Category, CategoryState, ConvertConflictBehavior, FileRecord, canonical_tag_key,
-    default_format_priority, tag_label,
+    AudioFormat, Category, CategoryState, ConvertConflictBehavior, FileRecord, FolderTagAssignment,
+    canonical_tag_key, default_format_priority, tag_label,
 };
 
 #[path = "config.rs"]
@@ -408,6 +408,67 @@ impl Library {
                 );
             }
         }
+    }
+
+    pub fn prepare_folder_tag_values(&mut self, cx: &mut Context<Self>) -> Vec<String> {
+        let category = self.active;
+        if let Err(error) = self.backend.refresh_category(category) {
+            eprintln!(
+                "lowcat folder tag refresh failed category={} error={error}",
+                category.label()
+            );
+            return Vec::new();
+        }
+        if let Err(error) = self.refresh_category_state(category) {
+            eprintln!(
+                "lowcat folder tag state refresh failed category={} error={error}",
+                category.label()
+            );
+        }
+        cx.notify();
+
+        match self.backend.folder_tag_values(category) {
+            Ok(values) => values,
+            Err(error) => {
+                eprintln!(
+                    "lowcat folder tag preview failed category={} error={error}",
+                    category.label()
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    pub fn assign_folder_tags(
+        &mut self,
+        category: Category,
+        assignments: Vec<FolderTagAssignment>,
+        cx: &mut Context<Self>,
+    ) {
+        let inserted = match self.backend.assign_folder_tags(category, &assignments) {
+            Ok(count) => count,
+            Err(error) => {
+                eprintln!(
+                    "lowcat folder tag assignment failed category={} error={error}",
+                    category.label()
+                );
+                0
+            }
+        };
+        if let Err(error) = self.refresh_category_state(category) {
+            eprintln!(
+                "lowcat folder tag state refresh failed category={} error={error}",
+                category.label()
+            );
+        }
+        debug_library_interaction(|| {
+            format!(
+                "folder_tags category={} assignments={} inserted={inserted}",
+                category.label(),
+                assignments.len()
+            )
+        });
+        cx.notify();
     }
 
     pub fn move_format_priority_up(&mut self, format: AudioFormat, cx: &mut Context<Self>) {
@@ -1303,6 +1364,49 @@ mod tests {
         );
         let priority = library.read_with(cx, |lib, _| lib.format_priority().to_vec());
         assert_eq!(priority[0], AudioFormat::Mp3);
+    }
+
+    #[gpui::test]
+    fn folder_tag_assignment_updates_active_category(cx: &mut gpui::TestAppContext) {
+        let settings_path = settings_path("folder-tags");
+        let (music_dir, sfx_dir) = settings_with_folders(&settings_path);
+        fs::create_dir_all(music_dir.join("ambient/dark")).unwrap();
+        fs::write(music_dir.join("ambient/dark/pad.wav"), b"not audio").unwrap();
+        fs::create_dir_all(sfx_dir.join("foley/impact")).unwrap();
+        fs::write(sfx_dir.join("foley/impact/hit.wav"), b"not audio").unwrap();
+        let library = cx.new(|_| Library::new_with_settings_path(settings_path));
+
+        let values = library.update(cx, |lib, cx| lib.prepare_folder_tag_values(cx));
+        assert_eq!(values, vec!["ambient", "dark"]);
+
+        library.update(cx, |lib, cx| {
+            lib.assign_folder_tags(
+                Category::Music,
+                vec![
+                    FolderTagAssignment {
+                        value: "ambient".to_string(),
+                        key: "Genre".to_string(),
+                        enabled: true,
+                    },
+                    FolderTagAssignment {
+                        value: "dark".to_string(),
+                        key: "Mood".to_string(),
+                        enabled: true,
+                    },
+                ],
+                cx,
+            );
+        });
+
+        let (music_tags, sfx_tags) = library.read_with(cx, |lib, _| {
+            (
+                lib.states[&Category::Music].results[0].tags.clone(),
+                lib.states[&Category::Sfx].results[0].tags.clone(),
+            )
+        });
+        assert_eq!(music_tags["Genre"], vec!["ambient"]);
+        assert_eq!(music_tags["Mood"], vec!["dark"]);
+        assert!(!sfx_tags.contains_key("Type"));
     }
 
     #[gpui::test]

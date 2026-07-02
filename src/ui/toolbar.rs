@@ -7,6 +7,7 @@ use gpui_component::{
     ActiveTheme as _, Icon, IconName, Selectable, Sizable, StyledExt,
     button::{Button, ButtonVariants as _},
     input::{Input, InputEvent, InputState},
+    menu::{ContextMenuExt as _, PopupMenuItem},
 };
 
 use crate::library::Library;
@@ -139,6 +140,9 @@ impl Render for Toolbar {
 
         for (key, value) in chips {
             let chip_id = format!("chip:{key}:{value}");
+            let menu_key = key.clone();
+            let menu_value = value.clone();
+            let menu_library = self.library.clone();
             let chip_bg = if self.alt_down && self.hovered_chip.as_deref() == Some(chip_id.as_str())
             {
                 chip_delete_bg
@@ -191,7 +195,19 @@ impl Render for Toolbar {
                                         lib.remove_value(&key.clone(), &value.clone(), cx);
                                     });
                                 }
-                            })),
+                            }))
+                            .context_menu(move |menu, _, _| {
+                                let library = menu_library.clone();
+                                let key = menu_key.clone();
+                                let value = menu_value.clone();
+                                menu.item(PopupMenuItem::new("Remove Filter").on_click(
+                                    move |_, _, cx| {
+                                        library.update(cx, |lib, cx| {
+                                            lib.remove_value(&key, &value, cx);
+                                        });
+                                    },
+                                ))
+                            }),
                     ),
             );
         }
