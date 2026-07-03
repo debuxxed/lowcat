@@ -247,24 +247,22 @@ pub fn tag_label(key: &str) -> &str {
     }
 }
 
-/// A record matches iff its name contains `search` (case-insensitive) AND, for every
-/// key with checked values, the record's values for that key contain all of them.
+/// A record matches iff its name fuzzy-matches `search` (case-insensitive
+/// ordered characters) AND, for every key with checked values, the record's
+/// values for that key contain all of them.
 pub fn record_matches(
     record: &FileRecord,
     search: &str,
     selected: &BTreeMap<String, BTreeSet<String>>,
 ) -> bool {
-    let search = search.to_lowercase();
-    let filename_match = record.name.to_lowercase().contains(&search)
+    let filename_match = fuzzy_search_match(&record.name, search)
         || record
             .variants
             .iter()
-            .any(|variant| variant.extension.to_lowercase().contains(&search))
+            .any(|variant| fuzzy_search_match(&variant.extension, search))
         || record.tags.iter().any(|(key, values)| {
-            key.to_lowercase().contains(&search)
-                || values
-                    .iter()
-                    .any(|value| value.to_lowercase().contains(&search))
+            fuzzy_search_match(key, search)
+                || values.iter().any(|value| fuzzy_search_match(value, search))
         });
     if !filename_match {
         return false;
@@ -283,6 +281,15 @@ pub fn record_matches(
         }
     }
     true
+}
+
+fn fuzzy_search_match(text: &str, search: &str) -> bool {
+    let text = text.to_lowercase();
+    let mut text_chars = text.chars();
+    search
+        .to_lowercase()
+        .chars()
+        .all(|query_ch| text_chars.any(|text_ch| text_ch == query_ch))
 }
 
 #[cfg(test)]
@@ -330,11 +337,19 @@ mod tests {
     }
 
     #[test]
-    fn search_is_case_insensitive_substring() {
+    fn search_is_case_insensitive_fuzzy_match() {
         let r = rec("Pulse_Drive.ogg", &[]);
         assert!(record_matches(&r, "drive", &BTreeMap::new()));
         assert!(record_matches(&r, "PULSE", &BTreeMap::new()));
+        assert!(record_matches(&r, "psdv", &BTreeMap::new()));
         assert!(!record_matches(&r, "ambient", &BTreeMap::new()));
+        assert!(!record_matches(&r, "drive pulse", &BTreeMap::new()));
+    }
+
+    #[test]
+    fn fuzzy_search_skips_unqueried_punctuation() {
+        let r = rec("it's me.wav", &[]);
+        assert!(record_matches(&r, "its m", &BTreeMap::new()));
     }
 
     #[test]

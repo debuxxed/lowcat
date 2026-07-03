@@ -761,7 +761,7 @@ impl Database {
         }
         sql.push_str(" ORDER BY lower(f.stem), f.stem");
 
-        let search_pattern = like_contains_pattern(search);
+        let search_pattern = like_subsequence_pattern(search);
         let rows = block_on(async {
             let mut query = sqlx::query(&sql).bind(category_key(category));
             if !search.is_empty() {
@@ -1007,16 +1007,16 @@ fn placeholders(len: usize) -> String {
     std::iter::repeat_n("?", len).collect::<Vec<_>>().join(", ")
 }
 
-fn like_contains_pattern(value: &str) -> String {
-    let mut pattern = String::with_capacity(value.len() + 2);
+fn like_subsequence_pattern(value: &str) -> String {
+    let mut pattern = String::with_capacity(value.len() * 2 + 1);
     pattern.push('%');
     for ch in value.to_lowercase().chars() {
         if matches!(ch, '%' | '_' | '\\') {
             pattern.push('\\');
         }
         pattern.push(ch);
+        pattern.push('%');
     }
-    pattern.push('%');
     pattern
 }
 
@@ -1439,6 +1439,30 @@ mod tests {
             vec!["mp3", "flac"]
         );
         assert_eq!(rows[0].tags["GENRE"], vec!["Electronic"]);
+    }
+
+    #[test]
+    fn query_visible_rows_fuzzy_search_matches_characters_in_order() {
+        let db = Database::open(&db_path("sql-filter-fuzzy")).unwrap();
+
+        db.sync_category(
+            Category::Music,
+            vec![scan("it's me.flac", &[]), scan("mist.flac", &[])],
+        )
+        .unwrap();
+
+        let rows = db
+            .query_visible_rows(
+                Category::Music,
+                "its m",
+                &BTreeMap::new(),
+                &default_format_priority(),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "it's me");
     }
 
     #[test]
