@@ -350,6 +350,8 @@ impl FileTable {
         )
         .detach();
 
+        let hidden_tag_keys = library.read(cx).hidden_tag_column_keys();
+
         Self {
             library,
             tag_input,
@@ -373,7 +375,7 @@ impl FileTable {
             pending_drag: None,
             selected: BTreeSet::new(),
             selection_anchor: None,
-            hidden_tag_keys: BTreeSet::new(),
+            hidden_tag_keys,
             column_visibility_menu_position: None,
             hovered_column_visibility: None,
             row_scroll_handle: VirtualListScrollHandle::new(),
@@ -436,11 +438,12 @@ impl FileTable {
         let editing = Self::editing_cache_key(self.editing.as_ref());
         let (keys, row_count, widths) = {
             let state = self.library.read(cx).active_state();
-            let all_keys: BTreeSet<String> = state.schema.keys().cloned().collect();
-            self.hidden_tag_keys.retain(|key| all_keys.contains(key));
-            let keys: Vec<String> = all_keys
+            let keys: Vec<String> = state
+                .schema
+                .keys()
+                .filter(|key| !self.hidden_tag_keys.contains(*key))
+                .cloned()
                 .into_iter()
-                .filter(|key| !self.hidden_tag_keys.contains(key))
                 .collect();
             let row_count = state.results.len();
 
@@ -487,8 +490,14 @@ impl FileTable {
             .keys()
             .cloned()
             .collect();
-        self.hidden_tag_keys.retain(|key| keys.contains(key));
         keys.into_iter().collect()
+    }
+
+    fn persist_hidden_tag_columns(&self, cx: &mut Context<Self>) {
+        let hidden = self.hidden_tag_keys.clone();
+        self.library.update(cx, |lib, cx| {
+            lib.set_hidden_tag_column_keys(hidden, cx);
+        });
     }
 
     fn toggle_tag_column(&mut self, key: &str, cx: &mut Context<Self>) {
@@ -496,6 +505,7 @@ impl FileTable {
             self.hidden_tag_keys.insert(key.to_string());
         }
         self.tag_width_cache = None;
+        self.persist_hidden_tag_columns(cx);
         cx.notify();
     }
 
@@ -503,6 +513,7 @@ impl FileTable {
         if !self.hidden_tag_keys.is_empty() {
             self.hidden_tag_keys.clear();
             self.tag_width_cache = None;
+            self.persist_hidden_tag_columns(cx);
             cx.notify();
         }
     }
@@ -510,6 +521,7 @@ impl FileTable {
     fn hide_all_tag_columns(&mut self, keys: &[String], cx: &mut Context<Self>) {
         self.hidden_tag_keys = keys.iter().cloned().collect();
         self.tag_width_cache = None;
+        self.persist_hidden_tag_columns(cx);
         cx.notify();
     }
 
@@ -732,6 +744,12 @@ impl FileTable {
                         .occlude()
                         .on_mouse_down(
                             MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.close_column_visibility_menu(cx);
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
                             cx.listener(|this, _, _, cx| {
                                 this.close_column_visibility_menu(cx);
                             }),

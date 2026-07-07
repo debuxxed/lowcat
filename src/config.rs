@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     env, fs, io,
     path::{Path, PathBuf},
     str::FromStr,
@@ -14,6 +15,10 @@ pub struct Settings {
     category_folders: CategoryFolders,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     download_format: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    hidden_tag_groups: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    hidden_tag_columns: BTreeSet<String>,
 }
 
 impl Settings {
@@ -55,6 +60,22 @@ impl Settings {
 
     pub fn set_download_format(&mut self, format: AudioFormat) {
         self.download_format = Some(format.extension().to_string());
+    }
+
+    pub fn hidden_tag_groups(&self) -> BTreeSet<String> {
+        self.hidden_tag_groups.clone()
+    }
+
+    pub fn set_hidden_tag_groups(&mut self, keys: BTreeSet<String>) {
+        self.hidden_tag_groups = keys;
+    }
+
+    pub fn hidden_tag_columns(&self) -> BTreeSet<String> {
+        self.hidden_tag_columns.clone()
+    }
+
+    pub fn set_hidden_tag_columns(&mut self, keys: BTreeSet<String>) {
+        self.hidden_tag_columns = keys;
     }
 }
 

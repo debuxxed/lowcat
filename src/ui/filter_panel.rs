@@ -261,6 +261,12 @@ impl FilterPanel {
                                 this.close_tag_group_menu(cx);
                             }),
                         )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, _, _, cx| {
+                                this.close_tag_group_menu(cx);
+                            }),
+                        )
                         .child(
                             anchored()
                                 .position(position)

@@ -31,6 +31,7 @@ pub struct Library {
     filters_open: bool,
     tag_search: String,
     hidden_tag_keys: BTreeSet<String>,
+    hidden_tag_column_keys: BTreeSet<String>,
     downloader_open: bool,
     download_state: DownloadState,
     download_cancel: Option<DownloadCancel>,
@@ -119,6 +120,8 @@ impl Library {
             .convert_conflict_behavior()
             .unwrap_or(ConvertConflictBehavior::AddCopy);
         let download_format = settings.download_format();
+        let hidden_tag_keys = settings.hidden_tag_groups();
+        let hidden_tag_column_keys = settings.hidden_tag_columns();
         Self {
             backend,
             active: Category::Music,
@@ -130,7 +133,8 @@ impl Library {
             convert_conflict_behavior,
             filters_open: false,
             tag_search: String::new(),
-            hidden_tag_keys: BTreeSet::new(),
+            hidden_tag_keys,
+            hidden_tag_column_keys,
             downloader_open: false,
             download_state: DownloadState::Idle,
             download_cancel: None,
@@ -171,6 +175,10 @@ impl Library {
 
     pub fn tag_group_is_visible(&self, key: &str) -> bool {
         !self.hidden_tag_keys.contains(key)
+    }
+
+    pub fn hidden_tag_column_keys(&self) -> BTreeSet<String> {
+        self.hidden_tag_column_keys.clone()
     }
 
     pub fn downloader_open(&self) -> bool {
@@ -286,8 +294,19 @@ impl Library {
     }
 
     pub fn toggle_tag_group_visibility(&mut self, key: &str, cx: &mut Context<Self>) {
-        if !self.hidden_tag_keys.remove(key) {
-            self.hidden_tag_keys.insert(key.to_string());
+        let mut keys = self.hidden_tag_keys.clone();
+        if !keys.remove(key) {
+            keys.insert(key.to_string());
+        }
+        self.set_hidden_tag_groups(keys, cx);
+    }
+
+    pub fn set_hidden_tag_groups(&mut self, keys: BTreeSet<String>, cx: &mut Context<Self>) {
+        let mut settings = self.settings.clone();
+        settings.set_hidden_tag_groups(keys.clone());
+        if settings.save(&self.settings_path).is_ok() {
+            self.settings = settings;
+            self.hidden_tag_keys = keys;
         }
         cx.notify();
     }
@@ -296,12 +315,20 @@ impl Library {
         if self.hidden_tag_keys.is_empty() {
             return;
         }
-        self.hidden_tag_keys.clear();
-        cx.notify();
+        self.set_hidden_tag_groups(BTreeSet::new(), cx);
     }
 
     pub fn hide_all_tag_groups(&mut self, keys: &[String], cx: &mut Context<Self>) {
-        self.hidden_tag_keys = keys.iter().cloned().collect();
+        self.set_hidden_tag_groups(keys.iter().cloned().collect(), cx);
+    }
+
+    pub fn set_hidden_tag_column_keys(&mut self, keys: BTreeSet<String>, cx: &mut Context<Self>) {
+        let mut settings = self.settings.clone();
+        settings.set_hidden_tag_columns(keys.clone());
+        if settings.save(&self.settings_path).is_ok() {
+            self.settings = settings;
+            self.hidden_tag_column_keys = keys;
+        }
         cx.notify();
     }
 
@@ -1879,6 +1906,34 @@ mod tests {
         let restarted = cx.new(|_| Library::new_with_settings_path(settings_path));
         let persisted = restarted.read_with(cx, |lib, _| lib.download_format());
         assert_eq!(persisted, AudioFormat::Wav);
+    }
+
+    #[gpui::test]
+    fn tag_group_visibility_persists(cx: &mut gpui::TestAppContext) {
+        let settings_path = settings_path("tag-group-visibility");
+        let library = cx.new(|_| Library::new_with_settings_path(settings_path.clone()));
+
+        library.update(cx, |lib, cx| {
+            lib.toggle_tag_group_visibility("genre", cx);
+        });
+
+        let restarted = cx.new(|_| Library::new_with_settings_path(settings_path));
+        let visible = restarted.read_with(cx, |lib, _| lib.tag_group_is_visible("genre"));
+        assert!(!visible);
+    }
+
+    #[gpui::test]
+    fn tag_column_visibility_persists(cx: &mut gpui::TestAppContext) {
+        let settings_path = settings_path("tag-column-visibility");
+        let library = cx.new(|_| Library::new_with_settings_path(settings_path.clone()));
+
+        library.update(cx, |lib, cx| {
+            lib.set_hidden_tag_column_keys(BTreeSet::from(["genre".to_string()]), cx);
+        });
+
+        let restarted = cx.new(|_| Library::new_with_settings_path(settings_path));
+        let hidden = restarted.read_with(cx, |lib, _| lib.hidden_tag_column_keys());
+        assert!(hidden.contains("genre"));
     }
 
     #[gpui::test]
