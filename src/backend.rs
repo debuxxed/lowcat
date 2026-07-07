@@ -129,6 +129,24 @@ impl Backend {
         })
     }
 
+    pub fn add_tag_key(&mut self, category: Category, key: &str) -> io::Result<Option<String>> {
+        self.db.add_tag_key(category, key)
+    }
+
+    pub fn remove_tag_key(&mut self, category: Category, key: &str) -> io::Result<bool> {
+        self.db.remove_tag_key(category, key)
+    }
+
+    pub fn rename_tag_key(
+        &mut self,
+        category: Category,
+        old_key: &str,
+        new_key: &str,
+    ) -> io::Result<()> {
+        self.db.rename_tag_key(category, old_key, new_key)?;
+        self.refresh_category(category)
+    }
+
     pub fn add_tag(
         &mut self,
         category: Category,
@@ -136,9 +154,6 @@ impl Backend {
         key: &str,
         value: &str,
     ) -> io::Result<()> {
-        let Some(key) = canonical_category_key(category, key) else {
-            return Ok(());
-        };
         let stem = file_stem(path);
         self.db.add_tag(category, &stem, key, value)
     }
@@ -150,9 +165,6 @@ impl Backend {
         key: &str,
         value: &str,
     ) -> io::Result<()> {
-        let Some(key) = canonical_category_key(category, key) else {
-            return Ok(());
-        };
         let stem = file_stem(path);
         self.db.remove_tag(category, &stem, key, value)
     }
@@ -165,9 +177,6 @@ impl Backend {
         old_value: &str,
         new_value: &str,
     ) -> io::Result<()> {
-        let Some(key) = canonical_category_key(category, key) else {
-            return Ok(());
-        };
         let stem = file_stem(path);
         self.db
             .rename_stem_tag_value(category, &stem, key, old_value, new_value)

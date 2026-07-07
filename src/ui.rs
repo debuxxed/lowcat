@@ -150,6 +150,11 @@ impl UI {
             .update(cx, |table, cx| table.cancel_tag_edit(window, cx))
     }
 
+    fn cancel_column_visibility_menu(&mut self, cx: &mut Context<Self>) -> bool {
+        self.table
+            .update(cx, |table, cx| table.cancel_column_visibility_menu(cx))
+    }
+
     fn clear_selection(&mut self, cx: &mut Context<Self>) -> bool {
         self.table.update(cx, |table, cx| table.clear_selection(cx))
     }
@@ -351,6 +356,7 @@ impl UI {
             PendingDeleteKind::Rows if counts.row_count == 1 => "Move row to Trash?",
             PendingDeleteKind::Rows => "Move rows to Trash?",
             PendingDeleteKind::Format => "Move format file to Trash?",
+            PendingDeleteKind::TagKey => "Remove tag column?",
         };
         let file_label = pluralize(counts.file_count, "file", "files");
         let description = match counts.kind {
@@ -364,6 +370,11 @@ impl UI {
             PendingDeleteKind::Format => {
                 format!("Move {} {} to Trash?", counts.file_count, file_label)
             }
+            PendingDeleteKind::TagKey => "Remove this tag column and all values in it?".to_string(),
+        };
+        let confirm_label = match counts.kind {
+            PendingDeleteKind::Rows | PendingDeleteKind::Format => "Move to Trash",
+            PendingDeleteKind::TagKey => "Remove",
         };
 
         Some(
@@ -426,7 +437,7 @@ impl UI {
                                             Button::new("delete-confirm")
                                                 .small()
                                                 .danger()
-                                                .label("Move to Trash")
+                                                .label(confirm_label)
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.table.update(cx, |table, cx| {
                                                         table.confirm_pending_delete(cx);
@@ -447,6 +458,7 @@ impl UI {
             PendingRenameKind::Rows if details.item_count == 1 => "Rename row",
             PendingRenameKind::Rows => "Rename files",
             PendingRenameKind::TagAll => "Rename tag",
+            PendingRenameKind::TagKey => "Rename tag column",
         };
         let description = match details.kind {
             PendingRenameKind::Rows if details.item_count == 1 => {
@@ -460,6 +472,10 @@ impl UI {
             PendingRenameKind::TagAll => {
                 let name = details.current_name.unwrap_or_else(|| "tag".to_string());
                 format!("Rename all {name} tags")
+            }
+            PendingRenameKind::TagKey => {
+                let name = details.current_name.unwrap_or_else(|| "tag".to_string());
+                format!("Rename {name} column")
             }
         };
 
@@ -687,6 +703,10 @@ impl Render for UI {
                         return;
                     }
                     if this.cancel_tag_edit(window, cx) {
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if this.cancel_column_visibility_menu(cx) {
                         cx.stop_propagation();
                         return;
                     }

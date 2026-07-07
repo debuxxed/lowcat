@@ -12,12 +12,13 @@ use sqlx::{Row, SqlitePool};
 
 use crate::model::{
     AudioFormat, Category, ConvertConflictBehavior, FileRecord, FileSupport, FileVariant,
-    FolderTagAssignment, canonical_tag_key, default_format_priority, normalize_format_priority,
-    record_matches,
+    FolderTagAssignment, default_format_priority, normalize_format_priority, normalize_tag_key,
+    normalize_tag_value, record_matches,
 };
 
 const FORMAT_PRIORITY_KEY: &str = "format_priority";
 const CONVERT_CONFLICT_KEY: &str = "convert_conflict";
+const DEFAULT_TAG_KEYS_SEEDED_KEY: &str = "default_tag_keys_seeded";
 
 pub struct Database {
     pool: SqlitePool,
@@ -85,7 +86,9 @@ impl Database {
                 "CREATE INDEX IF NOT EXISTS files_category_stem ON files(category, stem)",
                 "CREATE INDEX IF NOT EXISTS files_search ON files(category, search_text)",
                 "CREATE TABLE IF NOT EXISTS tag_keys (
-                    key TEXT PRIMARY KEY
+                    category TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    PRIMARY KEY(category, key)
                 )",
                 "CREATE TABLE IF NOT EXISTS tag_values (
                     category TEXT NOT NULL,
@@ -102,16 +105,10 @@ impl Database {
             ] {
                 sqlx::query(sql).execute(&self.pool).await?;
             }
+            migrate_tag_keys(&self.pool).await?;
             migrate_files_first_seen_at(&self.pool).await?;
-
-            for category in Category::ALL {
-                for key in category.tag_keys() {
-                    sqlx::query("INSERT OR IGNORE INTO tag_keys(key) VALUES (?)")
-                        .bind(*key)
-                        .execute(&self.pool)
-                        .await?;
-                }
-            }
+            seed_tag_keys_from_values(&self.pool).await?;
+            seed_default_tag_keys(&self.pool).await?;
 
             Ok::<_, sqlx::Error>(())
         })
@@ -207,20 +204,24 @@ impl Database {
                 .get("count");
                 if !existing_stems.contains(&record.stem) && tag_count == 0 {
                     for (key, values) in record.tags {
-                        let Some(key) = canonical_tag_key(&key) else {
+                        let Some(key) = normalize_tag_key(&key) else {
                             continue;
                         };
-                        if !category.tag_keys().contains(&key) {
-                            continue;
-                        }
+                        let key = canonical_existing_tag_key(&self.pool, category, &key)
+                            .await?
+                            .unwrap_or(key);
+                        ensure_tag_key(&self.pool, category, &key).await?;
                         for value in values {
+                            let Some(value) = normalize_tag_value(&value) else {
+                                continue;
+                            };
                             sqlx::query(
                                 "INSERT OR IGNORE INTO tag_values(category, stem, key, value)
                                  VALUES (?, ?, ?, ?)",
                             )
                             .bind(category_key)
                             .bind(&record.stem)
-                            .bind(key)
+                            .bind(&key)
                             .bind(value)
                             .execute(&self.pool)
                             .await?;
@@ -375,18 +376,18 @@ impl Database {
         })
         .map_err(io::Error::other)?;
 
-        let mut schema: BTreeMap<String, BTreeSet<String>> = category
-            .tag_keys()
-            .iter()
-            .map(|key| ((*key).to_string(), BTreeSet::new()))
+        let mut schema: BTreeMap<String, BTreeSet<String>> = self
+            .tag_keys(category)?
+            .into_iter()
+            .map(|key| (key, BTreeSet::new()))
             .collect();
         for row in rows {
             let key: String = row.get("key");
             let value: String = row.get("value");
-            if let Some(key) = canonical_tag_key(&key)
-                && category.tag_keys().contains(&key)
+            if let Some(key) = normalize_tag_key(&key)
+                && let Some(value) = normalize_tag_value(&value)
             {
-                schema.entry(key.to_string()).or_default().insert(value);
+                schema.entry(key).or_default().insert(value);
             }
         }
 
@@ -396,6 +397,123 @@ impl Database {
             .collect())
     }
 
+    pub fn tag_keys(&self, category: Category) -> io::Result<Vec<String>> {
+        let rows = block_on(async {
+            sqlx::query(
+                "SELECT key FROM tag_keys
+                 WHERE category = ?
+                 ORDER BY key COLLATE NOCASE",
+            )
+            .bind(category_key(category))
+            .fetch_all(&self.pool)
+            .await
+        })
+        .map_err(io::Error::other)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| row.get::<String, _>("key"))
+            .collect())
+    }
+
+    pub fn add_tag_key(&self, category: Category, key: &str) -> io::Result<Option<String>> {
+        let Some(key) = self.canonical_tag_key(category, key)? else {
+            return Ok(None);
+        };
+        block_on(async {
+            ensure_tag_key(&self.pool, category, &key).await?;
+            Ok::<_, sqlx::Error>(())
+        })
+        .map_err(io::Error::other)?;
+        Ok(Some(key))
+    }
+
+    pub fn remove_tag_key(&self, category: Category, key: &str) -> io::Result<bool> {
+        let Some(key) = self.canonical_tag_key(category, key)? else {
+            return Ok(false);
+        };
+        block_on(async {
+            let category_key = category_key(category);
+            let mut tx = self.pool.begin().await?;
+            sqlx::query("DELETE FROM tag_values WHERE category = ? AND key = ?")
+                .bind(category_key)
+                .bind(&key)
+                .execute(&mut *tx)
+                .await?;
+            let deleted_key = sqlx::query("DELETE FROM tag_keys WHERE category = ? AND key = ?")
+                .bind(category_key)
+                .bind(&key)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(deleted_key > 0)
+        })
+        .map_err(io::Error::other)
+    }
+
+    pub fn rename_tag_key(
+        &self,
+        category: Category,
+        old_key: &str,
+        new_key: &str,
+    ) -> io::Result<()> {
+        let Some(old_key) = self.canonical_tag_key(category, old_key)? else {
+            return Ok(());
+        };
+        let Some(new_key) = self.canonical_tag_key(category, new_key)? else {
+            return Ok(());
+        };
+        if old_key == new_key {
+            return Ok(());
+        }
+        block_on(async {
+            let category_key = category_key(category);
+            let mut tx = self.pool.begin().await?;
+            sqlx::query("INSERT OR IGNORE INTO tag_keys(category, key) VALUES (?, ?)")
+                .bind(category_key)
+                .bind(&new_key)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "INSERT OR IGNORE INTO tag_values(category, stem, key, value)
+                 SELECT category, stem, ?, value
+                 FROM tag_values
+                 WHERE category = ? AND key = ?",
+            )
+            .bind(&new_key)
+            .bind(category_key)
+            .bind(&old_key)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("DELETE FROM tag_values WHERE category = ? AND key = ?")
+                .bind(category_key)
+                .bind(&old_key)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM tag_keys WHERE category = ? AND key = ?")
+                .bind(category_key)
+                .bind(&old_key)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(())
+        })
+        .map_err(io::Error::other)
+    }
+
+    fn canonical_tag_key(&self, category: Category, key: &str) -> io::Result<Option<String>> {
+        let Some(key) = normalize_tag_key(key) else {
+            return Ok(None);
+        };
+        block_on(async {
+            canonical_existing_tag_key(&self.pool, category, &key)
+                .await
+                .map(|existing| Some(existing.unwrap_or(key)))
+        })
+        .map_err(io::Error::other)
+    }
+
     pub fn add_tag(
         &self,
         category: Category,
@@ -403,19 +521,20 @@ impl Database {
         key: &str,
         value: &str,
     ) -> io::Result<()> {
-        let Some(key) = canonical_tag_key(key) else {
+        let Some(key) = self.canonical_tag_key(category, key)? else {
             return Ok(());
         };
-        if !category.tag_keys().contains(&key) {
+        let Some(value) = normalize_tag_value(value) else {
             return Ok(());
-        }
+        };
         block_on(async {
+            ensure_tag_key(&self.pool, category, &key).await?;
             sqlx::query(
                 "INSERT OR IGNORE INTO tag_values(category, stem, key, value) VALUES (?, ?, ?, ?)",
             )
             .bind(category_key(category))
             .bind(stem)
-            .bind(key)
+            .bind(&key)
             .bind(value)
             .execute(&self.pool)
             .await?;
@@ -431,7 +550,10 @@ impl Database {
         key: &str,
         value: &str,
     ) -> io::Result<()> {
-        let Some(key) = canonical_tag_key(key) else {
+        let Some(key) = self.canonical_tag_key(category, key)? else {
+            return Ok(());
+        };
+        let Some(value) = normalize_tag_value(value) else {
             return Ok(());
         };
         block_on(async {
@@ -440,7 +562,7 @@ impl Database {
             )
             .bind(category_key(category))
             .bind(stem)
-            .bind(key)
+            .bind(&key)
             .bind(value)
             .execute(&self.pool)
             .await?;
@@ -457,12 +579,18 @@ impl Database {
         old_value: &str,
         new_value: &str,
     ) -> io::Result<()> {
-        let Some(key) = canonical_tag_key(key) else {
+        let Some(key) = self.canonical_tag_key(category, key)? else {
             return Ok(());
         };
-        if !category.tag_keys().contains(&key) || old_value == new_value {
+        if old_value == new_value {
             return Ok(());
         }
+        let Some(old_value) = normalize_tag_value(old_value) else {
+            return Ok(());
+        };
+        let Some(new_value) = normalize_tag_value(new_value) else {
+            return Ok(());
+        };
         block_on(async {
             let category = category_key(category);
             let mut tx = self.pool.begin().await?;
@@ -475,8 +603,8 @@ impl Database {
             .bind(new_value)
             .bind(category)
             .bind(stem)
-            .bind(key)
-            .bind(old_value)
+            .bind(&key)
+            .bind(&old_value)
             .execute(&mut *tx)
             .await?;
             sqlx::query(
@@ -485,8 +613,8 @@ impl Database {
             )
             .bind(category)
             .bind(stem)
-            .bind(key)
-            .bind(old_value)
+            .bind(&key)
+            .bind(&old_value)
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
@@ -536,12 +664,18 @@ impl Database {
         old_value: &str,
         new_value: &str,
     ) -> io::Result<()> {
-        let Some(key) = canonical_tag_key(key) else {
+        let Some(key) = self.canonical_tag_key(category, key)? else {
             return Ok(());
         };
-        if !category.tag_keys().contains(&key) || old_value == new_value {
+        if old_value == new_value {
             return Ok(());
         }
+        let Some(old_value) = normalize_tag_value(old_value) else {
+            return Ok(());
+        };
+        let Some(new_value) = normalize_tag_value(new_value) else {
+            return Ok(());
+        };
         block_on(async {
             let category = category_key(category);
             let mut tx = self.pool.begin().await?;
@@ -553,8 +687,8 @@ impl Database {
             )
             .bind(new_value)
             .bind(category)
-            .bind(key)
-            .bind(old_value)
+            .bind(&key)
+            .bind(&old_value)
             .execute(&mut *tx)
             .await?;
             sqlx::query(
@@ -562,8 +696,8 @@ impl Database {
                  WHERE category = ? AND key = ? AND value = ?",
             )
             .bind(category)
-            .bind(key)
-            .bind(old_value)
+            .bind(&key)
+            .bind(&old_value)
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
@@ -604,15 +738,15 @@ impl Database {
         category_folder: &Path,
         assignments: &[FolderTagAssignment],
     ) -> io::Result<usize> {
-        let assignments: BTreeMap<String, &'static str> = assignments
+        let assignments: BTreeMap<String, String> = assignments
             .iter()
             .filter(|assignment| assignment.enabled)
             .filter_map(|assignment| {
-                let key = canonical_tag_key(&assignment.key)?;
-                category
-                    .tag_keys()
-                    .contains(&key)
-                    .then(|| (assignment.value.clone(), key))
+                let key = self
+                    .canonical_tag_key(category, &assignment.key)
+                    .ok()
+                    .flatten()?;
+                Some((assignment.value.clone(), key))
             })
             .collect();
         if assignments.is_empty() {
@@ -621,6 +755,9 @@ impl Database {
 
         block_on(async {
             let category_key = category_key(category);
+            for key in assignments.values() {
+                ensure_tag_key(&self.pool, category, key).await?;
+            }
             let rows = sqlx::query(
                 "SELECT path, stem FROM files
                  WHERE category = ?
@@ -636,7 +773,7 @@ impl Database {
                 let path = PathBuf::from(row.get::<String, _>("path"));
                 let stem: String = row.get("stem");
                 for value in folder_tag_values(category_folder, &path) {
-                    let Some(key) = assignments.get(&value).copied() else {
+                    let Some(key) = assignments.get(&value) else {
                         continue;
                     };
                     let result = sqlx::query(
@@ -753,7 +890,7 @@ impl Database {
                         SELECT 1 FROM tag_values selected_tv
                         WHERE selected_tv.category = f.category
                           AND selected_tv.stem = f.stem
-                          AND selected_tv.key = ?
+                          AND lower(selected_tv.key) = lower(?)
                           AND selected_tv.value = ?
                     )",
                 );
@@ -921,6 +1058,119 @@ async fn migrate_files_first_seen_at(pool: &SqlitePool) -> Result<(), sqlx::Erro
     Ok(())
 }
 
+async fn migrate_tag_keys(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let columns = sqlx::query("PRAGMA table_info(tag_keys)")
+        .fetch_all(pool)
+        .await?;
+    let has_category = columns
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "category");
+    if has_category {
+        return Ok(());
+    }
+
+    let legacy_keys = sqlx::query("SELECT key FROM tag_keys")
+        .fetch_all(pool)
+        .await?;
+    sqlx::query("ALTER TABLE tag_keys RENAME TO tag_keys_legacy")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "CREATE TABLE tag_keys (
+            category TEXT NOT NULL,
+            key TEXT NOT NULL,
+            PRIMARY KEY(category, key)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    for row in legacy_keys {
+        let key: String = row.get("key");
+        let Some(key) = normalize_tag_key(&key) else {
+            continue;
+        };
+        for category in legacy_tag_key_categories(&key) {
+            ensure_tag_key(pool, category, &key).await?;
+        }
+    }
+
+    sqlx::query("DROP TABLE tag_keys_legacy")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn seed_tag_keys_from_values(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let rows = sqlx::query("SELECT DISTINCT category, key FROM tag_values")
+        .fetch_all(pool)
+        .await?;
+    for row in rows {
+        let category: String = row.get("category");
+        let key: String = row.get("key");
+        let Some(category) = category_from_key(&category) else {
+            continue;
+        };
+        let Some(key) = normalize_tag_key(&key) else {
+            continue;
+        };
+        ensure_tag_key(pool, category, &key).await?;
+    }
+    Ok(())
+}
+
+async fn seed_default_tag_keys(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let seeded = sqlx::query("SELECT value FROM settings WHERE key = ?")
+        .bind(DEFAULT_TAG_KEYS_SEEDED_KEY)
+        .fetch_optional(pool)
+        .await?;
+    if seeded.is_some() {
+        return Ok(());
+    }
+
+    for category in Category::ALL {
+        for key in category.tag_keys() {
+            ensure_tag_key(pool, category, key).await?;
+        }
+    }
+    sqlx::query("INSERT OR REPLACE INTO settings(key, value) VALUES (?, '1')")
+        .bind(DEFAULT_TAG_KEYS_SEEDED_KEY)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn canonical_existing_tag_key(
+    pool: &SqlitePool,
+    category: Category,
+    key: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query(
+        "SELECT key FROM tag_keys
+         WHERE category = ? AND lower(key) = lower(?)
+         ORDER BY key COLLATE NOCASE
+         LIMIT 1",
+    )
+    .bind(category_key(category))
+    .bind(key)
+    .fetch_optional(pool)
+    .await
+    .map(|row| row.map(|row| row.get("key")))
+}
+
+async fn ensure_tag_key(
+    pool: &SqlitePool,
+    category: Category,
+    key: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT OR IGNORE INTO tag_keys(category, key) VALUES (?, ?)")
+        .bind(category_key(category))
+        .bind(key)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 fn current_unix_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1003,6 +1253,26 @@ fn category_key(category: Category) -> &'static str {
     }
 }
 
+fn category_from_key(key: &str) -> Option<Category> {
+    match key {
+        "music" => Some(Category::Music),
+        "sfx" => Some(Category::Sfx),
+        _ => None,
+    }
+}
+
+fn legacy_tag_key_categories(key: &str) -> Vec<Category> {
+    let categories: Vec<Category> = Category::ALL
+        .into_iter()
+        .filter(|category| category.tag_keys().contains(&key))
+        .collect();
+    if categories.is_empty() {
+        Category::ALL.to_vec()
+    } else {
+        categories
+    }
+}
+
 fn placeholders(len: usize) -> String {
     std::iter::repeat_n("?", len).collect::<Vec<_>>().join(", ")
 }
@@ -1047,10 +1317,10 @@ fn canonical_selected(
 ) -> BTreeMap<String, BTreeSet<String>> {
     let mut out = BTreeMap::new();
     for (key, values) in selected {
-        if let Some(key) = canonical_tag_key(key) {
+        if let Some(key) = normalize_tag_key(key) {
             out.entry(key.to_string())
                 .or_insert_with(BTreeSet::new)
-                .extend(values.iter().cloned());
+                .extend(values.iter().filter_map(|value| normalize_tag_value(value)));
         }
     }
     out

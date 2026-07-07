@@ -7,14 +7,15 @@ use std::rc::Rc;
 
 use futures::{StreamExt as _, channel::mpsc};
 use gpui::{
-    AnyElement, App, AppContext as _, AsyncApp, ClickEvent, Context, DismissEvent, Entity,
+    Anchor, AnyElement, App, AppContext as _, AsyncApp, ClickEvent, Context, DismissEvent, Entity,
     FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyDownEvent, Keystroke,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions,
     Pixels, Point, Render, SharedString, Size, StatefulInteractiveElement as _, Styled, Window,
-    div, hsla, prelude::FluentBuilder as _, px, red, size,
+    anchored, deferred, div, hsla, prelude::FluentBuilder as _, px, red, size,
 };
 use gpui_component::{
-    ActiveTheme as _, Sizable, StyledExt, VirtualListScrollHandle,
+    ActiveTheme as _, Icon, IconName, Sizable, StyledExt, VirtualListScrollHandle,
+    button::{Button, ButtonVariants as _},
     input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt as _, PopupMenuItem},
     scroll::{ScrollableElement, ScrollbarAxis},
@@ -36,6 +37,8 @@ const TAG_COLUMN_MIN_WIDTH: f32 = TAG_CELL_X_PADDING_WIDTH + TAG_ADD_BUTTON_WIDT
 const TAG_GAP_WIDTH: f32 = 4.;
 const TAG_TEXT_WIDTH: f32 = 7.;
 const TAG_EDITOR_WIDTH: f32 = 90.;
+const TAG_KEY_ACTION_WIDTH: f32 = 32.;
+const TAG_KEY_EDITOR_WIDTH: f32 = 118.;
 const FILE_DRAG_THRESHOLD_PX: f32 = 4.;
 const CONVERT_MENU_PANE_WIDTH: f32 = 160.;
 const ROW_HEIGHT: Pixels = px(32.);
@@ -73,10 +76,11 @@ struct TagChipTarget {
     value: String,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum DeleteKind {
     Rows,
     Format,
+    TagKey { key: String },
 }
 
 #[derive(Clone)]
@@ -93,6 +97,7 @@ struct RenameTarget {
 enum RenameKind {
     Rows { records: Vec<RowRenameTarget> },
     TagAll { key: String, old_value: String },
+    TagKey { old_key: String },
 }
 
 #[derive(Clone)]
@@ -135,6 +140,7 @@ pub(crate) struct PendingDeleteCounts {
 pub(crate) enum PendingDeleteKind {
     Rows,
     Format,
+    TagKey,
 }
 
 pub(crate) struct PendingRenameDetails {
@@ -148,17 +154,27 @@ pub(crate) struct PendingRenameDetails {
 pub(crate) enum PendingRenameKind {
     Rows,
     TagAll,
+    TagKey,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum ColumnVisibilityHover {
+    Key(String),
+    ToggleAll,
 }
 
 pub struct FileTable {
     library: Entity<Library>,
     tag_input: Entity<InputState>,
+    tag_key_input: Entity<InputState>,
     rename_input: Entity<InputState>,
     editing: Option<TagEdit>,
+    creating_tag_key: bool,
     focus_handle: FocusHandle,
     alt_down: bool,
     hovered_row: Option<PathBuf>,
     hovered_tag_chip: Option<TagChipTarget>,
+    hovered_tag_key: Option<String>,
     hovered_format_chip: Option<PathBuf>,
     hovered_delete_row: Option<PathBuf>,
     pending_delete: Option<PendingDelete>,
@@ -170,6 +186,9 @@ pub struct FileTable {
     pending_drag: Option<PendingFileDrag>,
     selected: BTreeSet<PathBuf>,
     selection_anchor: Option<PathBuf>,
+    hidden_tag_keys: BTreeSet<String>,
+    column_visibility_menu_position: Option<Point<Pixels>>,
+    hovered_column_visibility: Option<ColumnVisibilityHover>,
     row_scroll_handle: VirtualListScrollHandle,
     row_sizes: Rc<Vec<Size<Pixels>>>,
     row_sizes_len: usize,
@@ -264,6 +283,7 @@ impl FileTable {
             LibraryEvent::TagEdited { path } => {
                 this.tag_width_cache = None;
                 this.hovered_tag_chip = None;
+                this.hovered_tag_key = None;
                 if this.hovered_row.as_ref() == Some(path) {
                     this.hovered_delete_row = Some(path.clone());
                 }
@@ -273,6 +293,7 @@ impl FileTable {
         .detach();
 
         let tag_input = cx.new(|cx| InputState::new(window, cx));
+        let tag_key_input = cx.new(|cx| InputState::new(window, cx));
         let rename_input = cx.new(|cx| InputState::new(window, cx));
 
         cx.subscribe_in(
@@ -284,6 +305,21 @@ impl FileTable {
                     this.commit_tag_edit(value, window, cx);
                 }
                 InputEvent::Blur => this.cancel_tag(window, cx),
+                _ => {}
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &tag_key_input,
+            window,
+            |this, state, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } => {
+                    let key = state.read(cx).value().to_string();
+                    this.commit_tag_key(key, window, cx);
+                }
+                InputEvent::Blur => {
+                    this.cancel_tag_key(window, cx);
+                }
                 _ => {}
             },
         )
@@ -303,12 +339,15 @@ impl FileTable {
         Self {
             library,
             tag_input,
+            tag_key_input,
             rename_input,
             editing: None,
+            creating_tag_key: false,
             focus_handle: cx.focus_handle(),
             alt_down: false,
             hovered_row: None,
             hovered_tag_chip: None,
+            hovered_tag_key: None,
             hovered_format_chip: None,
             hovered_delete_row: None,
             pending_delete: None,
@@ -320,6 +359,9 @@ impl FileTable {
             pending_drag: None,
             selected: BTreeSet::new(),
             selection_anchor: None,
+            hidden_tag_keys: BTreeSet::new(),
+            column_visibility_menu_position: None,
+            hovered_column_visibility: None,
             row_scroll_handle: VirtualListScrollHandle::new(),
             row_sizes: Rc::new(Vec::new()),
             row_sizes_len: 0,
@@ -376,7 +418,12 @@ impl FileTable {
         let editing = Self::editing_cache_key(self.editing.as_ref());
         let (keys, row_count, widths) = {
             let state = self.library.read(cx).active_state();
-            let keys: Vec<String> = state.schema.keys().cloned().collect();
+            let all_keys: BTreeSet<String> = state.schema.keys().cloned().collect();
+            self.hidden_tag_keys.retain(|key| all_keys.contains(key));
+            let keys: Vec<String> = all_keys
+                .into_iter()
+                .filter(|key| !self.hidden_tag_keys.contains(key))
+                .collect();
             let row_count = state.results.len();
 
             if let Some(cache) = self.tag_width_cache.as_ref()
@@ -413,6 +460,292 @@ impl FileTable {
         (keys, widths, row_count)
     }
 
+    fn tag_column_keys(&mut self, cx: &mut Context<Self>) -> Vec<String> {
+        let keys: BTreeSet<String> = self
+            .library
+            .read(cx)
+            .active_state()
+            .schema
+            .keys()
+            .cloned()
+            .collect();
+        self.hidden_tag_keys.retain(|key| keys.contains(key));
+        keys.into_iter().collect()
+    }
+
+    fn toggle_tag_column(&mut self, key: &str, cx: &mut Context<Self>) {
+        if !self.hidden_tag_keys.remove(key) {
+            self.hidden_tag_keys.insert(key.to_string());
+        }
+        self.tag_width_cache = None;
+        cx.notify();
+    }
+
+    fn show_all_tag_columns(&mut self, cx: &mut Context<Self>) {
+        if !self.hidden_tag_keys.is_empty() {
+            self.hidden_tag_keys.clear();
+            self.tag_width_cache = None;
+            cx.notify();
+        }
+    }
+
+    fn hide_all_tag_columns(&mut self, keys: &[String], cx: &mut Context<Self>) {
+        self.hidden_tag_keys = keys.iter().cloned().collect();
+        self.tag_width_cache = None;
+        cx.notify();
+    }
+
+    fn open_column_visibility_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_handle.focus(window, cx);
+        self.column_visibility_menu_position = Some(position);
+        self.hovered_column_visibility = None;
+        cx.notify();
+    }
+
+    fn close_column_visibility_menu(&mut self, cx: &mut Context<Self>) -> bool {
+        let closed = self.column_visibility_menu_position.take().is_some()
+            || self.hovered_column_visibility.take().is_some();
+        if closed {
+            cx.notify();
+        }
+        closed
+    }
+
+    pub(crate) fn cancel_column_visibility_menu(&mut self, cx: &mut Context<Self>) -> bool {
+        self.close_column_visibility_menu(cx)
+    }
+
+    fn set_column_visibility_hovered(
+        &mut self,
+        target: ColumnVisibilityHover,
+        hovered: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if hovered {
+            if self.hovered_column_visibility.as_ref() != Some(&target) {
+                self.hovered_column_visibility = Some(target);
+                cx.notify();
+            }
+        } else if self.hovered_column_visibility.as_ref() == Some(&target) {
+            self.hovered_column_visibility = None;
+            cx.notify();
+        }
+    }
+
+    fn column_visibility_row(label: impl Into<SharedString>, checked: bool) -> gpui::Div {
+        div()
+            .h_flex()
+            .h(px(26.))
+            .w_full()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .rounded_md()
+            .text_sm()
+            .cursor_pointer()
+            .child(
+                div()
+                    .size_4()
+                    .h_flex()
+                    .items_center()
+                    .justify_center()
+                    .when(checked, |el| el.child(Icon::new(IconName::Check).small())),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .whitespace_nowrap()
+                    .child(label.into()),
+            )
+    }
+
+    fn column_visibility_action_row(label: impl Into<SharedString>) -> gpui::Div {
+        div()
+            .h_flex()
+            .h(px(26.))
+            .w_full()
+            .items_center()
+            .px_2()
+            .rounded_md()
+            .text_sm()
+            .cursor_pointer()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .whitespace_nowrap()
+                    .child(label.into()),
+            )
+    }
+
+    fn render_column_visibility_menu(
+        &self,
+        keys: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let position = self.column_visibility_menu_position?;
+        let window_size = window.bounds().size;
+        let all_visible = keys
+            .iter()
+            .all(|key| !self.hidden_tag_keys.contains(key.as_str()));
+        let toggle_label = if all_visible { "Hide All" } else { "Show All" };
+
+        let mut rows = div().v_flex().gap_y_0p5();
+        if keys.is_empty() {
+            rows = rows.child(
+                div()
+                    .h_flex()
+                    .h(px(26.))
+                    .w_full()
+                    .items_center()
+                    .px_2()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("No tag columns"),
+            );
+        } else {
+            rows = rows.child(
+                div()
+                    .h_flex()
+                    .h(px(26.))
+                    .w_full()
+                    .items_center()
+                    .px_2()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Tag Columns"),
+            );
+
+            for key in &keys {
+                let checked = !self.hidden_tag_keys.contains(key.as_str());
+                let item_key = key.clone();
+                let hover_target = ColumnVisibilityHover::Key(key.clone());
+                let row_hovered = self.hovered_column_visibility.as_ref() == Some(&hover_target);
+                rows = rows.child(
+                    Self::column_visibility_row(SharedString::from(key.clone()), checked)
+                        .id(SharedString::from(format!("column-visibility-row:{key}")))
+                        .when(row_hovered, |el| {
+                            el.bg(cx.theme().accent)
+                                .text_color(cx.theme().accent_foreground)
+                        })
+                        .on_hover(cx.listener({
+                            let hover_target = hover_target.clone();
+                            move |this, hovered: &bool, _, cx| {
+                                this.set_column_visibility_hovered(
+                                    hover_target.clone(),
+                                    *hovered,
+                                    cx,
+                                );
+                            }
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                window.prevent_default();
+                                this.toggle_tag_column(&item_key, cx);
+                                window.refresh();
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
+                );
+            }
+
+            let toggle_hovered =
+                self.hovered_column_visibility.as_ref() == Some(&ColumnVisibilityHover::ToggleAll);
+
+            rows = rows
+                .child(
+                    div()
+                        .h_auto()
+                        .p_0()
+                        .my_0p5()
+                        .mx_neg_1()
+                        .border_b(px(2.))
+                        .border_color(cx.theme().border),
+                )
+                .child(
+                    Self::column_visibility_action_row(toggle_label)
+                        .id("column-visibility-toggle-all")
+                        .when(toggle_hovered, |el| {
+                            el.bg(cx.theme().accent)
+                                .text_color(cx.theme().accent_foreground)
+                        })
+                        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                            this.set_column_visibility_hovered(
+                                ColumnVisibilityHover::ToggleAll,
+                                *hovered,
+                                cx,
+                            );
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener({
+                                let keys = keys.clone();
+                                move |this, _, window, cx| {
+                                    window.prevent_default();
+                                    if all_visible {
+                                        this.hide_all_tag_columns(&keys, cx);
+                                    } else {
+                                        this.show_all_tag_columns(cx);
+                                    }
+                                    window.refresh();
+                                    cx.stop_propagation();
+                                }
+                            }),
+                        )
+                        .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
+                );
+        }
+
+        Some(
+            deferred(
+                anchored().child(
+                    div()
+                        .w(window_size.width)
+                        .h(window_size.height)
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.close_column_visibility_menu(cx);
+                            }),
+                        )
+                        .child(
+                            anchored()
+                                .position(position)
+                                .snap_to_window_with_margin(px(8.))
+                                .anchor(Anchor::TopLeft)
+                                .child(
+                                    div()
+                                        .id("column-visibility-menu")
+                                        .popover_style(cx)
+                                        .min_w(px(140.))
+                                        .max_w(px(260.))
+                                        .p_1()
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .on_mouse_down(MouseButton::Right, |_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .child(rows),
+                                ),
+                        ),
+                ),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
+
     fn row_sizes(&mut self, len: usize) -> Rc<Vec<Size<Pixels>>> {
         if self.row_sizes_len != len {
             self.row_sizes = Rc::new((0..len).map(|_| size(px(0.), ROW_HEIGHT)).collect());
@@ -430,6 +763,11 @@ impl FileTable {
 
     pub(crate) fn tag_editor_is_focused(&self, window: &Window, cx: &App) -> bool {
         self.tag_input.read(cx).focus_handle(cx).is_focused(window)
+            || self
+                .tag_key_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
     }
 
     pub(crate) fn rename_input_is_focused(&self, window: &Window, cx: &App) -> bool {
@@ -456,6 +794,42 @@ impl FileTable {
             state.focus(window, cx);
         });
         cx.notify();
+    }
+
+    fn start_creating_tag_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.creating_tag_key = true;
+        self.tag_key_input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+            state.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn commit_tag_key(&mut self, raw: String, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.creating_tag_key {
+            return;
+        }
+        self.creating_tag_key = false;
+        let key = raw.trim().to_string();
+        if !key.is_empty() {
+            debug_table_interaction(|| format!("tag key add key={key}"));
+            self.library.update(cx, |lib, cx| {
+                lib.add_tag_key(&key, cx);
+            });
+        }
+        self.focus_handle.focus(window, cx);
+        window.refresh();
+        cx.notify();
+    }
+
+    fn cancel_tag_key(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.creating_tag_key {
+            self.creating_tag_key = false;
+            self.focus_handle.focus(window, cx);
+            cx.notify();
+            return true;
+        }
+        false
     }
 
     fn start_renaming_tag(
@@ -527,7 +901,9 @@ impl FileTable {
     }
 
     pub(crate) fn cancel_tag_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.editing.is_some() {
+        if self.cancel_tag_key(window, cx) {
+            true
+        } else if self.editing.is_some() {
             self.cancel_tag(window, cx);
             true
         } else {
@@ -770,6 +1146,16 @@ impl FileTable {
         }
     }
 
+    fn tag_key_delete_target(key: &str) -> DeleteTarget {
+        DeleteTarget {
+            kind: DeleteKind::TagKey {
+                key: key.to_string(),
+            },
+            row_count: 0,
+            paths: Vec::new(),
+        }
+    }
+
     fn selected_delete_target(&self, cx: &mut Context<Self>) -> Option<DeleteTarget> {
         if self.selected.is_empty() {
             return None;
@@ -827,13 +1213,18 @@ impl FileTable {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if target.paths.is_empty() {
+        if target.paths.is_empty() && !matches!(target.kind, DeleteKind::TagKey { .. }) {
             return;
         }
 
         self.pending_delete = Some(PendingDelete { target });
         self.focus_handle.focus(window, cx);
         cx.notify();
+    }
+
+    fn confirm_tag_key_delete(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        debug_table_interaction(|| format!("tag key delete requested key={key}"));
+        self.confirm_delete_target(Self::tag_key_delete_target(key), "tag-key", window, cx);
     }
 
     fn confirm_selected_delete(
@@ -975,6 +1366,13 @@ impl FileTable {
                     });
                 }
             }
+            RenameKind::TagKey { old_key } => {
+                if value != old_key {
+                    self.library.update(cx, |lib, cx| {
+                        lib.rename_tag_key(&old_key, &value, cx);
+                    });
+                }
+            }
         }
         self.focus_handle.focus(window, cx);
         cx.notify();
@@ -1008,9 +1406,10 @@ impl FileTable {
 
     pub fn pending_delete_counts(&self) -> Option<PendingDeleteCounts> {
         let pending = self.pending_delete.as_ref()?;
-        let kind = match pending.target.kind {
+        let kind = match &pending.target.kind {
             DeleteKind::Rows => PendingDeleteKind::Rows,
             DeleteKind::Format => PendingDeleteKind::Format,
+            DeleteKind::TagKey { .. } => PendingDeleteKind::TagKey,
         };
         Some(PendingDeleteCounts {
             kind,
@@ -1085,11 +1484,22 @@ impl FileTable {
             return false;
         };
 
-        let paths = pending.target.paths;
+        let paths = match pending.target.kind {
+            DeleteKind::TagKey { key } => {
+                self.hovered_tag_key = None;
+                self.library.update(cx, |lib, cx| {
+                    lib.remove_tag_key(&key, cx);
+                });
+                cx.notify();
+                return true;
+            }
+            DeleteKind::Rows | DeleteKind::Format => pending.target.paths,
+        };
         self.selected.clear();
         self.selection_anchor = None;
         self.hovered_row = None;
         self.hovered_tag_chip = None;
+        self.hovered_tag_key = None;
         self.hovered_format_chip = None;
         self.hovered_delete_row = None;
         self.library
@@ -1136,6 +1546,18 @@ impl FileTable {
                 && hovered.value == target.value
         }) {
             self.hovered_tag_chip = None;
+            cx.notify();
+        }
+    }
+
+    fn set_tag_key_hovered(&mut self, key: String, hovered: bool, cx: &mut Context<Self>) {
+        if hovered {
+            if self.hovered_tag_key.as_ref() != Some(&key) {
+                self.hovered_tag_key = Some(key);
+                cx.notify();
+            }
+        } else if self.hovered_tag_key.as_ref() == Some(&key) {
+            self.hovered_tag_key = None;
             cx.notify();
         }
     }
@@ -1235,6 +1657,7 @@ impl FileTable {
         range: Range<usize>,
         keys: Vec<String>,
         tag_widths: Vec<Pixels>,
+        tag_key_action_width: Pixels,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         crate::perf::sample("table.rows.rate");
@@ -1273,6 +1696,7 @@ impl FileTable {
                     record,
                     &keys,
                     &tag_widths,
+                    tag_key_action_width,
                     &selected_records,
                     cx,
                 )
@@ -1298,6 +1722,7 @@ impl FileTable {
         record: &FileRecord,
         keys: &[String],
         tag_widths: &[Pixels],
+        tag_key_action_width: Pixels,
         selected_records: &[FileRecord],
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1905,6 +2330,14 @@ impl FileTable {
             );
         }
 
+        row = row.child(
+            div()
+                .h_full()
+                .w(tag_key_action_width)
+                .min_w(tag_key_action_width)
+                .flex_shrink_0(),
+        );
+
         row.into_any_element()
     }
 }
@@ -1916,7 +2349,7 @@ impl Focusable for FileTable {
 }
 
 impl Render for FileTable {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::perf::sample("table.render.rate");
         let render_start = crate::perf::start();
         let missing_folder_category = {
@@ -1929,27 +2362,177 @@ impl Render for FileTable {
         } else {
             self.table_columns(cx)
         };
+        let tag_key_action_width = if self.creating_tag_key {
+            px(TAG_KEY_EDITOR_WIDTH)
+        } else {
+            px(TAG_KEY_ACTION_WIDTH)
+        };
+        let tag_column_keys = self.tag_column_keys(cx);
 
         let mut header_row = TableRow::new().child(
-            TableHead::new()
-                .flex_1()
-                .min_w_0()
-                .px(CONTENT_PX)
-                .child(div().w_full().min_w_0().truncate().child("name")),
+            TableHead::new().flex_1().min_w_0().px(CONTENT_PX).child(
+                div()
+                    .h_full()
+                    .w_full()
+                    .min_w_0()
+                    .h_flex()
+                    .items_center()
+                    .child(div().flex_none().max_w_full().truncate().child("name"))
+                    .child(div().h_full().flex_1().min_w_0().on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            this.open_column_visibility_menu(event.position, window, cx);
+                            cx.stop_propagation();
+                        }),
+                    )),
+            ),
         );
         for (key, tag_width) in keys.iter().zip(&tag_widths) {
+            let key_for_click = key.clone();
+            let key_for_menu = key.clone();
+            let key_for_hover = key.clone();
+            let key_is_delete_hovered = self.alt_down && self.hovered_tag_key.as_ref() == Some(key);
+            let table = cx.entity();
+            let table_for_label_menu = table.clone();
+            let header_label = div()
+                .id(SharedString::from(format!("tag-key-header:{key}")))
+                .flex_none()
+                .max_w_full()
+                .truncate()
+                .cursor_pointer()
+                .text_color(cx.theme().foreground)
+                .when(key_is_delete_hovered, |el| el.text_color(red()))
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    this.set_tag_key_hovered(key_for_hover.clone(), *hovered, cx);
+                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        if event.modifiers.alt {
+                            this.confirm_tag_key_delete(&key_for_click, window, cx);
+                            cx.stop_propagation();
+                        }
+                    }),
+                )
+                .context_menu(move |menu, _, _| {
+                    let rename_table = table_for_label_menu.clone();
+                    let remove_table = table_for_label_menu.clone();
+                    let rename_key = key_for_menu.clone();
+                    let remove_key = key_for_menu.clone();
+                    let remove_label = SharedString::from(format!("Remove {remove_key}"));
+                    menu.item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
+                        let rename_key = rename_key.clone();
+                        cx.update_entity(&rename_table, |this, cx| {
+                            let target = RenameTarget {
+                                kind: RenameKind::TagKey {
+                                    old_key: rename_key,
+                                },
+                            };
+                            let initial_value = target.default_value();
+                            this.start_rename_target(target, initial_value, window, cx);
+                        });
+                    }))
+                    .separator()
+                    .item(
+                        PopupMenuItem::new(remove_label).on_click(move |_, window, cx| {
+                            cx.update_entity(&remove_table, |this, cx| {
+                                this.confirm_tag_key_delete(&remove_key, window, cx);
+                            });
+                        }),
+                    )
+                })
+                .child(SharedString::from(key.clone()))
+                .into_any_element();
             header_row = header_row.child(
                 TableHead::new()
                     .w(*tag_width)
                     .min_w(*tag_width)
                     .flex_shrink_0()
                     .px(CONTENT_PX)
-                    .child(SharedString::from(key.clone())),
+                    .child(
+                        div()
+                            .h_full()
+                            .w_full()
+                            .min_w_0()
+                            .h_flex()
+                            .items_center()
+                            .child(header_label)
+                            .child(div().h_full().flex_1().min_w_0().on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                    this.open_column_visibility_menu(event.position, window, cx);
+                                    cx.stop_propagation();
+                                }),
+                            )),
+                    ),
             );
         }
+        let creating_tag_key = self.creating_tag_key;
+        let tag_key_action = if creating_tag_key {
+            div()
+                .w_full()
+                .h_flex()
+                .items_center()
+                .rounded_md()
+                .bg(cx.theme().muted)
+                .text_color(cx.theme().foreground)
+                .overflow_hidden()
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    if event.keystroke.key == "escape" {
+                        this.cancel_tag_key(window, cx);
+                        cx.stop_propagation();
+                    }
+                }))
+                .child(
+                    Input::new(&self.tag_key_input)
+                        .appearance(false)
+                        .xsmall()
+                        .text_color(cx.theme().foreground)
+                        .px_0()
+                        .flex_1()
+                        .mr(px(-10.))
+                        .min_w_0(),
+                )
+                .into_any_element()
+        } else {
+            Button::new("add-tag-key")
+                .xsmall()
+                .compact()
+                .ghost()
+                .icon(IconName::Plus)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.start_creating_tag_key(window, cx);
+                    cx.stop_propagation();
+                }))
+                .into_any_element()
+        };
+        header_row = header_row.child(
+            TableHead::new()
+                .w(tag_key_action_width)
+                .min_w(tag_key_action_width)
+                .flex_shrink_0()
+                .px(px(4.))
+                .child(
+                    div()
+                        .h_full()
+                        .w_full()
+                        .min_w_0()
+                        .h_flex()
+                        .items_center()
+                        .child(tag_key_action)
+                        .child(div().h_full().flex_1().min_w_0().on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                this.open_column_visibility_menu(event.position, window, cx);
+                                cx.stop_propagation();
+                            }),
+                        )),
+                ),
+        );
 
         let virtual_keys = keys.clone();
         let virtual_tag_widths = tag_widths.clone();
+        let virtual_tag_key_action_width = tag_key_action_width;
         let row_sizes = self.row_sizes(row_count);
         let row_scroll_handle = self.row_scroll_handle.clone();
         let rows: AnyElement = if let Some(category) = missing_folder_category {
@@ -1988,6 +2571,7 @@ impl Render for FileTable {
                                 range,
                                 virtual_keys.clone(),
                                 virtual_tag_widths.clone(),
+                                virtual_tag_key_action_width,
                                 cx,
                             )
                         },
@@ -1997,13 +2581,18 @@ impl Render for FileTable {
                 .scrollbar(&row_scroll_handle, ScrollbarAxis::Vertical)
                 .into_any_element()
         };
+        let column_visibility_menu =
+            self.render_column_visibility_menu(tag_column_keys, window, cx);
 
         let table = div()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 match event.keystroke.key.as_str() {
                     "escape" => {
-                        if this.cancel_delete(cx) || this.clear_selection(cx) {
+                        if this.close_column_visibility_menu(cx)
+                            || this.cancel_delete(cx)
+                            || this.clear_selection(cx)
+                        {
                             cx.stop_propagation();
                         }
                     }
@@ -2037,7 +2626,8 @@ impl Render for FileTable {
                     .flex_1()
                     .min_h_0()
                     .child(div().size_full().child(rows)),
-            );
+            )
+            .when_some(column_visibility_menu, |table, menu| table.child(menu));
 
         crate::perf::finish("table.render", render_start, || {
             format!(
@@ -2057,6 +2647,7 @@ impl RenameTarget {
             RenameKind::Rows { records } if records.len() == 1 => records[0].name.clone(),
             RenameKind::Rows { .. } => String::new(),
             RenameKind::TagAll { old_value, .. } => old_value.clone(),
+            RenameKind::TagKey { old_key } => old_key.clone(),
         }
     }
 
@@ -2078,6 +2669,13 @@ impl RenameTarget {
                 file_count: 0,
                 current_name: Some(old_value.clone()),
                 bulk: true,
+            },
+            RenameKind::TagKey { old_key } => PendingRenameDetails {
+                kind: PendingRenameKind::TagKey,
+                item_count: 1,
+                file_count: 0,
+                current_name: Some(old_key.clone()),
+                bulk: false,
             },
         }
     }

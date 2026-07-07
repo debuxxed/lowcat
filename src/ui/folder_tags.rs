@@ -13,7 +13,7 @@ use gpui_component::{
 };
 
 use crate::{
-    model::{Category, FolderTagAssignment, tag_label},
+    model::{Category, FolderTagAssignment},
     ui::UI,
 };
 
@@ -33,6 +33,7 @@ struct FolderTagRow {
 
 pub(super) struct FolderTagModalState {
     category: Category,
+    keys: Vec<String>,
     rows: Vec<FolderTagRow>,
     selected: BTreeSet<usize>,
     selection_anchor: Option<usize>,
@@ -41,14 +42,11 @@ pub(super) struct FolderTagModalState {
 }
 
 impl FolderTagModalState {
-    fn new(category: Category, values: Vec<String>) -> Self {
-        let default_key = category
-            .tag_keys()
-            .first()
-            .map(|key| tag_label(key).to_string())
-            .unwrap_or_default();
+    fn new(category: Category, values: Vec<String>, keys: Vec<String>) -> Self {
+        let default_key = keys.first().cloned().unwrap_or_default();
         Self {
             category,
+            keys,
             rows: values
                 .into_iter()
                 .map(|value| FolderTagRow {
@@ -65,11 +63,7 @@ impl FolderTagModalState {
     }
 
     fn tag_keys(&self) -> Vec<String> {
-        self.category
-            .tag_keys()
-            .iter()
-            .map(|key| tag_label(key).to_string())
-            .collect()
+        self.keys.clone()
     }
 
     fn close_key_menu(&mut self) -> bool {
@@ -162,7 +156,15 @@ impl UI {
         let values = self
             .library
             .update(cx, |lib, cx| lib.prepare_folder_tag_values(cx));
-        self.folder_tag_modal = Some(FolderTagModalState::new(category, values));
+        let keys = self
+            .library
+            .read(cx)
+            .active_state()
+            .schema
+            .keys()
+            .cloned()
+            .collect();
+        self.folder_tag_modal = Some(FolderTagModalState::new(category, values, keys));
         cx.notify();
     }
 
@@ -740,6 +742,10 @@ fn folder_tag_text_width(window: &mut Window, label: &str) -> Pixels {
 mod tests {
     use super::*;
 
+    fn music_keys() -> Vec<String> {
+        vec!["genre".to_string(), "mood".to_string()]
+    }
+
     #[test]
     fn folder_tag_modal_bulk_edits_selected_rows() {
         let mut modal = FolderTagModalState::new(
@@ -749,14 +755,15 @@ mod tests {
                 "dark".to_string(),
                 "drone".to_string(),
             ],
+            music_keys(),
         );
 
         modal.select_row(0, false, false);
         modal.select_row(2, true, false);
-        modal.set_key(1, "Mood".to_string());
-        assert_eq!(modal.rows[0].key, "Mood");
-        assert_eq!(modal.rows[1].key, "Mood");
-        assert_eq!(modal.rows[2].key, "Mood");
+        modal.set_key(1, "mood".to_string());
+        assert_eq!(modal.rows[0].key, "mood");
+        assert_eq!(modal.rows[1].key, "mood");
+        assert_eq!(modal.rows[2].key, "mood");
 
         modal.set_enabled(2, false);
         assert!(!modal.rows[0].enabled);
@@ -773,15 +780,16 @@ mod tests {
                 "dark".to_string(),
                 "drone".to_string(),
             ],
+            music_keys(),
         );
 
         modal.select_row(0, false, false);
         modal.select_row(1, false, true);
-        modal.set_key(2, "Mood".to_string());
+        modal.set_key(2, "mood".to_string());
 
-        assert_eq!(modal.rows[0].key, "Genre");
-        assert_eq!(modal.rows[1].key, "Genre");
-        assert_eq!(modal.rows[2].key, "Mood");
+        assert_eq!(modal.rows[0].key, "genre");
+        assert_eq!(modal.rows[1].key, "genre");
+        assert_eq!(modal.rows[2].key, "mood");
     }
 
     #[test]
@@ -793,6 +801,7 @@ mod tests {
                 "dark".to_string(),
                 "drone".to_string(),
             ],
+            music_keys(),
         );
 
         assert!(modal.select_all());
@@ -808,6 +817,7 @@ mod tests {
         let mut modal = FolderTagModalState::new(
             Category::Music,
             vec!["ambient".to_string(), "dark".to_string()],
+            music_keys(),
         );
 
         modal.select_all();
@@ -822,5 +832,28 @@ mod tests {
         assert_eq!(modal.open_key_menu, None);
         assert_eq!(modal.key_menu_position, None);
         assert!(!modal.close_key_menu());
+    }
+
+    #[test]
+    fn folder_tag_modal_uses_schema_keys() {
+        let modal = FolderTagModalState::new(
+            Category::Music,
+            vec!["ambient".to_string()],
+            vec![
+                "Energy".to_string(),
+                "genre".to_string(),
+                "mood".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            modal.tag_keys(),
+            vec![
+                "Energy".to_string(),
+                "genre".to_string(),
+                "mood".to_string()
+            ]
+        );
+        assert_eq!(modal.rows[0].key, "Energy");
     }
 }

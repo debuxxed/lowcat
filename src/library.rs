@@ -13,7 +13,7 @@ use crate::downloader::{
 };
 use crate::model::{
     AudioFormat, Category, CategoryState, ConvertConflictBehavior, FileRecord, FolderTagAssignment,
-    canonical_tag_key, default_format_priority, tag_label,
+    default_format_priority, normalize_tag_key, tag_label,
 };
 
 #[path = "config.rs"]
@@ -389,6 +389,74 @@ impl Library {
                     "tag add failed path={} key={key} error={error}",
                     path.display()
                 );
+            }
+        }
+    }
+
+    pub fn add_tag_key(&mut self, key: &str, cx: &mut Context<Self>) {
+        let category = self.active;
+        match self.backend.add_tag_key(category, key) {
+            Ok(Some(key)) => {
+                let _ = self.refresh_category_state(category);
+                debug_library_interaction(|| {
+                    format!("add_tag_key category={} key={key}", category.label())
+                });
+                cx.notify();
+            }
+            Ok(None) => cx.notify(),
+            Err(error) => {
+                eprintln!(
+                    "lowcat tag key add failed category={} key={key} error={error}",
+                    category.label()
+                );
+                cx.notify();
+            }
+        }
+    }
+
+    pub fn remove_tag_key(&mut self, key: &str, cx: &mut Context<Self>) {
+        let category = self.active;
+        match self.backend.remove_tag_key(category, key) {
+            Ok(removed) => {
+                let _ = self.refresh_category_state(category);
+                debug_library_interaction(|| {
+                    format!(
+                        "remove_tag_key category={} key={key} removed={removed}",
+                        category.label()
+                    )
+                });
+                cx.notify();
+            }
+            Err(error) => {
+                eprintln!(
+                    "lowcat tag key remove failed category={} key={key} error={error}",
+                    category.label()
+                );
+                cx.notify();
+            }
+        }
+    }
+
+    pub fn rename_tag_key(&mut self, old_key: &str, new_key: &str, cx: &mut Context<Self>) {
+        let category = self.active;
+        match self.backend.rename_tag_key(category, old_key, new_key) {
+            Ok(()) => {
+                let _ =
+                    self.refresh_category_state_after_tag_key_rename(category, old_key, new_key);
+                debug_library_interaction(|| {
+                    format!(
+                        "rename_tag_key category={} old={old_key} new={new_key}",
+                        category.label()
+                    )
+                });
+                cx.notify();
+            }
+            Err(error) => {
+                eprintln!(
+                    "lowcat tag key rename failed category={} old={old_key} error={error}",
+                    category.label()
+                );
+                cx.notify();
             }
         }
     }
@@ -1066,7 +1134,7 @@ impl Library {
     }
 
     fn refresh_category_state(&mut self, category: Category) -> io::Result<()> {
-        self.refresh_category_state_with_tag_rename(category, None)
+        self.refresh_category_state_with_tag_rename(category, None, None)
     }
 
     fn refresh_category_state_after_tag_rename(
@@ -1076,13 +1144,27 @@ impl Library {
         old_value: &str,
         new_value: &str,
     ) -> io::Result<()> {
-        self.refresh_category_state_with_tag_rename(category, Some((key, old_value, new_value)))
+        self.refresh_category_state_with_tag_rename(
+            category,
+            Some((key, old_value, new_value)),
+            None,
+        )
+    }
+
+    fn refresh_category_state_after_tag_key_rename(
+        &mut self,
+        category: Category,
+        old_key: &str,
+        new_key: &str,
+    ) -> io::Result<()> {
+        self.refresh_category_state_with_tag_rename(category, None, Some((old_key, new_key)))
     }
 
     fn refresh_category_state_with_tag_rename(
         &mut self,
         category: Category,
         renamed_tag: Option<(&str, &str, &str)>,
+        renamed_key: Option<(&str, &str)>,
     ) -> io::Result<()> {
         let total_start = crate::perf::start();
         let (search, mut selected) = if let Some(state) = self.states.get(&category) {
@@ -1095,6 +1177,7 @@ impl Library {
         crate::perf::finish("library.schema", schema_start, || {
             format!("category={} keys={}", category.label(), schema.len())
         });
+        reconcile_selected_filter_keys(&mut selected, &schema, renamed_key);
         reconcile_selected_filters(&mut selected, &schema, renamed_tag);
         let filter_start = crate::perf::start();
         let results = display_records(self.backend.filter(category, &search, &selected));
@@ -1278,12 +1361,12 @@ fn paths_equal(left: &Path, right: &Path) -> bool {
 fn display_schema(schema: BTreeMap<String, Vec<String>>) -> BTreeMap<String, Vec<String>> {
     schema
         .into_iter()
-        .map(|(key, values)| (tag_label(&key).to_string(), values))
+        .filter_map(|(key, values)| display_tag_key(&key).map(|key| (key, values)))
         .collect()
 }
 
 fn display_tag_key(key: &str) -> Option<String> {
-    canonical_tag_key(key).map(tag_label).map(str::to_string)
+    normalize_tag_key(key).map(|key| tag_label(&key).to_string())
 }
 
 fn display_records(records: Vec<FileRecord>) -> Vec<FileRecord> {
@@ -1331,6 +1414,21 @@ fn reconcile_selected_filters(
         values.retain(|value| available.contains(value));
         !values.is_empty()
     });
+}
+
+fn reconcile_selected_filter_keys(
+    selected: &mut BTreeMap<String, BTreeSet<String>>,
+    schema: &BTreeMap<String, Vec<String>>,
+    renamed_key: Option<(&str, &str)>,
+) {
+    if let Some((old_key, new_key)) = renamed_key
+        && let (Some(old_key), Some(new_key)) = (display_tag_key(old_key), display_tag_key(new_key))
+        && !schema.contains_key(&old_key)
+        && schema.contains_key(&new_key)
+        && let Some(values) = selected.remove(&old_key)
+    {
+        selected.entry(new_key).or_default().extend(values);
+    }
 }
 
 fn debug_downloader_interaction(details: impl FnOnce() -> String) {
@@ -1429,7 +1527,7 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>()
         });
-        assert_eq!(schema_keys, vec!["Genre".to_string(), "Mood".to_string()]);
+        assert_eq!(schema_keys, vec!["genre".to_string(), "mood".to_string()]);
         let has_folder =
             library.read_with(cx, |lib, _| lib.category_folder(Category::Music).is_some());
         assert!(!has_folder);
@@ -1531,12 +1629,12 @@ mod tests {
                 vec![
                     FolderTagAssignment {
                         value: "ambient".to_string(),
-                        key: "Genre".to_string(),
+                        key: "genre".to_string(),
                         enabled: true,
                     },
                     FolderTagAssignment {
                         value: "dark".to_string(),
-                        key: "Mood".to_string(),
+                        key: "mood".to_string(),
                         enabled: true,
                     },
                 ],
@@ -1550,9 +1648,9 @@ mod tests {
                 lib.states[&Category::Sfx].results[0].tags.clone(),
             )
         });
-        assert_eq!(music_tags["Genre"], vec!["ambient"]);
-        assert_eq!(music_tags["Mood"], vec!["dark"]);
-        assert!(!sfx_tags.contains_key("Type"));
+        assert_eq!(music_tags["genre"], vec!["ambient"]);
+        assert_eq!(music_tags["mood"], vec!["dark"]);
+        assert!(!sfx_tags.contains_key("type"));
     }
 
     #[gpui::test]
@@ -1749,7 +1847,7 @@ mod tests {
         let count = library.read_with(cx, |lib, _| lib.active_state().results.len());
         assert_eq!(count, 2);
 
-        library.update(cx, |lib, cx| lib.toggle_value("Genre", "Electronic", cx));
+        library.update(cx, |lib, cx| lib.toggle_value("genre", "Electronic", cx));
         let count = library.read_with(cx, |lib, _| lib.active_state().results.len());
         assert_eq!(count, 1);
 
@@ -1769,23 +1867,23 @@ mod tests {
         let path = fixture(&music_dir, "tagged.flac", &[]);
         let library = cx.new(|_| Library::new_with_settings_path(settings_path));
 
-        library.update(cx, |lib, cx| lib.add_tag(path.clone(), "Genre", "Hype", cx));
-        library.update(cx, |lib, cx| lib.toggle_value("Genre", "Hype", cx));
+        library.update(cx, |lib, cx| lib.add_tag(path.clone(), "genre", "Hype", cx));
+        library.update(cx, |lib, cx| lib.toggle_value("genre", "Hype", cx));
 
         let selected = library.read_with(cx, |lib, _| {
-            lib.active_state().selected["Genre"].contains("Hype")
+            lib.active_state().selected["genre"].contains("Hype")
         });
         assert!(selected);
 
         library.update(cx, |lib, cx| {
-            lib.remove_tag(path.clone(), "Genre", "Hype", cx)
+            lib.remove_tag(path.clone(), "genre", "Hype", cx)
         });
 
         let (selected_empty, schema_values, result_count) = library.read_with(cx, |lib, _| {
             let state = lib.active_state();
             (
                 state.selected.is_empty(),
-                state.schema["Genre"].clone(),
+                state.schema["genre"].clone(),
                 state.results.len(),
             )
         });
@@ -1801,21 +1899,21 @@ mod tests {
         let path = fixture(&music_dir, "tagged.flac", &[]);
         let library = cx.new(|_| Library::new_with_settings_path(settings_path));
 
-        library.update(cx, |lib, cx| lib.add_tag(path.clone(), "Genre", "Hype", cx));
-        library.update(cx, |lib, cx| lib.toggle_value("Genre", "Hype", cx));
+        library.update(cx, |lib, cx| lib.add_tag(path.clone(), "genre", "Hype", cx));
+        library.update(cx, |lib, cx| lib.toggle_value("genre", "Hype", cx));
         library.update(cx, |lib, cx| {
-            lib.rename_tag(path.clone(), "Genre", "Hype", "Mad", cx)
+            lib.rename_tag(path.clone(), "genre", "Hype", "Mad", cx)
         });
 
         let (has_old_selection, has_new_selection, schema_values, result_tags) =
             library.read_with(cx, |lib, _| {
                 let state = lib.active_state();
-                let selected = state.selected.get("Genre");
+                let selected = state.selected.get("genre");
                 (
                     selected.is_some_and(|values| values.contains("Hype")),
                     selected.is_some_and(|values| values.contains("Mad")),
-                    state.schema["Genre"].clone(),
-                    state.results[0].tags["Genre"].clone(),
+                    state.schema["genre"].clone(),
+                    state.results[0].tags["genre"].clone(),
                 )
             });
         assert!(!has_old_selection);

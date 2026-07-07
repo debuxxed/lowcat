@@ -238,11 +238,26 @@ pub fn canonical_tag_key(key: &str) -> Option<&'static str> {
     }
 }
 
+pub fn normalize_tag_key(key: &str) -> Option<String> {
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    canonical_tag_key(key)
+        .map(str::to_string)
+        .or_else(|| Some(key.to_lowercase()))
+}
+
+pub fn normalize_tag_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 pub fn tag_label(key: &str) -> &str {
     match canonical_tag_key(key) {
-        Some(TAG_GENRE) => "Genre",
-        Some(TAG_MOOD) => "Mood",
-        Some(TAG_TYPE) => "Type",
+        Some(TAG_GENRE) => "genre",
+        Some(TAG_MOOD) => "mood",
+        Some(TAG_TYPE) => "type",
         _ => key,
     }
 }
@@ -271,7 +286,12 @@ pub fn record_matches(
         if wanted.is_empty() {
             continue;
         }
-        match record.tags.get(key) {
+        match record.tags.get(key).or_else(|| {
+            record
+                .tags
+                .iter()
+                .find_map(|(tag_key, values)| tag_key.eq_ignore_ascii_case(key).then_some(values))
+        }) {
             Some(values) => {
                 if !wanted.iter().all(|w| values.contains(w)) {
                     return false;
