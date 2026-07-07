@@ -303,7 +303,7 @@ pub fn record_matches(
     true
 }
 
-fn fuzzy_search_match(text: &str, search: &str) -> bool {
+pub(crate) fn fuzzy_search_match(text: &str, search: &str) -> bool {
     let text = text.to_lowercase();
     let mut text_chars = text.chars();
     search

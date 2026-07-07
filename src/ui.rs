@@ -35,6 +35,8 @@ actions!(
         ToggleSettings,
         ToggleFilters,
         ToggleDownloader,
+        ClearFilterTags,
+        ClearFilterTagsAndSearch,
         AssignFolderTags,
         RenameSelection
     ]
@@ -155,6 +157,11 @@ impl UI {
             .update(cx, |table, cx| table.cancel_column_visibility_menu(cx))
     }
 
+    fn cancel_tag_group_menu(&mut self, cx: &mut Context<Self>) -> bool {
+        self.filter_panel
+            .update(cx, |panel, cx| panel.cancel_tag_group_menu(cx))
+    }
+
     fn clear_selection(&mut self, cx: &mut Context<Self>) -> bool {
         self.table.update(cx, |table, cx| table.clear_selection(cx))
     }
@@ -221,6 +228,21 @@ impl UI {
     fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.toolbar
             .update(cx, |toolbar, cx| toolbar.toggle_settings(window, cx));
+    }
+
+    fn clear_filter_tags(&mut self, cx: &mut Context<Self>) -> bool {
+        self.toolbar
+            .update(cx, |toolbar, cx| toolbar.clear_filter_tags(cx))
+    }
+
+    fn clear_filter_tags_and_search(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.toolbar.update(cx, |toolbar, cx| {
+            toolbar.clear_filter_tags_and_search(window, cx)
+        })
     }
 
     /// Full-window overlay that fades in while OS files are dragged over the
@@ -710,6 +732,10 @@ impl Render for UI {
                         cx.stop_propagation();
                         return;
                     }
+                    if this.cancel_tag_group_menu(cx) {
+                        cx.stop_propagation();
+                        return;
+                    }
                     if this.cancel_search_if_no_selection(window, cx) {
                         cx.stop_propagation();
                         return;
@@ -725,8 +751,11 @@ impl Render for UI {
                         cx.stop_propagation();
                     }
                 } else if event.keystroke.modifiers.platform && event.keystroke.key == "f" {
+                    this.library.update(cx, |lib, cx| {
+                        lib.close_filters(cx);
+                    });
                     this.toolbar
-                        .update(cx, |toolbar, cx| toolbar.focus_search(window, cx));
+                        .update(cx, |toolbar, cx| toolbar.focus_normal_search(window, cx));
                     cx.stop_propagation();
                 } else if event.keystroke.modifiers.platform
                     && event.keystroke.key == "a"
@@ -756,11 +785,13 @@ impl Render for UI {
                     });
                 }
             }))
-            .on_action(cx.listener(|this, _: &ToggleFilters, _, cx| {
+            .on_action(cx.listener(|this, _: &ToggleFilters, window, cx| {
                 if this.has_media_tool_problems() {
                     return;
                 }
                 this.library.update(cx, |lib, cx| lib.toggle_filters(cx));
+                this.toolbar
+                    .update(cx, |toolbar, cx| toolbar.focus_search(window, cx));
             }))
             .on_action(cx.listener(|this, _: &ToggleDownloader, _, cx| {
                 if this.has_media_tool_problems() {
@@ -774,6 +805,20 @@ impl Render for UI {
                 }
                 this.toggle_settings(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ClearFilterTags, _, cx| {
+                if this.has_media_tool_problems() {
+                    return;
+                }
+                this.clear_filter_tags(cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &ClearFilterTagsAndSearch, window, cx| {
+                    if this.has_media_tool_problems() {
+                        return;
+                    }
+                    this.clear_filter_tags_and_search(window, cx);
+                }),
+            )
             .on_action(cx.listener(|this, _: &AssignFolderTags, _, cx| {
                 if this.has_media_tool_problems() {
                     return;

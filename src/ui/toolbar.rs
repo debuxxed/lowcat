@@ -1,12 +1,12 @@
 use gpui::{
     App, AppContext, ClickEvent, Context, Entity, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, div, red,
-    relative,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    prelude::FluentBuilder, red, relative,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Selectable, Sizable, StyledExt,
     button::{Button, ButtonVariants as _},
-    input::{Input, InputEvent, InputState},
+    input::{Enter, Input, InputEvent, InputState},
     menu::{ContextMenuExt as _, PopupMenuItem},
 };
 
@@ -16,6 +16,7 @@ use crate::ui::{CONTENT_PX, settings_menu::SettingsMenu};
 pub struct Toolbar {
     library: Entity<Library>,
     search_input: Entity<InputState>,
+    tag_search_input: Entity<InputState>,
     settings_menu: Entity<SettingsMenu>,
     hovered_chip: Option<String>,
     alt_down: bool,
@@ -24,6 +25,8 @@ pub struct Toolbar {
 impl Toolbar {
     pub fn new(library: Entity<Library>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search..."));
+        let tag_search_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Filter tags..."));
         search_input.update(cx, |state, cx| state.focus(window, cx));
 
         cx.subscribe(&search_input, |this, state, event: &InputEvent, cx| {
@@ -33,6 +36,18 @@ impl Toolbar {
             }
         })
         .detach();
+        cx.subscribe(
+            &tag_search_input,
+            |this, state, event: &InputEvent, cx| match event {
+                InputEvent::Change => {
+                    let value = state.read(cx).value().to_string();
+                    this.library
+                        .update(cx, |lib, cx| lib.set_tag_search(value, cx));
+                }
+                _ => {}
+            },
+        )
+        .detach();
 
         cx.observe(&library, |_, _, cx| cx.notify()).detach();
 
@@ -40,6 +55,7 @@ impl Toolbar {
             settings_menu: cx.new(|cx| SettingsMenu::new(library.clone(), cx)),
             library,
             search_input,
+            tag_search_input,
             hovered_chip: None,
             alt_down: false,
         }
@@ -53,6 +69,15 @@ impl Toolbar {
     }
 
     pub fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let input = if self.library.read(cx).filters_open() {
+            self.tag_search_input.clone()
+        } else {
+            self.search_input.clone()
+        };
+        input.update(cx, |state, cx| state.focus(window, cx));
+    }
+
+    pub fn focus_normal_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_input
             .update(cx, |state, cx| state.focus(window, cx));
     }
@@ -62,9 +87,25 @@ impl Toolbar {
             .read(cx)
             .focus_handle(cx)
             .is_focused(window)
+            || self
+                .tag_search_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
     }
 
     pub fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.library.read(cx).filters_open() {
+            if self.tag_search_input.read(cx).value().is_empty() {
+                return false;
+            }
+
+            self.tag_search_input
+                .update(cx, |state, cx| state.set_value("", window, cx));
+            self.library.update(cx, |lib, cx| lib.clear_tag_search(cx));
+            return true;
+        }
+
         if self.search_input.read(cx).value().is_empty() {
             return false;
         }
@@ -76,9 +117,45 @@ impl Toolbar {
         true
     }
 
+    pub fn clear_filter_tags(&mut self, cx: &mut Context<Self>) -> bool {
+        self.library
+            .update(cx, |lib, cx| lib.clear_selected_filters(cx))
+    }
+
+    pub fn clear_filter_tags_and_search(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let cleared_filters = self.clear_filter_tags(cx);
+        let search_input_had_value = !self.search_input.read(cx).value().is_empty();
+        let cleared_search = self.library.update(cx, |lib, cx| lib.clear_search(cx));
+        if search_input_had_value {
+            self.search_input
+                .update(cx, |state, cx| state.set_value("", window, cx));
+        }
+
+        cleared_filters || cleared_search || search_input_had_value
+    }
+
     pub fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_menu
             .update(cx, |settings, cx| settings.toggle_from_shortcut(window, cx));
+    }
+
+    pub fn apply_single_tag_search_match(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let applied = self
+            .library
+            .update(cx, |lib, cx| lib.apply_single_tag_search_match(cx));
+        if applied {
+            self.tag_search_input
+                .update(cx, |state, cx| state.set_value("", window, cx));
+        }
+        applied
     }
 }
 
@@ -95,7 +172,13 @@ impl Render for Toolbar {
         };
         let chips_len = chips.len();
         let chip_delete_bg = red().opacity(0.18);
-        let has_search = !self.search_input.read(cx).value().is_empty();
+        let filters_open = self.library.read(cx).filters_open();
+        let active_search_input = if filters_open {
+            self.tag_search_input.clone()
+        } else {
+            self.search_input.clone()
+        };
+        let has_search = !active_search_input.read(cx).value().is_empty();
         let search_icon = if has_search {
             div().child(
                 Button::new("clear-search")
@@ -106,10 +189,11 @@ impl Render for Toolbar {
                     .tab_stop(false)
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.clear_search(window, cx);
-                        this.search_input
-                            .update(cx, |state, cx| state.focus(window, cx));
+                        this.focus_search(window, cx);
                     })),
             )
+        } else if filters_open {
+            div().child(Icon::new(IconName::Settings2).small())
         } else {
             div().child(Icon::new(IconName::Search).small())
         };
@@ -126,8 +210,15 @@ impl Render for Toolbar {
             .bg(cx.theme().secondary)
             .border_1()
             .border_color(cx.theme().border)
+            .on_action(cx.listener(|this, _: &Enter, window, cx| {
+                if this.library.read(cx).filters_open()
+                    && this.apply_single_tag_search_match(window, cx)
+                {
+                    cx.stop_propagation();
+                }
+            }))
             .child(search_icon)
-            .child(Input::new(&self.search_input).appearance(false).flex_1());
+            .child(Input::new(&active_search_input).appearance(false).flex_1());
 
         let mut chip_row = div()
             .h_flex()
@@ -212,15 +303,15 @@ impl Render for Toolbar {
             );
         }
 
-        let filters_open = self.library.read(cx).filters_open();
         let downloader_open = self.library.read(cx).downloader_open();
         let filter_button = Button::new("filter-toggle")
             .icon(IconName::Settings2)
             .small()
             .tooltip("Filter")
             .selected(filters_open)
-            .on_click(cx.listener(|this, _, _, cx| {
+            .on_click(cx.listener(|this, _, window, cx| {
                 this.library.update(cx, |lib, cx| lib.toggle_filters(cx));
+                this.focus_search(window, cx);
             }));
         let downloader_button = Button::new("downloader-toggle")
             .icon(IconName::Globe)
@@ -230,6 +321,18 @@ impl Render for Toolbar {
             .on_click(cx.listener(|this, _, _, cx| {
                 this.library.update(cx, |lib, cx| lib.toggle_downloader(cx));
             }));
+        let clear_filter_tags_button = (chips_len > 0).then(|| {
+            Button::new("clear-filter-tags")
+                .icon(IconName::Close)
+                .ghost()
+                .xsmall()
+                .compact()
+                .tab_stop(false)
+                .tooltip("Clear filters")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.clear_filter_tags(cx);
+                }))
+        });
 
         let toolbar = div()
             .h_flex()
@@ -241,6 +344,9 @@ impl Render for Toolbar {
             .child(self.settings_menu.clone())
             .child(filter_button)
             .child(downloader_button)
+            .when_some(clear_filter_tags_button, |toolbar, button| {
+                toolbar.child(button)
+            })
             .child(chip_row)
             .child(search);
 

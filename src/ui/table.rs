@@ -30,10 +30,10 @@ use crate::{
     model::{AudioFormat, Category, FileRecord},
 };
 
-const TAG_CELL_X_PADDING_WIDTH: f32 = 24.;
+const TAG_CELL_LEFT_PADDING_WIDTH: f32 = 12.;
 const TAG_CHIP_X_PADDING_WIDTH: f32 = 12.;
 const TAG_ADD_BUTTON_WIDTH: f32 = 19.;
-const TAG_COLUMN_MIN_WIDTH: f32 = TAG_CELL_X_PADDING_WIDTH + TAG_ADD_BUTTON_WIDTH;
+const TAG_COLUMN_MIN_WIDTH: f32 = TAG_CELL_LEFT_PADDING_WIDTH + TAG_ADD_BUTTON_WIDTH;
 const TAG_GAP_WIDTH: f32 = 4.;
 const TAG_TEXT_WIDTH: f32 = 7.;
 const TAG_EDITOR_WIDTH: f32 = 90.;
@@ -245,12 +245,26 @@ impl FileTable {
             + values.len().saturating_sub(1) as f32 * TAG_GAP_WIDTH
     }
 
+    fn tag_header_width(window: &mut Window, key: &str) -> f32 {
+        let text_style = window.text_style();
+        let font_size = text_style.font_size.to_pixels(window.rem_size());
+        let shaped = window.text_system().shape_line(
+            key.into(),
+            font_size,
+            &[text_style.to_run(key.len())],
+            None,
+        );
+
+        shaped.width.as_f32() + TAG_CELL_LEFT_PADDING_WIDTH
+    }
+
     fn tag_column_width(
+        window: &mut Window,
         state: &crate::model::CategoryState,
         key: &str,
         editing: Option<&TagEdit>,
     ) -> Pixels {
-        let header_width = key.chars().count() as f32 * TAG_TEXT_WIDTH + TAG_CELL_X_PADDING_WIDTH;
+        let header_width = Self::tag_header_width(window, key);
         let mut width = header_width;
 
         for record in &state.results {
@@ -267,7 +281,7 @@ impl FileTable {
                 TAG_ADD_BUTTON_WIDTH
             };
             let row_width = value_width + gap_width + action_width;
-            width = width.max(row_width + TAG_CELL_X_PADDING_WIDTH);
+            width = width.max(row_width + TAG_CELL_LEFT_PADDING_WIDTH);
         }
 
         px(width.max(TAG_COLUMN_MIN_WIDTH))
@@ -414,7 +428,11 @@ impl FileTable {
         .detach();
     }
 
-    fn table_columns(&mut self, cx: &mut Context<Self>) -> (Vec<String>, Vec<Pixels>, usize) {
+    fn table_columns(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Vec<String>, Vec<Pixels>, usize) {
         let editing = Self::editing_cache_key(self.editing.as_ref());
         let (keys, row_count, widths) = {
             let state = self.library.read(cx).active_state();
@@ -437,7 +455,7 @@ impl FileTable {
             let width_start = crate::perf::start();
             let widths: Vec<Pixels> = keys
                 .iter()
-                .map(|key| Self::tag_column_width(state, key, self.editing.as_ref()))
+                .map(|key| Self::tag_column_width(window, state, key, self.editing.as_ref()))
                 .collect();
             crate::perf::finish("table.widths", width_start, || {
                 format!(
@@ -2120,7 +2138,7 @@ impl FileTable {
                 .group(group.clone())
                 .absolute()
                 .left(CONTENT_PX)
-                .right(CONTENT_PX)
+                .right(px(0.))
                 .top_0()
                 .bottom_0()
                 .h_flex()
@@ -2360,7 +2378,7 @@ impl Render for FileTable {
         let (keys, tag_widths, row_count) = if missing_folder_category.is_some() {
             (Vec::new(), Vec::new(), 0)
         } else {
-            self.table_columns(cx)
+            self.table_columns(window, cx)
         };
         let tag_key_action_width = if self.creating_tag_key {
             px(TAG_KEY_EDITOR_WIDTH)
@@ -2448,7 +2466,8 @@ impl Render for FileTable {
                     .w(*tag_width)
                     .min_w(*tag_width)
                     .flex_shrink_0()
-                    .px(CONTENT_PX)
+                    .pl(CONTENT_PX)
+                    .pr(px(0.))
                     .child(
                         div()
                             .h_full()
@@ -2597,6 +2616,9 @@ impl Render for FileTable {
                         }
                     }
                     "backspace" | "delete" => {
+                        if event.keystroke.modifiers.shift {
+                            return;
+                        }
                         if this.row_context_menu_open {
                             window.dispatch_keystroke(Keystroke::parse("escape").unwrap(), cx);
                         }

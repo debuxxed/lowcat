@@ -13,7 +13,7 @@ use crate::downloader::{
 };
 use crate::model::{
     AudioFormat, Category, CategoryState, ConvertConflictBehavior, FileRecord, FolderTagAssignment,
-    default_format_priority, normalize_tag_key, tag_label,
+    default_format_priority, fuzzy_search_match, normalize_tag_key, tag_label,
 };
 
 #[path = "config.rs"]
@@ -29,6 +29,8 @@ pub struct Library {
     download_format: AudioFormat,
     convert_conflict_behavior: ConvertConflictBehavior,
     filters_open: bool,
+    tag_search: String,
+    hidden_tag_keys: BTreeSet<String>,
     downloader_open: bool,
     download_state: DownloadState,
     download_cancel: Option<DownloadCancel>,
@@ -127,6 +129,8 @@ impl Library {
             download_format,
             convert_conflict_behavior,
             filters_open: false,
+            tag_search: String::new(),
+            hidden_tag_keys: BTreeSet::new(),
             downloader_open: false,
             download_state: DownloadState::Idle,
             download_cancel: None,
@@ -161,6 +165,14 @@ impl Library {
         self.filters_open
     }
 
+    pub fn tag_search(&self) -> &str {
+        &self.tag_search
+    }
+
+    pub fn tag_group_is_visible(&self, key: &str) -> bool {
+        !self.hidden_tag_keys.contains(key)
+    }
+
     pub fn downloader_open(&self) -> bool {
         self.downloader_open
     }
@@ -191,6 +203,15 @@ impl Library {
             self.downloader_open = false;
         }
         cx.notify();
+    }
+
+    pub fn close_filters(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.filters_open {
+            return false;
+        }
+        self.filters_open = false;
+        cx.notify();
+        true
     }
 
     pub fn toggle_downloader(&mut self, cx: &mut Context<Self>) {
@@ -241,6 +262,89 @@ impl Library {
         cx.notify();
     }
 
+    pub fn set_tag_search(&mut self, search: String, cx: &mut Context<Self>) {
+        self.tag_search = search;
+        cx.notify();
+    }
+
+    pub fn clear_tag_search(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.tag_search.is_empty() {
+            return false;
+        }
+        self.tag_search.clear();
+        cx.notify();
+        true
+    }
+
+    pub fn clear_search(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.states.values().all(|state| state.search.is_empty()) {
+            return false;
+        }
+
+        self.set_search(String::new(), cx);
+        true
+    }
+
+    pub fn toggle_tag_group_visibility(&mut self, key: &str, cx: &mut Context<Self>) {
+        if !self.hidden_tag_keys.remove(key) {
+            self.hidden_tag_keys.insert(key.to_string());
+        }
+        cx.notify();
+    }
+
+    pub fn show_all_tag_groups(&mut self, cx: &mut Context<Self>) {
+        if self.hidden_tag_keys.is_empty() {
+            return;
+        }
+        self.hidden_tag_keys.clear();
+        cx.notify();
+    }
+
+    pub fn hide_all_tag_groups(&mut self, keys: &[String], cx: &mut Context<Self>) {
+        self.hidden_tag_keys = keys.iter().cloned().collect();
+        cx.notify();
+    }
+
+    pub fn single_tag_search_match(&self) -> Option<(String, String)> {
+        let include_hidden_groups = !self.tag_search.is_empty();
+        let matches: Vec<(String, String)> = self
+            .active_state()
+            .schema
+            .iter()
+            .flat_map(|(key, values)| {
+                values
+                    .iter()
+                    .filter(|_| include_hidden_groups || self.tag_group_is_visible(key))
+                    .filter(|value| tag_matches_search(value, &self.tag_search))
+                    .map(move |value| (key.clone(), value.clone()))
+            })
+            .collect();
+
+        let exact_search = self.tag_search.trim();
+        if !exact_search.is_empty() {
+            let mut exact_matches = matches
+                .iter()
+                .filter(|(_, value)| tag_exactly_matches_search(value, exact_search))
+                .cloned();
+            if let Some(first) = exact_matches.next() {
+                return exact_matches.next().is_none().then_some(first);
+            }
+        }
+
+        let mut matches = matches.into_iter();
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    }
+
+    pub fn apply_single_tag_search_match(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((key, value)) = self.single_tag_search_match() else {
+            return false;
+        };
+        self.tag_search.clear();
+        self.toggle_value(&key, &value, cx);
+        true
+    }
+
     pub fn toggle_value(&mut self, key: &str, value: &str, cx: &mut Context<Self>) {
         let active = self.active;
         if let Some(state) = self.states.get_mut(&active) {
@@ -260,6 +364,20 @@ impl Library {
             }
         }
         self.refresh(cx);
+    }
+
+    pub fn clear_selected_filters(&mut self, cx: &mut Context<Self>) -> bool {
+        let active = self.active;
+        let Some(state) = self.states.get_mut(&active) else {
+            return false;
+        };
+        if state.selected.values().all(BTreeSet::is_empty) {
+            return false;
+        }
+
+        state.selected.clear();
+        self.refresh(cx);
+        true
     }
 
     pub fn download_from_clipboard(
@@ -1369,6 +1487,32 @@ fn display_tag_key(key: &str) -> Option<String> {
     normalize_tag_key(key).map(|key| tag_label(&key).to_string())
 }
 
+pub(crate) fn tag_matches_search(value: &str, search: &str) -> bool {
+    fuzzy_search_match(value, search)
+}
+
+pub(crate) fn tag_exactly_matches_search(value: &str, search: &str) -> bool {
+    let search = search.trim();
+    !search.is_empty() && value.trim().eq_ignore_ascii_case(search)
+}
+
+pub(crate) fn tag_search_match_sort_key(value: &str, search: &str) -> (bool, String) {
+    (
+        !tag_exactly_matches_search(value, search),
+        value.to_lowercase(),
+    )
+}
+
+pub(crate) fn tag_search_group_sort_key<'a, I>(key: &str, values: I, search: &str) -> (bool, String)
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let has_exact_match = values
+        .into_iter()
+        .any(|value| tag_exactly_matches_search(value, search));
+    (!has_exact_match, key.to_lowercase())
+}
+
 fn display_records(records: Vec<FileRecord>) -> Vec<FileRecord> {
     records.into_iter().map(display_record).collect()
 }
@@ -1858,6 +2002,73 @@ mod tests {
         library.update(cx, |lib, cx| lib.set_category(Category::Music, cx));
         let count = library.read_with(cx, |lib, _| lib.active_state().results.len());
         assert_eq!(count, 1);
+    }
+
+    #[gpui::test]
+    fn clearing_selected_filters_restores_active_results(cx: &mut gpui::TestAppContext) {
+        let settings_path = settings_path("clear-filters");
+        let (music_dir, _) = settings_with_folders(&settings_path);
+        fixture(&music_dir, "dark.flac", &[("GENRE", "Electronic")]);
+        fixture(&music_dir, "calm.flac", &[("GENRE", "Ambient")]);
+        let library = cx.new(|_| Library::new_with_settings_path(settings_path));
+
+        library.update(cx, |lib, cx| lib.toggle_value("genre", "Electronic", cx));
+        let (filtered_count, selected_count) = library.read_with(cx, |lib, _| {
+            let state = lib.active_state();
+            (
+                state.results.len(),
+                state.selected.values().map(BTreeSet::len).sum::<usize>(),
+            )
+        });
+        assert_eq!(filtered_count, 1);
+        assert_eq!(selected_count, 1);
+
+        let cleared = library.update(cx, |lib, cx| lib.clear_selected_filters(cx));
+        let (result_count, selected_empty) = library.read_with(cx, |lib, _| {
+            let state = lib.active_state();
+            (state.results.len(), state.selected.is_empty())
+        });
+        assert!(cleared);
+        assert_eq!(result_count, 2);
+        assert!(selected_empty);
+    }
+
+    #[gpui::test]
+    fn tag_search_prioritizes_single_exact_match(cx: &mut gpui::TestAppContext) {
+        let settings_path = settings_path("tag-search-exact-priority");
+        let (music_dir, _) = settings_with_folders(&settings_path);
+        let path = fixture(&music_dir, "tagged.flac", &[]);
+        let library = cx.new(|_| Library::new_with_settings_path(settings_path));
+
+        library.update(cx, |lib, cx| lib.add_tag(path.clone(), "mood", "Hype", cx));
+        library.update(cx, |lib, cx| {
+            lib.add_tag(path.clone(), "genre", "Hyper", cx)
+        });
+        library.update(cx, |lib, cx| lib.set_tag_search("hype".to_string(), cx));
+
+        let single_match = library.read_with(cx, |lib, _| lib.single_tag_search_match());
+        assert_eq!(single_match, Some(("mood".to_string(), "Hype".to_string())));
+    }
+
+    #[test]
+    fn tag_search_orders_exact_matches_before_fuzzy_matches() {
+        let mut values = vec!["Hyper", "Hypr"];
+
+        values.sort_by_key(|value| tag_search_match_sort_key(value, "hypr"));
+
+        assert_eq!(values, vec!["Hypr", "Hyper"]);
+    }
+
+    #[test]
+    fn tag_search_orders_exact_groups_before_fuzzy_groups() {
+        let mut groups = vec![("genre", vec!["Hyper"]), ("mood", vec!["Hypr"])];
+
+        groups.sort_by_key(|(key, values)| {
+            tag_search_group_sort_key(key, values.iter().copied(), "hypr")
+        });
+
+        assert_eq!(groups[0].0, "mood");
+        assert_eq!(groups[1].0, "genre");
     }
 
     #[gpui::test]
