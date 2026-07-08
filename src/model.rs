@@ -312,6 +312,106 @@ pub(crate) fn fuzzy_search_match(text: &str, search: &str) -> bool {
         .all(|query_ch| text_chars.any(|text_ch| text_ch == query_ch))
 }
 
+pub(crate) fn record_search_sort_key(
+    record: &FileRecord,
+    search: &str,
+) -> (u8, usize, usize, String, String) {
+    let lower_name = record.name.to_lowercase();
+    if search.is_empty() {
+        return (0, 0, 0, lower_name, record.name.clone());
+    }
+
+    let mut best = search_sort_key_for_text(&record.name, search);
+    for variant in &record.variants {
+        merge_search_sort_key(
+            &mut best,
+            search_sort_key_for_text(&variant.extension, search),
+            4,
+        );
+    }
+    for (key, values) in &record.tags {
+        merge_search_sort_key(&mut best, search_sort_key_for_text(key, search), 4);
+        for value in values {
+            merge_search_sort_key(&mut best, search_sort_key_for_text(value, search), 4);
+        }
+    }
+
+    let (class, span, start) = best.unwrap_or((u8::MAX, usize::MAX, usize::MAX));
+    (class, span, start, lower_name, record.name.clone())
+}
+
+fn merge_search_sort_key(
+    best: &mut Option<(u8, usize, usize)>,
+    candidate: Option<(u8, usize, usize)>,
+    class_offset: u8,
+) {
+    let Some((class, span, start)) = candidate else {
+        return;
+    };
+    let candidate = (class.saturating_add(class_offset), span, start);
+    if best.is_none_or(|current| candidate < current) {
+        *best = Some(candidate);
+    }
+}
+
+fn search_sort_key_for_text(text: &str, search: &str) -> Option<(u8, usize, usize)> {
+    let (span, start) = fuzzy_match_span(text, search)?;
+    let text_lower = text.to_lowercase();
+    let search_lower = search.to_lowercase();
+    let trimmed_search = search_lower.trim();
+    let exact_word = !trimmed_search.is_empty()
+        && text_lower
+            .split(|ch: char| !ch.is_alphanumeric())
+            .any(|word| word == trimmed_search);
+
+    let class = if exact_word || text_lower.trim() == trimmed_search {
+        0
+    } else if text_lower.starts_with(trimmed_search) {
+        1
+    } else if text_lower.contains(trimmed_search) {
+        2
+    } else {
+        3
+    };
+
+    Some((class, span, start))
+}
+
+fn fuzzy_match_span(text: &str, search: &str) -> Option<(usize, usize)> {
+    let text = text.to_lowercase().chars().collect::<Vec<_>>();
+    let search = search.to_lowercase().chars().collect::<Vec<_>>();
+    if search.is_empty() {
+        return Some((0, 0));
+    }
+
+    let mut best = None;
+    for (start, text_ch) in text.iter().enumerate() {
+        if *text_ch != search[0] {
+            continue;
+        }
+
+        let mut query_index = 1;
+        let mut end = start;
+        while query_index < search.len() {
+            end += 1;
+            if end >= text.len() {
+                break;
+            }
+            if text[end] == search[query_index] {
+                query_index += 1;
+            }
+        }
+        if query_index == search.len() {
+            let candidate = (end - start + 1, start);
+            if best.is_none_or(|current| candidate < current) {
+                best = Some(candidate);
+            }
+        }
+    }
+
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,6 +470,26 @@ mod tests {
     fn fuzzy_search_skips_unqueried_punctuation() {
         let r = rec("it's me.wav", &[]);
         assert!(record_matches(&r, "its m", &BTreeMap::new()));
+    }
+
+    #[test]
+    fn search_sort_prioritizes_exact_name_words() {
+        let mut records = vec![
+            rec("brass loop", &[]),
+            rec("bassy", &[]),
+            rec("sub bass loop", &[]),
+            rec("bass", &[]),
+        ];
+
+        records.sort_by_key(|record| record_search_sort_key(record, "bass"));
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bass", "sub bass loop", "bassy", "brass loop"]
+        );
     }
 
     #[test]

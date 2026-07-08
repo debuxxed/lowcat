@@ -22,6 +22,8 @@ trash = "5.2"
 [target.'cfg(target_os = "macos")'.dependencies]
 cocoa = "0.26"
 drag = "2.1.1"
+objc = "0.2"
+raw-window-handle = "0.6"
 
 [dev-dependencies]
 gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = ["test-support"] }

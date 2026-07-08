@@ -13,7 +13,7 @@ use sqlx::{Row, SqlitePool};
 use crate::model::{
     AudioFormat, Category, ConvertConflictBehavior, FileRecord, FileSupport, FileVariant,
     FolderTagAssignment, default_format_priority, normalize_format_priority, normalize_tag_key,
-    normalize_tag_value, record_matches,
+    normalize_tag_value, record_matches, record_search_sort_key,
 };
 
 const FORMAT_PRIORITY_KEY: &str = "format_priority";
@@ -348,12 +348,7 @@ impl Database {
             }
         }
 
-        records.sort_by(|a, b| {
-            a.name
-                .to_lowercase()
-                .cmp(&b.name.to_lowercase())
-                .then_with(|| a.name.cmp(&b.name))
-        });
+        records.sort_by_key(|record| record_search_sort_key(record, search));
         Ok(records)
     }
 
@@ -1733,6 +1728,37 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "it's me");
+    }
+
+    #[test]
+    fn query_visible_rows_sorts_search_by_best_name_match() {
+        let db = Database::open(&db_path("sql-filter-search-rank")).unwrap();
+
+        db.sync_category(
+            Category::Music,
+            vec![
+                scan("brass loop.flac", &[]),
+                scan("bassy.flac", &[]),
+                scan("sub bass loop.flac", &[]),
+                scan("bass.flac", &[]),
+            ],
+        )
+        .unwrap();
+
+        let rows = db
+            .query_visible_rows(
+                Category::Music,
+                "bass",
+                &BTreeMap::new(),
+                &default_format_priority(),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            vec!["bass", "sub bass loop", "bassy", "brass loop"]
+        );
     }
 
     #[test]

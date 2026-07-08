@@ -1,7 +1,11 @@
+#![allow(unexpected_cfgs)]
+
 mod backend;
 mod db;
 mod downloader;
 mod library;
+#[cfg(target_os = "macos")]
+mod macos_url_drop;
 mod media_tools;
 mod model;
 mod perf;
