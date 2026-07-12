@@ -1,37 +1,25 @@
 mod downloader_panel;
+mod drop_overlay;
 mod filter_panel;
 mod folder_tags;
+mod media_tools_modal;
+mod modals;
 mod settings_menu;
 mod table;
 mod titlebar;
 mod toolbar;
 
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
-
 use futures::StreamExt as _;
 use gpui::{
-    AnyElement, App, AppContext as _, Context, Entity, ExternalPaths, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyDownEvent, ModifiersChangedEvent, ParentElement, Pixels,
-    Render, SharedString, Styled, Window, actions, div, prelude::FluentBuilder, px, relative, rgba,
+    App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    KeyDownEvent, ModifiersChangedEvent, ParentElement, Pixels, Render, Styled, Window, actions,
+    div, prelude::FluentBuilder, px,
 };
-use gpui_component::{
-    ActiveTheme as _, Sizable as _, StyledExt,
-    button::{Button, ButtonVariants as _},
-    input::Input,
-    progress::Progress,
-    scroll::ScrollableElement,
-};
+use gpui_component::{ActiveTheme as _, StyledExt};
 
-use crate::ui::titlebar::{TITLEBAR_HEIGHT, TITLEBAR_LEFT_OFFSET};
+use crate::media_tools::MissingTool;
 #[cfg(target_os = "macos")]
 use crate::{CloseWindow, MinimizeWindow};
-use crate::{
-    media_tools::{MissingTool, SearchLocation},
-    model::Category,
-};
 
 actions!(
     library,
@@ -53,16 +41,11 @@ actions!(
 pub(crate) const CONTENT_PX: Pixels = px(12.);
 pub(crate) const ROW_PANEL_HEIGHT: Pixels = px(32.);
 const ROW_PANEL_SEPARATOR_HEIGHT: Pixels = px(1.);
-const DROPPED_LINK_MAX_BYTES: u64 = 64 * 1024;
 
 use crate::library::Library;
 use crate::ui::{
-    downloader_panel::DownloaderPanel,
-    filter_panel::FilterPanel,
-    folder_tags::FolderTagModalState,
-    table::{FileTable, PendingDeleteKind, PendingRenameKind},
-    titlebar::AppTitleBar,
-    toolbar::Toolbar,
+    downloader_panel::DownloaderPanel, filter_panel::FilterPanel, folder_tags::FolderTagModalState,
+    table::FileTable, titlebar::AppTitleBar, toolbar::Toolbar,
 };
 
 pub struct UI {
@@ -261,22 +244,6 @@ impl UI {
         });
     }
 
-    fn download_dropped_link(
-        &mut self,
-        category: Category,
-        paths: &[PathBuf],
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(link_text) = dropped_download_link_text(paths) else {
-            return false;
-        };
-
-        self.library.update(cx, |lib, cx| {
-            lib.download_from_clipboard(category, Some(link_text), cx);
-        });
-        true
-    }
-
     fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.toolbar
             .update(cx, |toolbar, cx| toolbar.toggle_settings(window, cx));
@@ -297,424 +264,81 @@ impl UI {
         })
     }
 
-    /// Full-window overlay that fades in while OS files are dragged over the
-    /// window, aligned with the titlebar categories.
-    fn render_drop_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let base_bg = rgba(0x70707066);
-        let highlight_bg = rgba(0x9a9a9aa6);
-        let mut columns = div().h_flex().size_full().pl(TITLEBAR_LEFT_OFFSET);
-        for category in Category::ALL {
-            let column = div()
-                .id(SharedString::from(format!(
-                    "drop-overlay:{}",
-                    category.label()
-                )))
-                .h_flex()
-                .flex_1()
-                .h_full()
-                .items_center()
-                .justify_center()
-                .border_l_1()
-                .border_color(rgba(0xffffff22))
-                .bg(base_bg)
-                .text_color(cx.theme().foreground)
-                .child(SharedString::from(category.label()))
-                .drag_over::<ExternalPaths>(move |style, paths, _, _| {
-                    if paths.paths().is_empty() {
-                        style
-                    } else {
-                        style.bg(highlight_bg)
-                    }
-                });
-
-            columns = columns.child(column.on_drop(cx.listener(
-                move |this, paths: &ExternalPaths, _, cx| {
-                    let paths = paths.paths().to_vec();
-                    if !this.download_dropped_link(category, &paths, cx) {
-                        this.library
-                            .update(cx, |lib, cx| lib.import_files(category, paths, cx));
-                    }
-                },
-            )));
+    fn handle_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.has_media_tool_problems() {
+            cx.stop_propagation();
+            return;
         }
-
-        let overlay = div()
-            .id("drop-overlay")
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .opacity(0.)
-            // `drag_over` alone does not register a hitbox. An empty `hover`
-            // keeps the overlay detectable without changing layout.
-            .hover(|style| style);
-
-        overlay
-            .drag_over::<ExternalPaths>(|style, _, _, _| style.opacity(1.))
-            .on_drop(cx.listener(|_, _: &ExternalPaths, _, _| {}))
-            .child(columns)
-    }
-
-    fn render_import_progress_modal(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let progress = self
-            .library
-            .read(cx)
-            .import_progress()
-            .cloned()
-            .expect("progress modal only renders while import progress exists");
-        let percent = progress.progress.round() as u32;
-
-        div()
-            .id("import-progress-overlay")
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .bg(rgba(0x00000099))
-            .occlude()
-            .hover(|style| style)
-            .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
-            .on_mouse_move(|_, _, cx| cx.stop_propagation())
-            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-            .on_drop(cx.listener(|_, _: &ExternalPaths, _, cx| {
+        if self.folder_tag_modal.is_some() {
+            if event.keystroke.modifiers.platform && event.keystroke.key == "a" {
+                self.select_all_folder_tag_rows(cx);
+            } else if event.keystroke.key == "escape"
+                && !self.close_folder_tag_key_menu(cx)
+                && !self.clear_folder_tag_selection(cx)
+            {
+                self.close_folder_tag_modal(cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if event.keystroke.key == "escape" {
+            if self.cancel_rename(window, cx)
+                || self.cancel_delete(cx)
+                || self.cancel_tag_edit(window, cx)
+                || self.cancel_column_visibility_menu(cx)
+                || self.cancel_tag_group_menu(cx)
+                || self.cancel_file_drag(window, cx)
+                || self.cancel_search_if_no_selection(window, cx)
+                || self.clear_selection(cx)
+            {
                 cx.stop_propagation();
-            }))
-            .child(
-                div()
-                    .size_full()
-                    .h_flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .w(px(360.))
-                            .max_w(px(520.))
-                            .v_flex()
-                            .gap_3()
-                            .p_4()
-                            .rounded(px(8.))
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .bg(cx.theme().popover)
-                            .shadow_lg()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .child("Converting media"),
-                            )
-                            .child(
-                                div()
-                                    .w_full()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(progress.file_name),
-                            )
-                            .child(
-                                Progress::new("import-progress")
-                                    .small()
-                                    .value(progress.progress),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(SharedString::from(format!("{percent}%"))),
-                            ),
-                    ),
-            )
-    }
-
-    fn render_delete_confirmation_modal(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let counts = self.table.read(cx).pending_delete_counts()?;
-        let title = match counts.kind {
-            PendingDeleteKind::Rows if counts.row_count == 1 => "Move row to Trash?",
-            PendingDeleteKind::Rows => "Move rows to Trash?",
-            PendingDeleteKind::Format => "Move format file to Trash?",
-            PendingDeleteKind::TagKey => "Remove tag column?",
-        };
-        let file_label = pluralize(counts.file_count, "file", "files");
-        let description = match counts.kind {
-            PendingDeleteKind::Rows => {
-                let row_label = pluralize(counts.row_count, "row", "rows");
-                format!(
-                    "Move {} {} ({} {}) to Trash?",
-                    counts.row_count, row_label, counts.file_count, file_label
-                )
+                return;
             }
-            PendingDeleteKind::Format => {
-                format!("Move {} {} to Trash?", counts.file_count, file_label)
-            }
-            PendingDeleteKind::TagKey => "Remove this tag column and all values in it?".to_string(),
-        };
-        let confirm_label = match counts.kind {
-            PendingDeleteKind::Rows | PendingDeleteKind::Format => "Move to Trash",
-            PendingDeleteKind::TagKey => "Remove",
-        };
-
-        Some(
-            div()
-                .id("delete-confirmation-overlay")
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .bg(rgba(0x00000099))
-                .occlude()
-                .hover(|style| style)
-                .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
-                .on_mouse_move(|_, _, cx| cx.stop_propagation())
-                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                .child(
-                    div()
-                        .size_full()
-                        .h_flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            div()
-                                .w(px(360.))
-                                .max_w(px(520.))
-                                .v_flex()
-                                .gap_3()
-                                .p_4()
-                                .rounded(px(8.))
-                                .border_1()
-                                .border_color(cx.theme().border)
-                                .bg(cx.theme().popover)
-                                .shadow_lg()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(gpui::FontWeight::BOLD)
-                                        .child(title),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(description),
-                                )
-                                .child(
-                                    div()
-                                        .h_flex()
-                                        .justify_end()
-                                        .gap_2()
-                                        .child(
-                                            Button::new("delete-cancel")
-                                                .small()
-                                                .label("Cancel")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.cancel_delete(cx);
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new("delete-confirm")
-                                                .small()
-                                                .danger()
-                                                .label(confirm_label)
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.table.update(cx, |table, cx| {
-                                                        table.confirm_pending_delete(cx);
-                                                    });
-                                                })),
-                                        ),
-                                ),
-                        ),
-                )
-                .into_any_element(),
-        )
-    }
-
-    fn render_rename_modal(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let details = self.table.read(cx).pending_rename_details()?;
-        let input = self.table.read(cx).rename_input();
-        let title = match details.kind {
-            PendingRenameKind::Rows if details.item_count == 1 => "Rename row",
-            PendingRenameKind::Rows => "Rename files",
-            PendingRenameKind::TagAll => "Rename tag",
-            PendingRenameKind::TagKey => "Rename tag column",
-        };
-        let description = match details.kind {
-            PendingRenameKind::Rows if details.item_count == 1 => {
-                let name = details.current_name.unwrap_or_else(|| "row".to_string());
-                format!("Rename {name}")
-            }
-            PendingRenameKind::Rows => {
-                let file_label = pluralize(details.file_count, "file", "files");
-                format!("Rename {} {}", details.file_count, file_label)
-            }
-            PendingRenameKind::TagAll => {
-                let name = details.current_name.unwrap_or_else(|| "tag".to_string());
-                format!("Rename all {name} tags")
-            }
-            PendingRenameKind::TagKey => {
-                let name = details.current_name.unwrap_or_else(|| "tag".to_string());
-                format!("Rename {name} column")
-            }
-        };
-
-        Some(
-            div()
-                .id("rename-overlay")
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .bg(rgba(0x00000099))
-                .occlude()
-                .hover(|style| style)
-                .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
-                .on_mouse_move(|_, _, cx| cx.stop_propagation())
-                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                .child(
-                    div()
-                        .size_full()
-                        .h_flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            div()
-                                .w(px(360.))
-                                .max_w(px(520.))
-                                .v_flex()
-                                .gap_3()
-                                .p_4()
-                                .rounded(px(8.))
-                                .border_1()
-                                .border_color(cx.theme().border)
-                                .bg(cx.theme().popover)
-                                .shadow_lg()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(gpui::FontWeight::BOLD)
-                                        .child(title),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(description),
-                                )
-                                .child(Input::new(&input).small())
-                                .child(
-                                    div()
-                                        .h_flex()
-                                        .justify_end()
-                                        .gap_2()
-                                        .child(
-                                            Button::new("rename-cancel")
-                                                .small()
-                                                .label("Cancel")
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.cancel_rename(window, cx);
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new("rename-confirm")
-                                                .small()
-                                                .when(details.bulk, |button| button.warning())
-                                                .when(!details.bulk, |button| button.primary())
-                                                .label("Apply")
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.table.update(cx, |table, cx| {
-                                                        table.confirm_pending_rename(window, cx);
-                                                    });
-                                                })),
-                                        ),
-                                ),
-                        ),
-                )
-                .into_any_element(),
-        )
-    }
-
-    fn render_media_tools_modal(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let problems = self
-            .media_tool_problems
-            .iter()
-            .map(|problem| render_media_tool_problem(problem, cx))
-            .collect::<Vec<_>>();
-
-        div()
-            .id("media-tools-overlay")
-            .absolute()
-            .top(TITLEBAR_HEIGHT)
-            .bottom_0()
-            .left_0()
-            .w_full()
-            .bg(rgba(0x00000099))
-            .occlude()
-            .hover(|style| style)
-            .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
-            .on_mouse_move(|_, _, cx| cx.stop_propagation())
-            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-            .on_drop(cx.listener(|_, _: &ExternalPaths, _, cx| {
+            cx.stop_propagation();
+        } else if event.keystroke.key == "enter" {
+            if self.confirm_rename(window, cx) || self.confirm_delete(cx) {
                 cx.stop_propagation();
-            }))
-            .child(
-                div()
-                    .size_full()
-                    .h_flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .w_full()
-                            .h(relative(0.86))
-                            .v_flex()
-                            .border_y_1()
-                            .border_color(cx.theme().border)
-                            .bg(cx.theme().popover)
-                            .shadow_lg()
-                            .child(
-                                div().w_full().flex_shrink_0().px(CONTENT_PX).py_3().child(
-                                    div()
-                                        .w_full()
-                                        .min_w_0()
-                                        .v_flex()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .text_base()
-                                                .font_weight(gpui::FontWeight::BOLD)
-                                                .child("Required tools missing"),
-                                        )
-                                        .child(
-                                            div()
-                                                .w_full()
-                                                .min_w_0()
-                                                .text_sm()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(
-                                                    "Lowcat can't function without these tools.",
-                                                ),
-                                        ),
-                                ),
-                            )
-                            .child(
-                                div().flex_1().min_h_0().overflow_hidden().child(
-                                    div()
-                                        .size_full()
-                                        .overflow_y_scrollbar()
-                                        .v_flex()
-                                        .gap_4()
-                                        .px(CONTENT_PX)
-                                        .pb_4()
-                                        .children(problems),
-                                ),
-                            )
-                            .child(
-                                div()
-                                    .w_full()
-                                    .h(px(1.))
-                                    .flex_shrink_0()
-                                    .bg(cx.theme().border),
-                            ),
-                    ),
-            )
+            }
+        } else if event.keystroke.key == "space"
+            && event.keystroke.modifiers.platform
+            && self.play_cmd_hovered_preview_from_start(cx)
+        {
+            cx.stop_propagation();
+        } else if event.keystroke.modifiers.platform && event.keystroke.key == "f" {
+            self.library.update(cx, |lib, cx| lib.close_filters(cx));
+            self.toolbar
+                .update(cx, |toolbar, cx| toolbar.focus_search(window, cx));
+            cx.stop_propagation();
+        } else if event.keystroke.modifiers.platform
+            && event.keystroke.key == "a"
+            && !self.tag_editor_is_focused(window, cx)
+            && self
+                .table
+                .update(cx, |table, cx| table.select_all_visible(window, cx))
+        {
+            debug_ui_interaction(|| "cmd-a selected visible rows".to_string());
+            cx.stop_propagation();
+        } else if self.library.read(cx).downloader_open()
+            && event.keystroke.modifiers.platform
+            && event.keystroke.key == "v"
+            && !self.text_input_is_focused(window, cx)
+        {
+            self.paste_download_for_active_category(cx);
+            cx.stop_propagation();
+        } else if Self::should_activate_search(event) && !self.text_input_is_focused(window, cx) {
+            let keystroke = event.keystroke.clone();
+            self.toolbar
+                .update(cx, |toolbar, cx| toolbar.focus_search(window, cx));
+            cx.stop_propagation();
+            window.defer(cx, move |window, cx| {
+                window.dispatch_keystroke(keystroke, cx);
+            });
+        }
     }
 }
 
@@ -754,102 +378,7 @@ impl Render for UI {
                     table.set_cmd_down(event.modifiers.platform, cx)
                 });
             }))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if this.has_media_tool_problems() {
-                    cx.stop_propagation();
-                    return;
-                }
-                if this.folder_tag_modal.is_some() {
-                    if event.keystroke.modifiers.platform && event.keystroke.key == "a" {
-                        this.select_all_folder_tag_rows(cx);
-                    } else if event.keystroke.key == "escape" {
-                        if !this.close_folder_tag_key_menu(cx)
-                            && !this.clear_folder_tag_selection(cx)
-                        {
-                            this.close_folder_tag_modal(cx);
-                        }
-                    }
-                    cx.stop_propagation();
-                    return;
-                }
-                if event.keystroke.key == "escape" {
-                    if this.cancel_rename(window, cx) {
-                        cx.stop_propagation();
-                        return;
-                    }
-                    if this.cancel_delete(cx) {
-                        cx.stop_propagation();
-                        return;
-                    }
-                    if this.cancel_tag_edit(window, cx) {
-                        cx.stop_propagation();
-                        return;
-                    }
-                    if this.cancel_column_visibility_menu(cx) {
-                        cx.stop_propagation();
-                        return;
-                    }
-                    if this.cancel_tag_group_menu(cx) {
-                        cx.stop_propagation();
-                        return;
-                    }
-                    if this.cancel_file_drag(window, cx) {
-                        cx.stop_propagation();
-                        return;
-                    }
-                    if this.cancel_search_if_no_selection(window, cx) {
-                        cx.stop_propagation();
-                        return;
-                    }
-                    if this.clear_selection(cx) {
-                        cx.stop_propagation();
-                        return;
-                    }
-                    cx.stop_propagation();
-                } else if event.keystroke.key == "enter" {
-                    if this.confirm_rename(window, cx) || this.confirm_delete(cx) {
-                        cx.stop_propagation();
-                    }
-                } else if event.keystroke.key == "space"
-                    && event.keystroke.modifiers.platform
-                    && this.play_cmd_hovered_preview_from_start(cx)
-                {
-                    cx.stop_propagation();
-                } else if event.keystroke.modifiers.platform && event.keystroke.key == "f" {
-                    this.library.update(cx, |lib, cx| {
-                        lib.close_filters(cx);
-                    });
-                    this.toolbar
-                        .update(cx, |toolbar, cx| toolbar.focus_normal_search(window, cx));
-                    cx.stop_propagation();
-                } else if event.keystroke.modifiers.platform
-                    && event.keystroke.key == "a"
-                    && !this.tag_editor_is_focused(window, cx)
-                    && this
-                        .table
-                        .update(cx, |table, cx| table.select_all_visible(window, cx))
-                {
-                    debug_ui_interaction(|| "cmd-a selected visible rows".to_string());
-                    cx.stop_propagation();
-                } else if this.library.read(cx).downloader_open()
-                    && event.keystroke.modifiers.platform
-                    && event.keystroke.key == "v"
-                    && !this.text_input_is_focused(window, cx)
-                {
-                    this.paste_download_for_active_category(cx);
-                    cx.stop_propagation();
-                } else if Self::should_activate_search(event)
-                    && !this.text_input_is_focused(window, cx)
-                {
-                    let keystroke = event.keystroke.clone();
-                    this.toolbar
-                        .update(cx, |toolbar, cx| toolbar.focus_search(window, cx));
-                    cx.stop_propagation();
-                    window.defer(cx, move |window, cx| {
-                        window.dispatch_keystroke(keystroke, cx);
-                    });
-                }
-            }))
+            .on_key_down(cx.listener(Self::handle_key_down))
             .on_action(cx.listener(|this, _: &ToggleFilters, window, cx| {
                 if this.has_media_tool_problems() {
                     return;
@@ -947,7 +476,7 @@ impl Render for UI {
                 el.child(drop_overlay)
             })
             .when(!has_media_tool_problems && import_progress_active, |el| {
-                el.child(self.render_import_progress_modal(cx))
+                el.children(self.render_import_progress_modal(cx))
             })
             .when(!has_media_tool_problems, |el| {
                 el.children(self.render_folder_tag_modal(_window, cx))
@@ -964,217 +493,14 @@ impl Render for UI {
     }
 }
 
-fn pluralize(count: usize, singular: &'static str, plural: &'static str) -> &'static str {
-    if count == 1 { singular } else { plural }
-}
-
-fn dropped_download_link_text(paths: &[PathBuf]) -> Option<String> {
-    let [path] = paths else {
-        return None;
-    };
-    let path_text = path.to_string_lossy();
-    if let Some(url) = extract_dropped_youtube_url(&path_text) {
-        return Some(url);
-    }
-    if !is_dropped_link_file(path) {
-        return None;
-    }
-    let metadata = fs::metadata(path).ok()?;
-    if !metadata.is_file() || metadata.len() > DROPPED_LINK_MAX_BYTES {
-        return None;
-    }
-
-    let bytes = fs::read(path).ok()?;
-    let text = String::from_utf8_lossy(&bytes).into_owned();
-    extract_dropped_youtube_url(&text)
-}
-
-fn extract_dropped_youtube_url(text: &str) -> Option<String> {
-    if let Ok(url) = crate::downloader::extract_youtube_url(text) {
-        return Some(url);
-    }
-
-    let lower = text.to_ascii_lowercase();
-    let markers = [
-        "https://",
-        "http://",
-        "youtube.com/",
-        "www.youtube.com/",
-        "m.youtube.com/",
-        "music.youtube.com/",
-        "youtu.be/",
-    ];
-    markers.iter().find_map(|marker| {
-        lower.match_indices(marker).find_map(|(start, _)| {
-            let rest = &text[start..];
-            let end = rest
-                .find(|c: char| {
-                    c.is_whitespace()
-                        || matches!(
-                            c,
-                            '<' | '>' | '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ','
-                        )
-                })
-                .unwrap_or(rest.len());
-            crate::downloader::extract_youtube_url(&rest[..end]).ok()
-        })
-    })
-}
-
-fn is_dropped_link_file(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("webloc" | "url" | "website" | "inetloc" | "txt")
-    )
-}
-
-fn render_media_tool_problem(problem: &MissingTool, cx: &mut Context<UI>) -> AnyElement {
-    let locations = if problem.search_locations.is_empty() {
-        "No PATH or standard fallback directories".to_string()
-    } else {
-        problem
-            .search_locations
-            .iter()
-            .map(|location| match location {
-                SearchLocation::Path => "PATH".to_string(),
-                SearchLocation::Directory(path) => path.display().to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let solution = tool_solution(problem.name);
-
-    div()
-        .w_full()
-        .min_w_0()
-        .v_flex()
-        .gap_2()
-        .pt_3()
-        .border_t_1()
-        .border_color(cx.theme().border)
-        .child(
-            div()
-                .w_full()
-                .min_w_0()
-                .text_sm()
-                .font_weight(gpui::FontWeight::BOLD)
-                .child(problem.name),
-        )
-        .child(
-            div()
-                .w_full()
-                .min_w_0()
-                .v_flex()
-                .gap_0()
-                .child(
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .text_xs()
-                        .line_height(relative(1.35))
-                        .text_color(cx.theme().muted_foreground)
-                        .child("Looked up in"),
-                )
-                .child(
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .text_xs()
-                        .line_height(relative(1.35))
-                        .text_color(cx.theme().muted_foreground)
-                        .child(locations),
-                ),
-        )
-        .child(
-            div()
-                .w_full()
-                .min_w_0()
-                .h_flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(SharedString::from(format!(
-                            "Possible solution: {}",
-                            solution.text
-                        ))),
-                )
-                .when_some(solution.url, |el, url| {
-                    el.child(
-                        Button::new(format!("download-{}", problem.name))
-                            .xsmall()
-                            .flex_shrink_0()
-                            .label("Download")
-                            .on_click(move |_, _, _| {
-                                if let Err(error) = open::that(url) {
-                                    eprintln!("failed to open {url}: {error}");
-                                }
-                            }),
-                    )
-                }),
-        )
-        .into_any_element()
+fn debug_ui_interaction(details: impl FnOnce() -> String) {
+    crate::diagnostics::debug("ui", details);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use gpui::{Keystroke, Modifiers};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_link_path(extension: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        std::env::temp_dir().join(format!(
-            "lowcat-dropped-link-{}-{nanos}.{extension}",
-            std::process::id()
-        ))
-    }
-
-    #[test]
-    fn extracts_dropped_youtube_link_file() {
-        let path = temp_link_path("webloc");
-        fs::write(
-            &path,
-            r#"<?xml version="1.0"?><plist><dict><key>URL</key><string>https://www.youtube.com/watch?v=abc123</string></dict></plist>"#,
-        )
-        .unwrap();
-
-        let text = dropped_download_link_text(&[path.clone()]).unwrap();
-
-        assert_eq!(text, "https://www.youtube.com/watch?v=abc123");
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn ignores_non_link_file_drop() {
-        let path = temp_link_path("wav");
-        fs::write(&path, "not a link").unwrap();
-
-        assert!(dropped_download_link_text(&[path.clone()]).is_none());
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn ignores_multiple_dropped_paths_for_downloader() {
-        let first = temp_link_path("url");
-        let second = temp_link_path("url");
-        fs::write(&first, "URL=https://youtu.be/abc123").unwrap();
-        fs::write(&second, "URL=https://youtu.be/def456").unwrap();
-
-        assert!(dropped_download_link_text(&[first.clone(), second.clone()]).is_none());
-        let _ = fs::remove_file(first);
-        let _ = fs::remove_file(second);
-    }
 
     #[test]
     fn space_is_left_for_focused_search_input() {
@@ -1189,40 +515,5 @@ mod tests {
         };
 
         assert!(!UI::should_activate_search(&event));
-    }
-}
-
-struct ToolSolution {
-    text: &'static str,
-    url: Option<&'static str>,
-}
-
-fn tool_solution(tool: &str) -> ToolSolution {
-    match tool {
-        "ffmpeg" => ToolSolution {
-            text: "Install FFmpeg.",
-            url: cfg!(target_os = "macos").then_some("https://formulae.brew.sh/formula/ffmpeg"),
-        },
-        "ffprobe" => ToolSolution {
-            text: "Install FFmpeg; ffprobe is included with it.",
-            url: cfg!(target_os = "macos").then_some("https://formulae.brew.sh/formula/ffmpeg"),
-        },
-        "yt-dlp" => ToolSolution {
-            text: "Install yt-dlp.",
-            url: Some("https://github.com/yt-dlp/yt-dlp/wiki/Installation"),
-        },
-        _ => ToolSolution {
-            text: "Install the missing tool.",
-            url: None,
-        },
-    }
-}
-
-fn debug_ui_interaction(details: impl FnOnce() -> String) {
-    let enabled = std::env::var("LOWCAT_DEBUG")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
-    if enabled {
-        eprintln!("[lowcat:ui] {}", details());
     }
 }

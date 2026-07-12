@@ -61,19 +61,8 @@ impl OpusSource {
             .filter(|duration| !duration.is_zero());
         let mut decoder = make_decoder(&codec_params).map_err(symphonia_error)?;
 
-        let decoded = loop {
-            let packet = probed.format.next_packet().map_err(symphonia_error)?;
-            if packet.track_id() != track_id {
-                continue;
-            }
-            match decoder.decode(&packet) {
-                Ok(decoded) if decoded.frames() > 0 => break decoded,
-                Ok(_) | Err(Error::DecodeError(_)) => continue,
-                Err(error) => return Err(symphonia_error(error)),
-            }
-        };
-        let spec = *decoded.spec();
-        let buffer = sample_buffer(decoded, &spec);
+        let (spec, buffer) = decode_next_buffer(&mut *probed.format, &mut *decoder, track_id)
+            .map_err(symphonia_error)?;
 
         Ok(Self {
             codec_params,
@@ -114,19 +103,10 @@ impl Iterator for OpusSource {
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.buffer_offset >= self.buffer.len() {
-            let decoded = loop {
-                let packet = self.format.next_packet().ok()?;
-                if packet.track_id() != self.track_id {
-                    continue;
-                }
-                match self.decoder.decode(&packet) {
-                    Ok(decoded) if decoded.frames() > 0 => break decoded,
-                    Ok(_) | Err(Error::DecodeError(_)) => continue,
-                    Err(_) => return None,
-                }
-            };
-            self.spec = *decoded.spec();
-            self.buffer = sample_buffer(decoded, &self.spec);
+            let (spec, buffer) =
+                decode_next_buffer(&mut *self.format, &mut *self.decoder, self.track_id).ok()?;
+            self.spec = spec;
+            self.buffer = buffer;
             self.buffer_offset = 0;
         }
 
@@ -179,6 +159,27 @@ fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>, Error> {
     let mut registry = CodecRegistry::new();
     registry.register_all::<OpusDecoder>();
     registry.make(params, &DecoderOptions::default())
+}
+
+fn decode_next_buffer(
+    format: &mut dyn FormatReader,
+    decoder: &mut dyn Decoder,
+    track_id: u32,
+) -> Result<(SignalSpec, SampleBuffer<Sample>), Error> {
+    loop {
+        let packet = format.next_packet()?;
+        if packet.track_id() != track_id {
+            continue;
+        }
+        match decoder.decode(&packet) {
+            Ok(decoded) if decoded.frames() > 0 => {
+                let spec = *decoded.spec();
+                return Ok((spec, sample_buffer(decoded, &spec)));
+            }
+            Ok(_) | Err(Error::DecodeError(_)) => continue,
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn sample_buffer(decoded: AudioBufferRef<'_>, spec: &SignalSpec) -> SampleBuffer<Sample> {

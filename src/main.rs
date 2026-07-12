@@ -2,6 +2,7 @@
 
 mod backend;
 mod db;
+mod diagnostics;
 mod downloader;
 mod library;
 #[cfg(target_os = "macos")]
@@ -65,7 +66,7 @@ fn main() {
             cx.hide();
         });
 
-        let library = cx.new(|cx| Library::new_for_app(cx));
+        let library = cx.new(Library::new_for_app);
         *main_library.borrow_mut() = Some(library.clone());
         cx.on_action({
             let library = library.clone();

@@ -18,15 +18,9 @@ use crate::model::{AudioFormat, Category};
 
 #[derive(Debug, Clone)]
 pub struct DownloadRequest {
-    pub category: Category,
     pub url: String,
     pub folder: PathBuf,
     pub format: AudioFormat,
-}
-
-#[derive(Debug, Clone)]
-pub struct DownloadOutput {
-    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -147,8 +141,7 @@ pub fn download_audio(
     request: DownloadRequest,
     cancel: DownloadCancel,
     mut on_progress: impl FnMut(DownloadProgressEvent),
-) -> Result<DownloadOutput, DownloadError> {
-    let _ = request.category;
+) -> Result<(), DownloadError> {
     on_progress(DownloadProgressEvent::Progress(0.));
 
     fs::create_dir_all(&request.folder).map_err(|_| DownloadError::failed("Download failed"))?;
@@ -212,12 +205,12 @@ pub fn download_audio(
                     )
                 });
                 if status.success() {
-                    let Some(path) = output_path else {
+                    if output_path.is_none() {
                         debug_ytdlp(|| "success_without_output_path".to_string());
                         return Err(DownloadError::failed("Download failed"));
-                    };
+                    }
                     on_progress(DownloadProgressEvent::Progress(100.));
-                    return Ok(DownloadOutput { path });
+                    return Ok(());
                 }
                 return Err(classify_ytdlp_error(&error_text));
             }
@@ -241,7 +234,7 @@ pub fn download_audio(
     }
 }
 
-fn spawn_ytdlp(request: &DownloadRequest, temp_dir: &PathBuf) -> io::Result<Child> {
+fn spawn_ytdlp(request: &DownloadRequest, temp_dir: &std::path::Path) -> io::Result<Child> {
     let mut command = crate::media_tools::command("yt-dlp");
     let ffmpeg_location = ytdlp_ffmpeg_location();
     command
@@ -312,12 +305,7 @@ fn ytdlp_ffmpeg_location() -> Option<PathBuf> {
 }
 
 fn debug_ytdlp(details: impl FnOnce() -> String) {
-    let enabled = env::var("LOWCAT_DEBUG")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
-    if enabled {
-        eprintln!("[lowcat:ytdlp] {}", details());
-    }
+    crate::diagnostics::debug("ytdlp", details);
 }
 
 fn log_tail(text: &str) -> String {
@@ -466,11 +454,11 @@ fn terminate_child(child: &mut Child) {
     let _ = child.wait();
 }
 
-fn cleanup_temp_dir(temp_dir: &PathBuf) {
+fn cleanup_temp_dir(temp_dir: &std::path::Path) {
     let _ = fs::remove_dir_all(temp_dir);
 }
 
-fn temp_download_dir(folder: &PathBuf) -> PathBuf {
+fn temp_download_dir(folder: &std::path::Path) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())

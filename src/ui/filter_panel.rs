@@ -38,7 +38,7 @@ struct FilterRowSnapshot {
     key: String,
     label: String,
     indented: bool,
-    checked: Vec<String>,
+    checked: BTreeSet<String>,
     values: Vec<String>,
 }
 
@@ -77,10 +77,7 @@ impl FilterPanel {
                 continue;
             }
 
-            let checked: Vec<String> = selected
-                .get(key)
-                .map(|values| values.iter().cloned().collect())
-                .unwrap_or_default();
+            let checked = selected.get(key).cloned().unwrap_or_default();
             let root_values: BTreeSet<String> = values
                 .iter()
                 .map(|value| {
@@ -558,7 +555,7 @@ impl Render for FilterPanel {
             .is_none_or(|snapshot| snapshot.revision != revision)
         {
             let library = self.library.read(cx);
-            self.snapshot = Some(Arc::new(Self::build_snapshot(&library)));
+            self.snapshot = Some(Arc::new(Self::build_snapshot(library)));
         }
         let snapshot = self
             .snapshot

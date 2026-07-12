@@ -70,16 +70,16 @@ impl SettingsMenu {
         }
     }
 
-    fn close(&mut self, reason: &'static str) {
-        let _ = reason;
+    fn close(&mut self) {
         self.open = false;
+        self.position = None;
         self.active_submenu = None;
         self.hovered_priority = None;
     }
 
     pub fn toggle_from_shortcut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.open {
-            self.close_and_restore_focus("settings-shortcut", window, cx);
+            self.close_and_restore_focus(window, cx);
             cx.notify();
         } else {
             self.open_at(
@@ -103,40 +103,23 @@ impl SettingsMenu {
         cx.notify();
     }
 
-    fn close_and_restore_focus(
-        &mut self,
-        reason: &'static str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.close(reason);
+    fn close_and_restore_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close();
         if let Some(focus) = self.previous_focus.take() {
             focus.focus(window, cx);
         }
     }
 
-    fn activate_submenu(
-        &mut self,
-        submenu: SettingsSubmenu,
-        source: &'static str,
-        cx: &mut Context<Self>,
-    ) {
+    fn activate_submenu(&mut self, submenu: SettingsSubmenu, cx: &mut Context<Self>) {
         if self.active_submenu == Some(submenu) {
             return;
         }
 
-        let _ = source;
         self.active_submenu = Some(submenu);
         cx.notify();
     }
 
-    fn set_priority_hovered(
-        &mut self,
-        format: AudioFormat,
-        hovered: bool,
-        _source: &'static str,
-        cx: &mut Context<Self>,
-    ) {
+    fn set_priority_hovered(&mut self, format: AudioFormat, hovered: bool, cx: &mut Context<Self>) {
         if hovered {
             self.hovered_priority = Some(format);
             cx.notify();
@@ -171,8 +154,6 @@ impl SettingsMenu {
 
 impl Render for SettingsMenu {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let priority = self.library.read(cx).format_priority().to_vec();
-        let metrics = menu_metrics(window, &priority);
         let settings_button = Button::new("settings-button")
             .icon(IconName::Settings)
             .small()
@@ -181,7 +162,7 @@ impl Render for SettingsMenu {
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     if this.open {
-                        this.close_and_restore_focus("settings-button", window, cx);
+                        this.close_and_restore_focus(window, cx);
                         cx.notify();
                     } else {
                         this.open_at(event.position, window, cx);
@@ -191,7 +172,9 @@ impl Render for SettingsMenu {
             );
 
         let show_priority_menu = self.active_submenu == Some(SettingsSubmenu::Priority);
-        let settings_overlay = self.position.map(|position| {
+        let settings_overlay = self.open.then_some(self.position).flatten().map(|position| {
+            let priority = self.library.read(cx).format_priority().to_vec();
+            let metrics = menu_metrics(window, &priority);
             let settings_library = self.library.clone();
             let settings_focus = self.focus.clone();
             let window_size = window.bounds().size;
@@ -218,7 +201,7 @@ impl Render for SettingsMenu {
                 })
                 .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                     if event.keystroke.key == "escape" {
-                        this.close_and_restore_focus("escape", window, cx);
+                        this.close_and_restore_focus(window, cx);
                         cx.notify();
                     }
                 }))
@@ -270,7 +253,7 @@ impl Render for SettingsMenu {
                         })
                         .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                             if *hovered {
-                                this.activate_submenu(SettingsSubmenu::Priority, "row", cx);
+                                this.activate_submenu(SettingsSubmenu::Priority, cx);
                             }
                         }))
                         .child(
@@ -331,7 +314,7 @@ impl Render for SettingsMenu {
                         .hover(|style| style.bg(cx.theme().accent))
                         .when(row_hovered, |style| style.bg(cx.theme().accent))
                         .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                            this.set_priority_hovered(format, *hovered, "row", cx);
+                            this.set_priority_hovered(format, *hovered, cx);
                         }))
                         .child(
                             div()
@@ -362,7 +345,7 @@ impl Render for SettingsMenu {
                                         .on_hover(cx.listener(
                                             move |this, hovered: &bool, _, cx| {
                                                 this.set_priority_hovered(
-                                                    format, *hovered, "up", cx,
+                                                    format, *hovered, cx,
                                                 );
                                             },
                                         ))
@@ -391,7 +374,7 @@ impl Render for SettingsMenu {
                                         .on_hover(cx.listener(
                                             move |this, hovered: &bool, _, cx| {
                                                 this.set_priority_hovered(
-                                                    format, *hovered, "down", cx,
+                                                    format, *hovered, cx,
                                                 );
                                             },
                                         ))
@@ -438,7 +421,7 @@ impl Render for SettingsMenu {
                         .cursor_pointer()
                         .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                             if *hovered {
-                                this.activate_submenu(SettingsSubmenu::Priority, "bridge", cx);
+                                this.activate_submenu(SettingsSubmenu::Priority, cx);
                             }
                         })),
                 );
@@ -452,7 +435,7 @@ impl Render for SettingsMenu {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                                this.close_and_restore_focus("outside-click", window, cx);
+                                this.close_and_restore_focus(window, cx);
                                 cx.notify();
                             }),
                         )
@@ -525,22 +508,9 @@ fn menu_metrics(window: &mut Window, priority: &[AudioFormat]) -> MenuMetrics {
     let overwrite_row_width = text_row_width(window, "Overwrite existing target")
         + menu_row_chrome(px(MENU_AFFORDANCE_PX));
     let volume_row_width = text_row_width(window, "Volume") + menu_row_chrome(px(150.));
-    let priority_rows = priority
-        .iter()
-        .map(|format| {
-            let width = (text_row_width(window, format.label())
-                + menu_row_chrome(px(PRIORITY_ACTIONS_PX)))
-            .as_f32();
-            (format.label().to_string(), width)
-        })
-        .collect::<Vec<_>>();
-    let priority_menu_width = widest_width(
-        priority_rows
-            .iter()
-            .map(|(_, width)| px(*width))
-            .collect::<Vec<_>>()
-            .into_iter(),
-    );
+    let priority_menu_width = widest_width(priority.iter().map(|format| {
+        text_row_width(window, format.label()) + menu_row_chrome(px(PRIORITY_ACTIONS_PX))
+    }));
 
     MenuMetrics {
         main_menu_width: widest_width([

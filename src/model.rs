@@ -544,7 +544,7 @@ mod tests {
 
     #[test]
     fn search_sort_prioritizes_exact_name_words() {
-        let mut records = vec![
+        let mut records = [
             rec("brass loop", &[]),
             rec("bassy", &[]),
             rec("sub bass loop", &[]),

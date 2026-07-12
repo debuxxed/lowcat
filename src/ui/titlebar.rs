@@ -26,7 +26,6 @@ pub struct AppTitleBar {
     library: Entity<Library>,
     hovered_category: Option<Category>,
     drag_hovered_category: Option<Category>,
-    drag_hover_bounds: Option<Bounds<Pixels>>,
     drag_hover_watch_running: bool,
     folder_prompt_active: bool,
     should_move_window: bool,
@@ -40,7 +39,6 @@ impl AppTitleBar {
             library,
             hovered_category: None,
             drag_hovered_category: None,
-            drag_hover_bounds: None,
             drag_hover_watch_running: false,
             folder_prompt_active: false,
             should_move_window: false,
@@ -62,7 +60,6 @@ impl AppTitleBar {
                     .update_in(cx, |this, window, cx| {
                         if !this.library.read(cx).internal_file_drag_active() {
                             this.drag_hovered_category = None;
-                            this.drag_hover_bounds = None;
                             this.drag_hover_watch_running = false;
                             cx.notify();
                             return false;
@@ -109,7 +106,6 @@ impl AppTitleBar {
         if !self.library.read(cx).internal_file_drag_active() {
             if is_current {
                 self.drag_hovered_category = None;
-                self.drag_hover_bounds = None;
                 debug_titlebar_interaction(|| {
                     format!("clear drag hover: inactive category={}", category.label())
                 });
@@ -121,7 +117,6 @@ impl AppTitleBar {
         if !has_paths {
             if is_current {
                 self.drag_hovered_category = None;
-                self.drag_hover_bounds = None;
                 debug_titlebar_interaction(|| {
                     format!(
                         "clear drag hover: empty paths category={}",
@@ -134,7 +129,6 @@ impl AppTitleBar {
         }
 
         if bounds.contains(&event_position) {
-            self.drag_hover_bounds = Some(bounds);
             self.start_drag_hover_watch(window, cx);
             if !is_current {
                 self.drag_hovered_category = Some(category);
@@ -152,7 +146,6 @@ impl AppTitleBar {
             let mouse_position = live_window_mouse_position(window);
             if !bounds.contains(&mouse_position) {
                 self.drag_hovered_category = None;
-                self.drag_hover_bounds = None;
                 debug_titlebar_interaction(|| {
                     format!(
                         "clear drag hover: actual leave category={} event_x={:.1} event_y={:.1} mouse_x={:.1} mouse_y={:.1}",
@@ -175,7 +168,6 @@ impl AppTitleBar {
         cx: &mut Context<Self>,
     ) {
         self.drag_hovered_category = None;
-        self.drag_hover_bounds = None;
         debug_titlebar_interaction(|| {
             format!("drop category={} paths={}", category.label(), paths.len())
         });
@@ -183,13 +175,7 @@ impl AppTitleBar {
             .update(cx, |lib, cx| lib.import_files(category, paths, cx));
     }
 
-    fn choose_category_folder(
-        &mut self,
-        category: Category,
-        _event: &ClickEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn choose_category_folder(&mut self, category: Category, cx: &mut Context<Self>) {
         cx.stop_propagation();
         if self.folder_prompt_active {
             return;
@@ -244,9 +230,7 @@ impl Render for AppTitleBar {
             self.start_drag_hover_watch(window, cx);
         }
         if !internal_drag_active && self.drag_hovered_category.take().is_some() {
-            self.drag_hover_bounds = None;
             debug_titlebar_interaction(|| "clear drag hover: internal drag inactive".to_string());
-            self.drag_hovered_category = None;
         }
         let outline = cx.theme().title_bar_border;
         let selected_bg = outline.opacity(0.16);
@@ -302,8 +286,8 @@ impl Render for AppTitleBar {
             } else {
                 SharedString::from(format!("Choose {} folder", category.label()))
             })
-            .on_click(cx.listener(move |this, event, window, cx| {
-                this.choose_category_folder(category, event, window, cx);
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.choose_category_folder(category, cx);
             }));
 
             let show_folder_button = can_hover && (hovered || missing_folder);
@@ -463,10 +447,5 @@ fn live_window_mouse_position(window: &Window) -> gpui::Point<Pixels> {
 }
 
 fn debug_titlebar_interaction(details: impl FnOnce() -> String) {
-    let enabled = std::env::var("LOWCAT_DEBUG")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
-    if enabled {
-        eprintln!("[lowcat:titlebar] {}", details());
-    }
+    crate::diagnostics::debug("titlebar", details);
 }

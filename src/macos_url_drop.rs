@@ -74,9 +74,9 @@ pub fn install(window: &mut Window) -> mpsc::UnboundedReceiver<String> {
 
 unsafe fn install_view_drag_methods(view_class: *mut Class) {
     unsafe {
-        let dragging_return = CStr::from_bytes_with_nul_unchecked(b"Q@:@\0").as_ptr();
-        let void_return = CStr::from_bytes_with_nul_unchecked(b"v@:@\0").as_ptr();
-        let bool_return = CStr::from_bytes_with_nul_unchecked(b"c@:@\0").as_ptr();
+        let dragging_return = c"Q@:@".as_ptr();
+        let void_return = c"v@:@".as_ptr();
+        let bool_return = c"c@:@".as_ptr();
 
         let _ = class_addMethod(
             view_class,
@@ -308,10 +308,5 @@ unsafe fn ns_array_strings(array: id) -> Vec<String> {
 }
 
 fn debug_url_drop(details: impl FnOnce() -> String) {
-    let enabled = std::env::var("LOWCAT_DEBUG")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
-    if enabled {
-        eprintln!("[lowcat:url-drop] {}", details());
-    }
+    crate::diagnostics::debug("url-drop", details);
 }

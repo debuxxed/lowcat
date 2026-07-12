@@ -93,16 +93,7 @@ impl Toolbar {
             .update(cx, |state, cx| state.focus(window, cx));
     }
 
-    pub fn focus_normal_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.search_input
-            .update(cx, |state, cx| state.focus(window, cx));
-    }
-
     pub fn search_is_focused(&self, window: &Window, cx: &App) -> bool {
-        self.normal_search_is_focused(window, cx)
-    }
-
-    pub fn normal_search_is_focused(&self, window: &Window, cx: &App) -> bool {
         self.search_input
             .read(cx)
             .focus_handle(cx)
@@ -285,7 +276,7 @@ impl Render for Toolbar {
                             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                                 if event.modifiers().alt {
                                     this.library.update(cx, |lib, cx| {
-                                        lib.remove_value(&key.clone(), &value.clone(), cx);
+                                        lib.remove_value(&key, &value, cx);
                                     });
                                 }
                             }))

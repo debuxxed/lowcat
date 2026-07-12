@@ -21,11 +21,9 @@ pub struct PreviewPlayer {
     volume: f32,
 }
 
-enum ActivePlayback {
-    Rodio {
-        player: Player,
-        started_offset: Duration,
-    },
+struct ActivePlayback {
+    player: Player,
+    started_offset: Duration,
 }
 
 impl PreviewPlayer {
@@ -88,7 +86,7 @@ impl PreviewPlayer {
         }
         player.play();
 
-        self.active = Some(ActivePlayback::Rodio {
+        self.active = Some(ActivePlayback {
             player,
             started_offset: offset,
         });
@@ -99,7 +97,7 @@ impl PreviewPlayer {
 
     pub fn set_volume(&mut self, volume: f32) {
         self.volume = volume.clamp(0., 1.);
-        if let Some(ActivePlayback::Rodio { player, .. }) = self.active.as_ref() {
+        if let Some(ActivePlayback { player, .. }) = self.active.as_ref() {
             player.set_volume(self.volume);
         }
     }
@@ -122,9 +120,7 @@ impl PreviewPlayer {
     pub fn stop(&mut self) -> Option<PreviewPosition> {
         let position = self.current_position();
         if let Some(active) = self.active.take() {
-            match active {
-                ActivePlayback::Rodio { player, .. } => player.stop(),
-            }
+            active.player.stop();
         }
         self.current_path = None;
         self.current_duration = None;
@@ -138,12 +134,8 @@ impl PreviewPlayer {
     pub fn current_position(&self) -> Option<PreviewPosition> {
         let path = self.current_path.clone()?;
         let output_delay = self.output_delay();
-        let offset = match self.active.as_ref()? {
-            ActivePlayback::Rodio {
-                player,
-                started_offset,
-            } => audible_position(player.get_pos(), *started_offset, output_delay),
-        };
+        let active = self.active.as_ref()?;
+        let offset = audible_position(active.player.get_pos(), active.started_offset, output_delay);
         Some(PreviewPosition { path, offset })
     }
 
@@ -163,9 +155,7 @@ impl PreviewPlayer {
     }
 
     pub fn finish_if_ended(&mut self) -> Option<PreviewPosition> {
-        let ended = match self.active.as_mut()? {
-            ActivePlayback::Rodio { player, .. } => player.empty(),
-        };
+        let ended = self.active.as_mut()?.player.empty();
         if !ended {
             return None;
         }
