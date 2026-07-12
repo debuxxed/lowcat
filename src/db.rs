@@ -12,13 +12,16 @@ use sqlx::{Row, SqlitePool};
 
 use crate::model::{
     AudioFormat, Category, ConvertConflictBehavior, FileRecord, FileSupport, FileVariant,
-    FolderTagAssignment, default_format_priority, normalize_format_priority, normalize_tag_key,
-    normalize_tag_value, record_matches, record_search_sort_key,
+    FolderTagAssignment, WaveformBinary256, default_format_priority, normalize_format_priority,
+    normalize_tag_key, normalize_tag_value, record_matches_scoped, record_search_sort_key_scoped,
+    split_subtag,
 };
 
 const FORMAT_PRIORITY_KEY: &str = "format_priority";
 const CONVERT_CONFLICT_KEY: &str = "convert_conflict";
 const DEFAULT_TAG_KEYS_SEEDED_KEY: &str = "default_tag_keys_seeded";
+const PREVIEW_WAVEFORM_VERSION_KEY: &str = "preview_waveform_version";
+const PREVIEW_WAVEFORM_VERSION: &str = "2";
 
 pub struct Database {
     pool: SqlitePool,
@@ -31,6 +34,7 @@ struct FileRow {
     size: u64,
     modified: i64,
     first_seen_at: i64,
+    preview_waveform: Option<WaveformBinary256>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +85,7 @@ impl Database {
                     size INTEGER NOT NULL,
                     modified INTEGER NOT NULL,
                     first_seen_at INTEGER NOT NULL DEFAULT 0,
+                    preview_waveform BLOB CHECK(preview_waveform IS NULL OR length(preview_waveform) = 256),
                     search_text TEXT NOT NULL
                 )",
                 "CREATE INDEX IF NOT EXISTS files_category_stem ON files(category, stem)",
@@ -107,6 +112,7 @@ impl Database {
             }
             migrate_tag_keys(&self.pool).await?;
             migrate_files_first_seen_at(&self.pool).await?;
+            migrate_files_preview_waveform(&self.pool).await?;
             seed_tag_keys_from_values(&self.pool).await?;
             seed_default_tag_keys(&self.pool).await?;
 
@@ -172,14 +178,18 @@ impl Database {
                 }
 
                 sqlx::query(
-                    "INSERT INTO files(category, path, stem, extension, size, modified, first_seen_at, search_text)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    "INSERT INTO files(category, path, stem, extension, size, modified, first_seen_at, preview_waveform, search_text)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)
                      ON CONFLICT(path) DO UPDATE SET
                         category = excluded.category,
                         stem = excluded.stem,
                         extension = excluded.extension,
                         size = excluded.size,
                         modified = excluded.modified,
+                        preview_waveform = CASE
+                            WHEN files.size != excluded.size OR files.modified != excluded.modified THEN NULL
+                            ELSE files.preview_waveform
+                        END,
                         search_text = excluded.search_text",
                 )
                 .bind(category_key)
@@ -290,10 +300,22 @@ impl Database {
         priority: &[AudioFormat],
         category_folder: Option<&Path>,
     ) -> io::Result<Vec<FileRecord>> {
+        self.query_visible_rows_scoped(category, search, selected, true, priority, category_folder)
+    }
+
+    pub fn query_visible_rows_scoped(
+        &self,
+        category: Category,
+        search: &str,
+        selected: &BTreeMap<String, BTreeSet<String>>,
+        include_tags: bool,
+        priority: &[AudioFormat],
+        category_folder: Option<&Path>,
+    ) -> io::Result<Vec<FileRecord>> {
         let selected = canonical_selected(selected);
         let has_filter = !search.is_empty() || selected.values().any(|values| !values.is_empty());
         let (rows, tags) = if has_filter && search.is_ascii() {
-            let stems = self.matching_stems(category, search, &selected)?;
+            let stems = self.matching_stems(category, search, &selected, include_tags)?;
             if stems.is_empty() {
                 return Ok(Vec::new());
             }
@@ -323,6 +345,7 @@ impl Database {
                 size: row.size,
                 modified: row.modified,
                 first_seen_at: row.first_seen_at,
+                waveform: row.preview_waveform,
             });
         }
 
@@ -343,12 +366,12 @@ impl Database {
                 variants,
                 tags,
             };
-            if record_matches(&record, search, &selected) {
+            if record_matches_scoped(&record, search, &selected, include_tags) {
                 records.push(record);
             }
         }
 
-        records.sort_by_key(|record| record_search_sort_key(record, search));
+        records.sort_by_key(|record| record_search_sort_key_scoped(record, search, include_tags));
         Ok(records)
     }
 
@@ -524,15 +547,31 @@ impl Database {
         };
         block_on(async {
             ensure_tag_key(&self.pool, category, &key).await?;
+            let category = category_key(category);
+            let mut tx = self.pool.begin().await?;
+            if let Some((parent, _)) = split_subtag(&value) {
+                sqlx::query(
+                    "DELETE FROM tag_values
+                     WHERE category = ? AND stem = ? AND key = ?
+                       AND value LIKE ? ESCAPE '\\'",
+                )
+                .bind(category)
+                .bind(stem)
+                .bind(&key)
+                .bind(like_descendant_pattern(parent))
+                .execute(&mut *tx)
+                .await?;
+            }
             sqlx::query(
                 "INSERT OR IGNORE INTO tag_values(category, stem, key, value) VALUES (?, ?, ?, ?)",
             )
-            .bind(category_key(category))
+            .bind(category)
             .bind(stem)
             .bind(&key)
             .bind(value)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+            tx.commit().await?;
             Ok::<_, sqlx::Error>(())
         })
         .map_err(io::Error::other)
@@ -589,6 +628,20 @@ impl Database {
         block_on(async {
             let category = category_key(category);
             let mut tx = self.pool.begin().await?;
+            if let Some((parent, _)) = split_subtag(&new_value) {
+                sqlx::query(
+                    "DELETE FROM tag_values
+                     WHERE category = ? AND stem = ? AND key = ? AND value != ?
+                       AND value LIKE ? ESCAPE '\\'",
+                )
+                .bind(category)
+                .bind(stem)
+                .bind(&key)
+                .bind(&old_value)
+                .bind(like_descendant_pattern(parent))
+                .execute(&mut *tx)
+                .await?;
+            }
             sqlx::query(
                 "INSERT OR IGNORE INTO tag_values(category, stem, key, value)
                  SELECT category, stem, key, ?
@@ -652,6 +705,64 @@ impl Database {
         .map_err(io::Error::other)
     }
 
+    pub fn copy_stem_tags_between_categories(
+        &self,
+        source: Category,
+        destination: Category,
+        source_stem: &str,
+        destination_stem: &str,
+    ) -> io::Result<()> {
+        if source == destination {
+            return self.rename_stem_tags(source, source_stem, destination_stem);
+        }
+        block_on(async {
+            let source_category = category_key(source);
+            let destination_category = category_key(destination);
+            let rows = sqlx::query(
+                "SELECT key, value FROM tag_values
+                 WHERE category = ? AND stem = ?",
+            )
+            .bind(source_category)
+            .bind(source_stem)
+            .fetch_all(&self.pool)
+            .await?;
+
+            let mut tx = self.pool.begin().await?;
+            for row in rows {
+                let source_key: String = row.get("key");
+                let value: String = row.get("value");
+                let destination_key = sqlx::query(
+                    "SELECT key FROM tag_keys
+                     WHERE category = ? AND key = ? COLLATE NOCASE",
+                )
+                .bind(destination_category)
+                .bind(&source_key)
+                .fetch_optional(&mut *tx)
+                .await?
+                .map(|row| row.get::<String, _>("key"))
+                .unwrap_or(source_key);
+                sqlx::query("INSERT OR IGNORE INTO tag_keys(category, key) VALUES (?, ?)")
+                    .bind(destination_category)
+                    .bind(&destination_key)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query(
+                    "INSERT OR IGNORE INTO tag_values(category, stem, key, value)
+                     VALUES (?, ?, ?, ?)",
+                )
+                .bind(destination_category)
+                .bind(destination_stem)
+                .bind(destination_key)
+                .bind(value)
+                .execute(&mut *tx)
+                .await?;
+            }
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(())
+        })
+        .map_err(io::Error::other)
+    }
+
     pub fn rename_tag_value(
         &self,
         category: Category,
@@ -674,6 +785,26 @@ impl Database {
         block_on(async {
             let category = category_key(category);
             let mut tx = self.pool.begin().await?;
+            if let Some((parent, _)) = split_subtag(&new_value) {
+                sqlx::query(
+                    "DELETE FROM tag_values
+                     WHERE category = ? AND key = ? AND value != ?
+                       AND value LIKE ? ESCAPE '\\'
+                       AND stem IN (
+                         SELECT stem FROM tag_values
+                         WHERE category = ? AND key = ? AND value = ?
+                       )",
+                )
+                .bind(category)
+                .bind(&key)
+                .bind(&old_value)
+                .bind(like_descendant_pattern(parent))
+                .bind(category)
+                .bind(&key)
+                .bind(&old_value)
+                .execute(&mut *tx)
+                .await?;
+            }
             sqlx::query(
                 "INSERT OR IGNORE INTO tag_values(category, stem, key, value)
                  SELECT category, stem, key, ?
@@ -791,6 +922,50 @@ impl Database {
         .map_err(io::Error::other)
     }
 
+    pub fn missing_waveform_cache_paths(&self, limit: usize) -> io::Result<Vec<PathBuf>> {
+        let rows = block_on(async {
+            sqlx::query(
+                "SELECT path FROM files
+                 WHERE preview_waveform IS NULL
+                 ORDER BY first_seen_at, path
+                 LIMIT ?",
+            )
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+        })
+        .map_err(io::Error::other)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| PathBuf::from(row.get::<String, _>("path")))
+            .collect())
+    }
+
+    pub fn set_preview_waveform(&self, path: &Path, waveform: WaveformBinary256) -> io::Result<()> {
+        block_on(async {
+            sqlx::query("UPDATE files SET preview_waveform = ? WHERE path = ?")
+                .bind(waveform.as_slice())
+                .bind(path.to_string_lossy().as_ref())
+                .execute(&self.pool)
+                .await?;
+            Ok::<_, sqlx::Error>(())
+        })
+        .map_err(io::Error::other)
+    }
+
+    #[cfg(test)]
+    pub fn clear_preview_waveform(&self, path: &Path) -> io::Result<()> {
+        block_on(async {
+            sqlx::query("UPDATE files SET preview_waveform = NULL WHERE path = ?")
+                .bind(path.to_string_lossy().as_ref())
+                .execute(&self.pool)
+                .await?;
+            Ok::<_, sqlx::Error>(())
+        })
+        .map_err(io::Error::other)
+    }
+
     pub fn format_priority(&self) -> io::Result<Vec<AudioFormat>> {
         let value = self.setting(FORMAT_PRIORITY_KEY)?;
         let priority = value
@@ -840,6 +1015,7 @@ impl Database {
                 Alias::new("size"),
                 Alias::new("modified"),
                 Alias::new("first_seen_at"),
+                Alias::new("preview_waveform"),
             ])
             .from(files)
             .and_where(Expr::col(Alias::new("category")).eq(category_key(category)));
@@ -856,6 +1032,7 @@ impl Database {
         category: Category,
         search: &str,
         selected: &BTreeMap<String, BTreeSet<String>>,
+        include_tags: bool,
     ) -> io::Result<Vec<String>> {
         let mut sql = String::from(
             "SELECT DISTINCT f.stem FROM files f
@@ -863,10 +1040,12 @@ impl Database {
         );
         if !search.is_empty() {
             sql.push_str(
-                " AND (
-                    lower(f.stem) LIKE ? ESCAPE '\\'
-                    OR lower(f.extension) LIKE ? ESCAPE '\\'
-                    OR EXISTS (
+                " AND (lower(f.stem) LIKE ? ESCAPE '\\'
+                    OR lower(f.extension) LIKE ? ESCAPE '\\'",
+            );
+            if include_tags {
+                sql.push_str(
+                    " OR EXISTS (
                         SELECT 1 FROM tag_values tv
                         WHERE tv.category = f.category
                           AND tv.stem = f.stem
@@ -874,9 +1053,10 @@ impl Database {
                             lower(tv.key) LIKE ? ESCAPE '\\'
                             OR lower(tv.value) LIKE ? ESCAPE '\\'
                           )
-                    )
-                )",
-            );
+                    )",
+                );
+            }
+            sql.push(')');
         }
         for values in selected.values() {
             for _ in values {
@@ -886,7 +1066,10 @@ impl Database {
                         WHERE selected_tv.category = f.category
                           AND selected_tv.stem = f.stem
                           AND lower(selected_tv.key) = lower(?)
-                          AND selected_tv.value = ?
+                          AND (
+                            selected_tv.value = ?
+                            OR selected_tv.value LIKE ? ESCAPE '\\'
+                          )
                     )",
                 );
             }
@@ -897,15 +1080,17 @@ impl Database {
         let rows = block_on(async {
             let mut query = sqlx::query(&sql).bind(category_key(category));
             if !search.is_empty() {
-                query = query
-                    .bind(&search_pattern)
-                    .bind(&search_pattern)
-                    .bind(&search_pattern)
-                    .bind(&search_pattern);
+                query = query.bind(&search_pattern).bind(&search_pattern);
+                if include_tags {
+                    query = query.bind(&search_pattern).bind(&search_pattern);
+                }
             }
             for (key, values) in selected {
                 for value in values {
-                    query = query.bind(key).bind(value);
+                    query = query
+                        .bind(key)
+                        .bind(value)
+                        .bind(like_descendant_pattern(value));
                 }
             }
             query.fetch_all(&self.pool).await
@@ -927,7 +1112,7 @@ impl Database {
         for chunk in stems.chunks(500) {
             let placeholders = placeholders(chunk.len());
             let sql = format!(
-                "SELECT path, stem, extension, size, modified, first_seen_at FROM files
+                "SELECT path, stem, extension, size, modified, first_seen_at, preview_waveform FROM files
                  WHERE category = ? AND stem IN ({placeholders})
                  ORDER BY stem, extension"
             );
@@ -1050,6 +1235,39 @@ async fn migrate_files_first_seen_at(pool: &SqlitePool) -> Result<(), sqlx::Erro
     sqlx::query("UPDATE files SET first_seen_at = rowid WHERE first_seen_at = 0")
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+async fn migrate_files_preview_waveform(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let columns = sqlx::query("PRAGMA table_info(files)")
+        .fetch_all(pool)
+        .await?;
+    let has_preview_waveform = columns
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "preview_waveform");
+    if !has_preview_waveform {
+        sqlx::query(
+            "ALTER TABLE files
+             ADD COLUMN preview_waveform BLOB CHECK(preview_waveform IS NULL OR length(preview_waveform) = 256)",
+        )
+        .execute(pool)
+        .await?;
+    }
+    let current_version = sqlx::query("SELECT value FROM settings WHERE key = ?")
+        .bind(PREVIEW_WAVEFORM_VERSION_KEY)
+        .fetch_optional(pool)
+        .await?
+        .map(|row| row.get::<String, _>("value"));
+    if current_version.as_deref() != Some(PREVIEW_WAVEFORM_VERSION) {
+        sqlx::query("UPDATE files SET preview_waveform = NULL")
+            .execute(pool)
+            .await?;
+        sqlx::query("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)")
+            .bind(PREVIEW_WAVEFORM_VERSION_KEY)
+            .bind(PREVIEW_WAVEFORM_VERSION)
+            .execute(pool)
+            .await?;
+    }
     Ok(())
 }
 
@@ -1183,6 +1401,11 @@ fn sort_variants(variants: &mut [FileVariant], priority: &[AudioFormat]) {
 }
 
 fn file_row_from_sql(row: sqlx::sqlite::SqliteRow) -> FileRow {
+    let preview_waveform = row
+        .try_get::<Option<Vec<u8>>, _>("preview_waveform")
+        .ok()
+        .flatten()
+        .and_then(|bytes| bytes.try_into().ok());
     FileRow {
         path: PathBuf::from(row.get::<String, _>("path")),
         stem: row.get("stem"),
@@ -1190,6 +1413,7 @@ fn file_row_from_sql(row: sqlx::sqlite::SqliteRow) -> FileRow {
         size: row.get::<i64, _>("size") as u64,
         modified: row.get("modified"),
         first_seen_at: row.get("first_seen_at"),
+        preview_waveform,
     }
 }
 
@@ -1285,6 +1509,18 @@ fn like_subsequence_pattern(value: &str) -> String {
     pattern
 }
 
+fn like_descendant_pattern(value: &str) -> String {
+    let mut pattern = String::with_capacity(value.len() + 2);
+    for ch in value.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(ch);
+    }
+    pattern.push_str("/%");
+    pattern
+}
+
 fn folder_tag_values(category_folder: &Path, path: &Path) -> Vec<String> {
     let Some(parent) = path
         .strip_prefix(category_folder)
@@ -1372,6 +1608,10 @@ mod tests {
             modified: 1,
             tags: BTreeMap::new(),
         }
+    }
+
+    fn waveform(value: u8) -> WaveformBinary256 {
+        [value; 256]
     }
 
     #[test]
@@ -1583,6 +1823,184 @@ mod tests {
     }
 
     #[test]
+    fn open_migrates_legacy_files_table_with_preview_waveform() {
+        let path = db_path("legacy-preview-waveform");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        block_on(async {
+            let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+                .unwrap()
+                .create_if_missing(true);
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(options)
+                .await
+                .unwrap();
+            sqlx::query(
+                "CREATE TABLE files (
+                    category TEXT NOT NULL,
+                    path TEXT NOT NULL PRIMARY KEY,
+                    stem TEXT NOT NULL,
+                    extension TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    modified INTEGER NOT NULL,
+                    first_seen_at INTEGER NOT NULL DEFAULT 1,
+                    search_text TEXT NOT NULL
+                )",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO files(category, path, stem, extension, size, modified, search_text)
+                 VALUES ('music', '/tmp/song.wav', 'song', 'wav', 1, 1, 'song wav music')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        });
+
+        let db = Database::open(&path).unwrap();
+        let rows = db
+            .query_visible_rows(
+                Category::Music,
+                "",
+                &BTreeMap::new(),
+                &default_format_priority(),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].variants[0].waveform.is_none());
+        assert_eq!(
+            db.missing_waveform_cache_paths(10).unwrap(),
+            vec![PathBuf::from("/tmp/song.wav")]
+        );
+    }
+
+    #[test]
+    fn set_preview_waveform_round_trips_binary256() {
+        let db = Database::open(&db_path("waveform-round-trip")).unwrap();
+        let path = PathBuf::from("/tmp/song.wav");
+        db.sync_category(Category::Music, vec![scan_path("/tmp/song.wav")])
+            .unwrap();
+
+        db.set_preview_waveform(&path, waveform(42)).unwrap();
+        let rows = db
+            .query_visible_rows(
+                Category::Music,
+                "",
+                &BTreeMap::new(),
+                &default_format_priority(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(rows[0].variants[0].waveform, Some(waveform(42)));
+
+        db.clear_preview_waveform(&path).unwrap();
+        let rows = db
+            .query_visible_rows(
+                Category::Music,
+                "",
+                &BTreeMap::new(),
+                &default_format_priority(),
+                None,
+            )
+            .unwrap();
+        assert!(rows[0].variants[0].waveform.is_none());
+    }
+
+    #[test]
+    fn opening_new_waveform_version_invalidates_cached_shapes() {
+        let db_path = db_path("waveform-version");
+        let db = Database::open(&db_path).unwrap();
+        let path = PathBuf::from("/tmp/song.wav");
+        db.sync_category(Category::Music, vec![scan_path("/tmp/song.wav")])
+            .unwrap();
+        db.set_preview_waveform(&path, waveform(42)).unwrap();
+        db.set_setting(PREVIEW_WAVEFORM_VERSION_KEY, "1").unwrap();
+        drop(db);
+
+        let db = Database::open(&db_path).unwrap();
+        assert_eq!(db.missing_waveform_cache_paths(10).unwrap(), vec![path]);
+        assert_eq!(
+            db.setting(PREVIEW_WAVEFORM_VERSION_KEY).unwrap().as_deref(),
+            Some(PREVIEW_WAVEFORM_VERSION)
+        );
+    }
+
+    #[test]
+    fn sync_category_preserves_preview_waveform_when_file_unchanged() {
+        let db = Database::open(&db_path("waveform-preserve")).unwrap();
+        let path = PathBuf::from("/tmp/song.wav");
+        let record = scan_path("/tmp/song.wav");
+        db.sync_category(Category::Music, vec![record.clone()])
+            .unwrap();
+        db.set_preview_waveform(&path, waveform(99)).unwrap();
+
+        db.sync_category(Category::Music, vec![record]).unwrap();
+
+        let rows = db
+            .query_visible_rows(
+                Category::Music,
+                "",
+                &BTreeMap::new(),
+                &default_format_priority(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(rows[0].variants[0].waveform, Some(waveform(99)));
+    }
+
+    #[test]
+    fn sync_category_clears_preview_waveform_when_file_changes() {
+        let db = Database::open(&db_path("waveform-invalidate")).unwrap();
+        let path = PathBuf::from("/tmp/song.wav");
+        let mut record = scan_path("/tmp/song.wav");
+        db.sync_category(Category::Music, vec![record.clone()])
+            .unwrap();
+        db.set_preview_waveform(&path, waveform(99)).unwrap();
+
+        record.size += 1;
+        db.sync_category(Category::Music, vec![record]).unwrap();
+
+        let rows = db
+            .query_visible_rows(
+                Category::Music,
+                "",
+                &BTreeMap::new(),
+                &default_format_priority(),
+                None,
+            )
+            .unwrap();
+        assert!(rows[0].variants[0].waveform.is_none());
+    }
+
+    #[test]
+    fn missing_waveform_cache_paths_returns_uncached_files() {
+        let db = Database::open(&db_path("waveform-missing")).unwrap();
+        db.sync_category(
+            Category::Music,
+            vec![scan_path("/tmp/a.wav"), scan_path("/tmp/b.wav")],
+        )
+        .unwrap();
+        db.set_preview_waveform(Path::new("/tmp/a.wav"), waveform(1))
+            .unwrap();
+
+        assert_eq!(
+            db.missing_waveform_cache_paths(10).unwrap(),
+            vec![PathBuf::from("/tmp/b.wav")]
+        );
+        assert_eq!(
+            db.missing_waveform_cache_paths(0).unwrap(),
+            Vec::<PathBuf>::new()
+        );
+    }
+
+    #[test]
     fn sync_category_preserves_removed_last_tag() {
         let db = Database::open(&db_path("sync-category-removed-last-tag")).unwrap();
 
@@ -1704,6 +2122,52 @@ mod tests {
             vec!["mp3", "flac"]
         );
         assert_eq!(rows[0].tags["GENRE"], vec!["Electronic"]);
+    }
+
+    #[test]
+    fn adding_subtag_replaces_existing_sibling_for_stem() {
+        let db = Database::open(&db_path("replace-subtag")).unwrap();
+        db.sync_category(Category::Music, vec![scan("post.flac", &[])])
+            .unwrap();
+
+        db.add_tag(Category::Music, "post", "Use", "shitpost/comedy")
+            .unwrap();
+        db.add_tag(Category::Music, "post", "Use", "shitpost/meme")
+            .unwrap();
+
+        let rows = db
+            .query_visible_rows(
+                Category::Music,
+                "",
+                &BTreeMap::new(),
+                &default_format_priority(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(rows[0].tags["use"], vec!["shitpost/meme"]);
+    }
+
+    #[test]
+    fn parent_filter_matches_stored_subtag_path() {
+        let db = Database::open(&db_path("filter-subtag-parent")).unwrap();
+        db.sync_category(Category::Music, vec![scan("post.flac", &[])])
+            .unwrap();
+        db.add_tag(Category::Music, "post", "Use", "shitpost/comedy")
+            .unwrap();
+
+        let selected =
+            BTreeMap::from([("use".to_string(), BTreeSet::from(["shitpost".to_string()]))]);
+        let rows = db
+            .query_visible_rows(
+                Category::Music,
+                "",
+                &selected,
+                &default_format_priority(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tags["use"], vec!["shitpost/comedy"]);
     }
 
     #[test]

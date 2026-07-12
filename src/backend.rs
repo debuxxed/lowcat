@@ -13,7 +13,7 @@ use lofty::ogg::{OpusFile, VorbisComments};
 use crate::db::{Database, FileScanRecord};
 use crate::model::{
     AudioFormat, Category, ConvertConflictBehavior, FileRecord, FolderTagAssignment,
-    canonical_tag_key, supported_audio_extension,
+    WaveformBinary256, supported_audio_extension,
 };
 
 #[derive(Clone, Debug)]
@@ -44,6 +44,7 @@ impl Backend {
         self.folders.insert(category, path);
     }
 
+    #[cfg(test)]
     pub fn refresh_all(&mut self) -> io::Result<()> {
         for category in Category::ALL {
             self.refresh_category(category)?;
@@ -111,6 +112,28 @@ impl Backend {
                 category,
                 search,
                 selected,
+                &self
+                    .format_priority()
+                    .unwrap_or_else(|_| crate::model::default_format_priority()),
+                category_folder,
+            )
+            .unwrap_or_default()
+    }
+
+    pub fn filter_scoped(
+        &self,
+        category: Category,
+        search: &str,
+        selected: &BTreeMap<String, BTreeSet<String>>,
+        include_tags: bool,
+    ) -> Vec<FileRecord> {
+        let category_folder = self.folders.get(&category).map(PathBuf::as_path);
+        self.db
+            .query_visible_rows_scoped(
+                category,
+                search,
+                selected,
+                include_tags,
                 &self
                     .format_priority()
                     .unwrap_or_else(|_| crate::model::default_format_priority()),
@@ -196,6 +219,21 @@ impl Backend {
         Ok(records.iter().map(|record| record.paths.len()).sum())
     }
 
+    pub fn copy_tags_between_categories(
+        &mut self,
+        source: Category,
+        destination: Category,
+        source_path: &Path,
+        destination_path: &Path,
+    ) -> io::Result<()> {
+        self.db.copy_stem_tags_between_categories(
+            source,
+            destination,
+            &file_stem(source_path),
+            &file_stem(destination_path),
+        )
+    }
+
     pub fn rename_tag_value(
         &mut self,
         category: Category,
@@ -232,11 +270,24 @@ impl Backend {
         self.db.assign_folder_tags(category, folder, assignments)
     }
 
+    pub fn missing_waveform_cache_paths(&self, limit: usize) -> io::Result<Vec<PathBuf>> {
+        self.db.missing_waveform_cache_paths(limit)
+    }
+
+    pub fn set_preview_waveform(&self, path: &Path, waveform: WaveformBinary256) -> io::Result<()> {
+        self.db.set_preview_waveform(path, waveform)
+    }
+
+    #[cfg(test)]
+    pub fn clear_preview_waveform(&self, path: &Path) -> io::Result<()> {
+        self.db.clear_preview_waveform(path)
+    }
+
     /// Import `source` into `category`'s folder. Supported formats are copied as-is.
     /// The source is only removed
     /// after the destination has been written and verified, so a failed import
     /// never deletes the source. Returns an error if the category has no folder.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn import(&mut self, category: Category, source: &Path) -> io::Result<()> {
         let folder = self.folders.get(&category).cloned().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "category has no configured folder")
@@ -427,7 +478,7 @@ pub fn import_to_folder(
     folder: &Path,
     source: &Path,
     mut on_conversion_progress: impl FnMut(f32),
-) -> io::Result<()> {
+) -> io::Result<PathBuf> {
     if !folder.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -476,7 +527,7 @@ pub fn import_to_folder(
     }
 
     fs::remove_file(source)?;
-    Ok(())
+    Ok(final_path)
 }
 
 fn probe_is_audio(path: &Path) -> bool {
@@ -691,7 +742,7 @@ fn temp_destination(folder: &Path, extension: &str) -> PathBuf {
 }
 
 fn canonical_category_key(category: Category, key: &str) -> Option<&'static str> {
-    let key = canonical_tag_key(key)?;
+    let key = crate::model::canonical_tag_key(key)?;
     category.tag_keys().contains(&key).then_some(key)
 }
 
@@ -700,12 +751,6 @@ fn is_library_file(path: &Path) -> bool {
         .and_then(|ext| ext.to_str())
         .and_then(supported_audio_extension)
         .is_some()
-}
-
-fn read_scan_record(category: Category, path: &Path) -> io::Result<FileScanRecord> {
-    let metadata = fs::metadata(path)?;
-    let tags = read_tags(category, path).unwrap_or_default();
-    read_scan_record_with_tags(path, metadata.len(), modified_secs(&metadata), tags)
 }
 
 fn read_scan_record_cached(
@@ -765,25 +810,6 @@ fn file_stem(path: &Path) -> String {
         .and_then(|stem| stem.to_str())
         .unwrap_or_default()
         .to_string()
-}
-
-#[allow(dead_code)]
-fn read_record(category: Category, path: &Path) -> io::Result<FileRecord> {
-    let scan = read_scan_record(category, path)?;
-    Ok(FileRecord {
-        name: scan.stem.clone(),
-        path: path.to_path_buf(),
-        support: crate::model::FileSupport::Native,
-        stem: scan.stem,
-        variants: vec![crate::model::FileVariant {
-            path: scan.path,
-            extension: scan.extension,
-            size: scan.size,
-            modified: scan.modified,
-            first_seen_at: 0,
-        }],
-        tags: scan.tags,
-    })
 }
 
 fn is_taggable_file(path: &Path) -> bool {
@@ -1115,7 +1141,12 @@ mod tests {
         fixture(
             &dir,
             "tagged.flac",
-            &[("genre", "Ambient"), ("MoOd", "Calm"), ("TYPE", "Ignored")],
+            &[
+                ("genre", "Ambient"),
+                ("MoOd", "Calm"),
+                ("TYPE", "Ignored"),
+                ("Shitpost", "Yes"),
+            ],
         );
 
         let mut backend = backend("read-tags");
@@ -1124,6 +1155,7 @@ mod tests {
 
         assert_eq!(records[0].tags["GENRE"], vec!["Ambient"]);
         assert_eq!(records[0].tags["MOOD"], vec!["Calm"]);
+        assert!(!records[0].tags.contains_key("shitpost"));
         assert!(!records[0].tags.contains_key("TYPE"));
     }
 

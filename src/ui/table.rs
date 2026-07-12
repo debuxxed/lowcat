@@ -4,14 +4,20 @@ use std::collections::BTreeSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use futures::{StreamExt as _, channel::mpsc};
 use gpui::{
-    Anchor, AnyElement, App, AppContext as _, AsyncApp, ClickEvent, Context, DismissEvent, Entity,
-    FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyDownEvent, Keystroke,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions,
-    Pixels, Point, Render, SharedString, Size, StatefulInteractiveElement as _, Styled, Window,
-    anchored, deferred, div, hsla, prelude::FluentBuilder as _, px, red, size,
+    Anchor, AnyElement, App, AppContext as _, AsyncApp, Bounds, ClickEvent, Context, CursorStyle,
+    DismissEvent, DispatchPhase, Element, ElementId, Entity, FocusHandle, Focusable,
+    GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, InteractiveElement as _,
+    IntoElement, KeyDownEvent, Keystroke, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Point, Render, SharedString, Size,
+    StatefulInteractiveElement as _, Style, Styled, Window, anchored, deferred, div, fill, hsla,
+    point, prelude::FluentBuilder as _, px, red, relative, size, white,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable, StyledExt, VirtualListScrollHandle,
@@ -24,10 +30,11 @@ use gpui_component::{
 };
 
 use crate::ui::CONTENT_PX;
+use crate::ui::titlebar::{TITLEBAR_HEIGHT, TITLEBAR_LEFT_OFFSET};
 use crate::{
     backend::RenameRecord,
     library::{Library, LibraryEvent},
-    model::{AudioFormat, Category, FileRecord},
+    model::{AudioFormat, Category, FileRecord, WAVEFORM_BAR_COUNT, WaveformBinary256},
 };
 
 const TAG_CELL_LEFT_PADDING_WIDTH: f32 = 12.;
@@ -39,14 +46,131 @@ const TAG_TEXT_WIDTH: f32 = 7.;
 const TAG_EDITOR_WIDTH: f32 = 90.;
 const TAG_KEY_ACTION_WIDTH: f32 = 32.;
 const TAG_KEY_EDITOR_WIDTH: f32 = 118.;
-const FILE_DRAG_THRESHOLD_PX: f32 = 4.;
 const CONVERT_MENU_PANE_WIDTH: f32 = 160.;
 const ROW_HEIGHT: Pixels = px(32.);
 
-struct PendingFileDrag {
+#[derive(Clone)]
+pub(super) struct InternalFileDrag {
+    data: Arc<Mutex<InternalFileDragData>>,
+}
+
+#[derive(Clone)]
+struct InternalFileDragData {
     label: String,
     paths: Vec<PathBuf>,
-    origin: Point<Pixels>,
+}
+
+impl InternalFileDrag {
+    fn new(label: String, paths: Vec<PathBuf>) -> Self {
+        Self {
+            data: Arc::new(Mutex::new(InternalFileDragData { label, paths })),
+        }
+    }
+
+    fn replace(&self, label: String, paths: Vec<PathBuf>) {
+        *self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            InternalFileDragData { label, paths };
+    }
+
+    fn snapshot(&self) -> InternalFileDragData {
+        self.data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn same_gesture(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.data, &other.data)
+    }
+
+    pub(super) fn paths(&self) -> Vec<PathBuf> {
+        self.snapshot().paths
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .paths
+            .is_empty()
+    }
+}
+
+struct PendingFileDrag {
+    drag: InternalFileDrag,
+}
+
+struct ActiveFileDrag {
+    label: String,
+    paths: Vec<PathBuf>,
+}
+
+struct FileDragPreview {
+    label: SharedString,
+    cursor_offset: Point<Pixels>,
+}
+
+impl FileDragPreview {
+    fn new(drag: &InternalFileDrag, cursor_offset: Point<Pixels>) -> Self {
+        let data = drag.snapshot();
+        let label = if data.paths.len() > 1 {
+            format!("{} · {} files", data.label, data.paths.len())
+        } else {
+            data.label
+        };
+        Self {
+            label: SharedString::from(label),
+            cursor_offset,
+        }
+    }
+}
+
+impl Render for FileDragPreview {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .pl(self.cursor_offset.x + px(8.))
+            .pt(self.cursor_offset.y + px(8.))
+            .child(
+                div()
+                    .h(px(28.))
+                    .max_w(px(190.))
+                    .h_flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().popover)
+                    .text_color(cx.theme().foreground)
+                    .text_sm()
+                    .shadow_md()
+                    .child(Icon::new(IconName::File).small())
+                    .child(div().min_w_0().truncate().child(self.label.clone())),
+            )
+    }
+}
+
+#[derive(Clone, Default)]
+struct NativeDragSession(Arc<AtomicBool>);
+
+impl NativeDragSession {
+    fn is_active(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn try_start(&self) -> bool {
+        self.0
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn finish(&self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 struct TagWidthCache {
@@ -163,6 +287,37 @@ enum ColumnVisibilityHover {
     ToggleAll,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct PreviewScrub {
+    path: PathBuf,
+    ratio: f32,
+}
+
+impl PreviewScrub {
+    fn new(path: PathBuf, ratio: f32) -> Self {
+        Self {
+            path,
+            ratio: ratio.clamp(0., 1.),
+        }
+    }
+
+    fn update(&mut self, path: &Path, ratio: f32) -> bool {
+        if self.path != path {
+            return false;
+        }
+        self.ratio = ratio.clamp(0., 1.);
+        true
+    }
+
+    fn take_ratio_for_path(scrub: &mut Option<Self>, path: &Path) -> Option<f32> {
+        if scrub.as_ref().is_some_and(|scrub| scrub.path == path) {
+            scrub.take().map(|scrub| scrub.ratio)
+        } else {
+            None
+        }
+    }
+}
+
 pub struct FileTable {
     library: Entity<Library>,
     tag_input: Entity<InputState>,
@@ -172,7 +327,10 @@ pub struct FileTable {
     creating_tag_key: bool,
     focus_handle: FocusHandle,
     alt_down: bool,
+    cmd_down: bool,
     hovered_row: Option<PathBuf>,
+    preview_active_row: Option<PathBuf>,
+    preview_scrub: Option<PreviewScrub>,
     hovered_tag_chip: Option<TagChipTarget>,
     hovered_tag_key: Option<String>,
     hovered_format_chip: Option<PathBuf>,
@@ -184,6 +342,8 @@ pub struct FileTable {
     pending_context_menu_tag_rename: Option<TagChipTarget>,
     row_context_menu_open: bool,
     pending_drag: Option<PendingFileDrag>,
+    active_file_drag: Option<ActiveFileDrag>,
+    native_drag_session: NativeDragSession,
     selected: BTreeSet<PathBuf>,
     selection_anchor: Option<PathBuf>,
     hidden_tag_keys: BTreeSet<String>,
@@ -361,7 +521,10 @@ impl FileTable {
             creating_tag_key: false,
             focus_handle: cx.focus_handle(),
             alt_down: false,
+            cmd_down: false,
             hovered_row: None,
+            preview_active_row: None,
+            preview_scrub: None,
             hovered_tag_chip: None,
             hovered_tag_key: None,
             hovered_format_chip: None,
@@ -373,6 +536,8 @@ impl FileTable {
             pending_context_menu_tag_rename: None,
             row_context_menu_open: false,
             pending_drag: None,
+            active_file_drag: None,
+            native_drag_session: NativeDragSession::default(),
             selected: BTreeSet::new(),
             selection_anchor: None,
             hidden_tag_keys,
@@ -797,6 +962,120 @@ impl FileTable {
         }
     }
 
+    pub(crate) fn set_cmd_down(&mut self, cmd_down: bool, cx: &mut Context<Self>) {
+        if self.cmd_down == cmd_down {
+            return;
+        }
+        if self.cmd_down && !cmd_down && self.preview_active_row.is_some() {
+            self.library.update(cx, |lib, cx| {
+                lib.stop_preview(cx);
+            });
+        }
+        if !cmd_down {
+            self.preview_scrub = None;
+        }
+        self.cmd_down = cmd_down;
+        self.update_preview_active_row(cx);
+    }
+
+    fn row_edit_active(&self) -> bool {
+        self.editing.is_some() || self.pending_rename.is_some()
+    }
+
+    fn preview_path_for_state(
+        cmd_down: bool,
+        hovered_row: Option<&PathBuf>,
+        row_edit_active: bool,
+    ) -> Option<PathBuf> {
+        (cmd_down && !row_edit_active)
+            .then(|| hovered_row.cloned())
+            .flatten()
+    }
+
+    fn update_preview_active_row(&mut self, cx: &mut Context<Self>) {
+        let next = Self::preview_path_for_state(
+            self.cmd_down,
+            self.hovered_row.as_ref(),
+            self.row_edit_active(),
+        );
+        if self.preview_active_row != next {
+            if self.preview_scrub.as_ref().map(|scrub| &scrub.path) != next.as_ref() {
+                self.preview_scrub = None;
+            }
+            self.preview_active_row = next;
+            if let Some(path) = self.preview_active_row.clone() {
+                self.maybe_start_priority_waveform_cache(&path, cx);
+            }
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn active_preview_path(&self) -> Option<&Path> {
+        self.preview_active_row.as_deref()
+    }
+
+    pub(crate) fn play_cmd_hovered_preview_from_start(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(path) = self.active_preview_path().map(Path::to_path_buf) else {
+            return false;
+        };
+        self.library
+            .update(cx, |lib, cx| lib.play_preview_from_start(path, cx))
+    }
+
+    fn play_preview_from_ratio(
+        &mut self,
+        path: PathBuf,
+        ratio: f32,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.library
+            .update(cx, |lib, cx| lib.play_preview_from_ratio(path, ratio, cx))
+    }
+
+    fn begin_preview_scrub(&mut self, path: PathBuf, ratio: f32, cx: &mut Context<Self>) {
+        self.cancel_unstarted_file_drag(cx);
+        let scrub = PreviewScrub::new(path, ratio);
+        if self.preview_scrub.as_ref() != Some(&scrub) {
+            self.preview_scrub = Some(scrub);
+            cx.notify();
+        }
+    }
+
+    fn continue_preview_scrub(&mut self, path: &Path, ratio: f32, cx: &mut Context<Self>) {
+        let Some(scrub) = self.preview_scrub.as_mut() else {
+            return;
+        };
+        let previous_ratio = scrub.ratio;
+        if scrub.update(path, ratio) && scrub.ratio != previous_ratio {
+            cx.notify();
+        }
+    }
+
+    fn end_preview_scrub(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let Some(ratio) = PreviewScrub::take_ratio_for_path(&mut self.preview_scrub, path) else {
+            return;
+        };
+        cx.notify();
+        self.play_preview_from_ratio(path.to_path_buf(), ratio, cx);
+    }
+
+    fn maybe_start_priority_waveform_cache(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let waveform_missing = {
+            let library = self.library.read(cx);
+            library
+                .active_state()
+                .results
+                .iter()
+                .find(|record| record.path.as_path() == path)
+                .is_none_or(|record| record.primary_waveform().is_none())
+        };
+        if waveform_missing {
+            self.library.update(cx, |lib, cx| {
+                lib.maybe_start_priority_waveform_cache(path.to_path_buf(), cx);
+            });
+        }
+    }
+
     pub(crate) fn tag_editor_is_focused(&self, window: &Window, cx: &App) -> bool {
         self.tag_input.read(cx).focus_handle(cx).is_focused(window)
             || self
@@ -950,18 +1229,19 @@ impl FileTable {
     fn start_pending_row_drag(
         &mut self,
         record: &FileRecord,
-        origin: Point<Pixels>,
+        drag: InternalFileDrag,
         cx: &mut Context<Self>,
     ) {
         let start = crate::perf::start();
+        self.cancel_unstarted_file_drag(cx);
+        if self.native_drag_session.is_active() {
+            return;
+        }
         let state = self.library.read(cx);
         let paths = self.selected_priority_paths(&state.active_state().results, &record.path);
         let path_count = paths.len();
-        self.pending_drag = Some(PendingFileDrag {
-            label: "priority".to_string(),
-            paths,
-            origin,
-        });
+        drag.replace(record.name.clone(), paths);
+        self.pending_drag = Some(PendingFileDrag { drag });
         crate::perf::finish("table.pending_drag", start, || {
             format!("paths={path_count}")
         });
@@ -974,10 +1254,14 @@ impl FileTable {
         &mut self,
         record: &FileRecord,
         extension: String,
-        origin: Point<Pixels>,
+        drag: InternalFileDrag,
         cx: &mut Context<Self>,
     ) {
         let start = crate::perf::start();
+        self.cancel_unstarted_file_drag(cx);
+        if self.native_drag_session.is_active() {
+            return;
+        }
         let state = self.library.read(cx);
         let paths = self.selected_paths_for_extension(
             &state.active_state().results,
@@ -985,11 +1269,8 @@ impl FileTable {
             &extension,
         );
         let path_count = paths.len();
-        self.pending_drag = Some(PendingFileDrag {
-            label: extension.clone(),
-            paths,
-            origin,
-        });
+        drag.replace(format!(".{extension}"), paths);
+        self.pending_drag = Some(PendingFileDrag { drag });
         crate::perf::finish("table.pending_drag", start, || {
             format!("paths={path_count}")
         });
@@ -1003,6 +1284,19 @@ impl FileTable {
 
     fn clear_pending_drag(&mut self) {
         self.pending_drag = None;
+    }
+
+    fn cancel_unstarted_file_drag(&mut self, cx: &mut Context<Self>) {
+        let had_pending_drag = self.pending_drag.take().is_some();
+        let had_active_drag = if self.native_drag_session.is_active() {
+            false
+        } else {
+            self.active_file_drag.take().is_some()
+        };
+        if had_pending_drag || had_active_drag {
+            self.library
+                .update(cx, |library, cx| library.clear_internal_file_drag(cx));
+        }
     }
 
     fn select_row(
@@ -1548,13 +1842,26 @@ impl FileTable {
         if hovered {
             if self.hovered_row.as_ref() != Some(&path) {
                 self.hovered_row = Some(path.clone());
-                self.hovered_delete_row = Some(path);
+                self.hovered_delete_row = Some(path.clone());
+                if self.cmd_down {
+                    if self.preview_scrub.as_ref().map(|scrub| &scrub.path) != Some(&path) {
+                        self.preview_scrub = None;
+                    }
+                    self.preview_active_row = Some(path.clone());
+                    self.maybe_start_priority_waveform_cache(&path, cx);
+                }
                 cx.notify();
             }
         } else if self.hovered_row.as_ref() == Some(&path) {
             self.hovered_row = None;
             if self.hovered_delete_row.as_ref() == Some(&path) {
                 self.hovered_delete_row = None;
+            }
+            if self.preview_active_row.as_ref() == Some(&path) {
+                self.preview_active_row = None;
+            }
+            if self.preview_scrub.as_ref().map(|scrub| &scrub.path) == Some(&path) {
+                self.preview_scrub = None;
             }
             cx.notify();
         }
@@ -1610,81 +1917,148 @@ impl FileTable {
         }
     }
 
-    pub(crate) fn cancel_file_drag(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn cancel_file_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let had_drag = self.pending_drag.is_some()
+            || self.active_file_drag.is_some()
+            || self.library.read(cx).internal_file_drag_active();
+        if !had_drag {
+            return false;
+        }
+
         self.clear_pending_drag();
+        self.active_file_drag = None;
+        if !self.native_drag_session.is_active() {
+            window.on_next_frame(|window, _| native_drag::cancel_gpui_drag(window));
+        }
         self.library
             .update(cx, |lib, cx| lib.clear_internal_file_drag(cx));
+        true
     }
 
-    fn maybe_start_file_drag(
+    fn begin_internal_file_drag(
         &mut self,
-        event: &MouseMoveEvent,
+        drag: &InternalFileDrag,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !event.dragging() {
-            self.clear_pending_drag();
+        if self.native_drag_session.is_active() {
             return;
         }
 
-        let Some(pending) = self.pending_drag.as_ref() else {
-            return;
-        };
-
-        let move_start = crate::perf::start();
-        let dx = event.position.x.as_f32() - pending.origin.x.as_f32();
-        let dy = event.position.y.as_f32() - pending.origin.y.as_f32();
-        if dx.hypot(dy) < FILE_DRAG_THRESHOLD_PX {
-            crate::perf::finish("table.drag_move", move_start, || {
-                "below_threshold".to_string()
-            });
+        let data = drag.snapshot();
+        if data.paths.is_empty() {
+            self.cancel_unstarted_file_drag(cx);
             return;
         }
-
-        let drag_start = crate::perf::start();
-        let drag_label = pending.label.clone();
-        let drag_paths = pending.paths.clone();
-        let drag_path_count = drag_paths.len();
-        self.clear_pending_drag();
+        let _matches_pending = self
+            .pending_drag
+            .take()
+            .is_some_and(|pending| pending.drag.same_gesture(drag));
+        self.active_file_drag = Some(ActiveFileDrag {
+            label: data.label.clone(),
+            paths: data.paths.clone(),
+        });
         self.library.update(cx, |lib, cx| {
-            if drag_paths.len() == 1 {
-                lib.begin_internal_file_drag(drag_paths[0].clone(), cx);
+            if data.paths.len() == 1 {
+                lib.begin_internal_file_drag(data.paths[0].clone(), cx);
             } else {
-                lib.begin_internal_file_drag_files(drag_paths.clone(), cx);
+                lib.begin_internal_file_drag_files(data.paths.clone(), cx);
             }
         });
-        let (drag_finished_tx, mut drag_finished_rx) = mpsc::unbounded::<()>();
+        debug_table_interaction(|| {
+            format!(
+                "internal drag started drag={} paths={}",
+                data.label,
+                data.paths.len()
+            )
+        });
+        self.start_native_file_drag(window, cx);
+    }
+
+    fn finish_local_file_drag(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
+        self.clear_pending_drag();
+        if self.native_drag_session.is_active() || self.active_file_drag.take().is_none() {
+            return;
+        }
+
+        let library = self.library.clone();
+        window.on_next_frame(move |_, cx| {
+            library.update(cx, |lib, cx| lib.clear_internal_file_drag(cx));
+        });
+    }
+
+    fn start_native_file_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.native_drag_session.is_active() || self.active_file_drag.is_none() {
+            return;
+        }
+
+        let active = self
+            .active_file_drag
+            .take()
+            .expect("active drag disappeared after presence check");
+        if !self.native_drag_session.try_start() {
+            self.active_file_drag = Some(active);
+            return;
+        }
+
+        let drag_label = active.label;
+        let drag_paths = active.paths;
+        let drag_path_count = drag_paths.len();
+        let native_drag_label = if drag_path_count > 1 {
+            format!("{drag_label} · {drag_path_count} files")
+        } else {
+            drag_label.clone()
+        };
+        let (drag_finished_tx, mut drag_finished_rx) = mpsc::unbounded::<native_drag::DragEnd>();
+        let window_bounds = window.bounds();
+        let internal_drop_paths = drag_paths.clone();
         let library = self.library.clone();
         cx.spawn(async move |_, cx| {
-            if drag_finished_rx.next().await.is_some() {
-                library.update(cx, |lib, cx| lib.clear_internal_file_drag(cx));
+            if let Some(end) = drag_finished_rx.next().await {
+                library.update(cx, |lib, cx| {
+                    if let Some(category) = category_for_native_drag_end(end, window_bounds) {
+                        lib.import_files(category, internal_drop_paths, cx);
+                    } else {
+                        lib.clear_internal_file_drag(cx);
+                    }
+                });
             }
         })
         .detach();
 
         let library = self.library.clone();
+        let native_drag_session = self.native_drag_session.clone();
         window.on_next_frame(move |window, cx| {
-            let native_start = crate::perf::start();
-            let drag_finished_tx = drag_finished_tx.clone();
-            let ok = native_drag::start_file_drag(drag_paths.clone(), window, move || {
-                let _ = drag_finished_tx.unbounded_send(());
-            });
-            crate::perf::finish("table.native_file_drag", native_start, || {
-                format!("paths={} ok={ok}", drag_paths.len())
-            });
-            if !ok {
-                library.update(cx, |lib, cx| lib.clear_internal_file_drag(cx));
+            if !library.read(cx).internal_file_drag_active() {
+                native_drag_session.finish();
+                native_drag::cancel_gpui_drag(window);
+                return;
             }
-        });
-        window.refresh();
-        crate::perf::finish("table.drag_start", drag_start, || {
-            format!("drag={drag_label} paths={drag_path_count}")
-        });
-        crate::perf::finish("table.drag_move", move_start, || {
-            format!("started drag={drag_label} paths={drag_path_count}")
-        });
-        debug_table_interaction(|| {
-            format!("native drag queued drag={drag_label} paths={drag_path_count}")
+            cx.stop_active_drag(window);
+            let native_start = crate::perf::start();
+            let finished_session = native_drag_session.clone();
+            let result = native_drag::start_file_drag(
+                drag_paths.clone(),
+                native_drag_label,
+                window,
+                move |end| {
+                    finished_session.finish();
+                    let _ = drag_finished_tx.unbounded_send(end);
+                },
+            );
+            crate::perf::finish("table.native_file_drag", native_start, || {
+                format!("paths={} ok={}", drag_paths.len(), result.is_ok())
+            });
+            if let Err(error) = result {
+                native_drag_session.finish();
+                native_drag::cancel_gpui_drag(window);
+                debug_table_interaction(|| format!("native drag rejected: {error}"));
+                library.update(cx, |lib, cx| lib.clear_internal_file_drag(cx));
+            } else {
+                debug_table_interaction(|| {
+                    format!("native drag started drag={drag_label} paths={drag_path_count}")
+                });
+            }
         });
     }
 
@@ -1765,6 +2139,16 @@ impl FileTable {
         let path = record.path.clone();
         let convertible = record.is_convertible();
         let selected = self.selected.contains(path.as_path());
+        let preview_active = self.preview_active_row.as_ref() == Some(&path);
+        let waveform = record.primary_waveform().copied();
+        let playhead_ratio = preview_active.then(|| {
+            self.preview_scrub
+                .as_ref()
+                .filter(|scrub| scrub.path == path)
+                .map(|scrub| scrub.ratio)
+                .or_else(|| self.library.read(cx).preview_playhead_ratio_for_path(&path))
+        });
+        let playhead_ratio = playhead_ratio.flatten();
         let delete_target = self.delete_target(record, selected_records);
         let rename_target = self.rename_target(record, selected_records);
         let row_hover_bg = if convertible {
@@ -1792,17 +2176,25 @@ impl FileTable {
                     hovered == &path
                 }
             });
-        let name = div()
-            .flex_shrink(1.)
-            .min_w_0()
-            .truncate()
-            .child(record.name.clone());
         let open_path = record.path.clone();
+        let open_preview_active = preview_active;
         let select_path = record.path.clone();
         let hover_path = record.path.clone();
         let delete_click_target = delete_target.clone();
         let conversion_actions = self.conversion_actions(record, selected_records);
         let table = cx.entity();
+        let row_drag_paths = if self.selected.len() > 1 && selected {
+            selected_records
+                .iter()
+                .map(|record| record.path.clone())
+                .collect()
+        } else {
+            vec![record.path.clone()]
+        };
+        let row_drag = InternalFileDrag::new(record.name.clone(), row_drag_paths);
+        let row_drag_for_mouse_down = row_drag.clone();
+        let table_for_drag = table.clone();
+        let table_for_context_menu = table.clone();
         let menu_action_context = self.focus_handle.clone();
         let menu_record = record.clone();
         let row_group = SharedString::from(format!("row-group:{}", path.display()));
@@ -1813,6 +2205,8 @@ impl FileTable {
             .flex()
             .flex_row()
             .w_full()
+            .relative()
+            .overflow_hidden()
             .text_sm()
             .when(row_ix > 0, |s| {
                 s.border_t_1().border_color(cx.theme().table_row_border)
@@ -1824,6 +2218,9 @@ impl FileTable {
                 this.set_row_hovered(hover_path.clone(), *hovered, cx);
             }))
             .on_click(cx.listener(move |_, event: &ClickEvent, _, _| {
+                if open_preview_active {
+                    return;
+                }
                 if event.modifiers().alt {
                     return;
                 }
@@ -1854,23 +2251,32 @@ impl FileTable {
                             if let Some(record) =
                                 records.iter().find(|record| record.path == select_path)
                             {
-                                this.start_pending_row_drag(record, event.position, cx);
+                                this.start_pending_row_drag(
+                                    record,
+                                    row_drag_for_mouse_down.clone(),
+                                    cx,
+                                );
                             }
                         }
                     }
                 }),
             )
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
-                this.maybe_start_file_drag(event, window, cx);
-            }))
+            .when(!self.alt_down, |row| {
+                row.on_drag(row_drag, move |drag, cursor_offset, window, cx| {
+                    let _ = table_for_drag.update(cx, |this, cx| {
+                        this.begin_internal_file_drag(drag, window, cx);
+                    });
+                    cx.new(|_| FileDragPreview::new(drag, cursor_offset))
+                })
+            })
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _, _| {
-                    this.clear_pending_drag();
+                cx.listener(|this, _: &MouseUpEvent, window, cx| {
+                    this.finish_local_file_drag(window, cx);
                 }),
             )
             .context_menu(move |menu, window, menu_cx| {
-                let table = table.clone();
+                let table = table_for_context_menu.clone();
                 let actions = conversion_actions.clone();
                 let target = delete_target.clone();
                 let row_rename_target = rename_target.clone();
@@ -2014,39 +2420,75 @@ impl FileTable {
                 }));
                 menu
             })
-            .child(
-                div()
-                    .h_full()
-                    .h_flex()
-                    .items_center()
-                    .flex_1()
-                    .min_w_0()
-                    .px(CONTENT_PX)
-                    .py(px(4.))
-                    .gap_1()
-                    .overflow_hidden()
-                    .child(name)
-                    .child(
-                        div()
-                            .h_flex()
-                            .items_center()
-                            .gap_1()
-                            .flex_shrink_0()
-                            .children(unique_format_variants(record).into_iter().map(|variant| {
-                                let record = record.clone();
-                                let extension = variant.extension.clone();
-                                let label = extension.clone();
-                                let variant_path = variant.path.clone();
-                                let format_delete_target =
-                                    self.format_delete_target(&record, &extension);
-                                let chip_bg = if self.alt_down
-                                    && self.hovered_format_chip.as_ref() == Some(&variant_path)
-                                {
-                                    chip_delete_bg
-                                } else {
-                                    cx.theme().muted
-                                };
-                                div()
+            .when(preview_active, |row| {
+                row.child(div().absolute().inset_0().child(PreviewWaveformElement {
+                    id: SharedString::from(format!("preview-waveform:{}", path.display())).into(),
+                    table: cx.entity(),
+                    path: path.clone(),
+                    waveform,
+                    playhead_ratio,
+                }))
+            })
+            .when(!preview_active, |row| {
+                row.child(
+                    div()
+                        .h_full()
+                        .h_flex()
+                        .items_center()
+                        .flex_1()
+                        .min_w_0()
+                        .px(CONTENT_PX)
+                        .py(px(4.))
+                        .gap_1()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .flex_shrink(1.)
+                                .min_w_0()
+                                .truncate()
+                                .child(record.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .h_flex()
+                                .items_center()
+                                .gap_1()
+                                .flex_shrink_0()
+                                .children(unique_format_variants(record).into_iter().map(
+                                    |variant| {
+                                        let record = record.clone();
+                                        let extension = variant.extension.clone();
+                                        let label = extension.clone();
+                                        let variant_path = variant.path.clone();
+                                        let format_drag_paths =
+                                            if self.selected.len() > 1 && selected {
+                                                selected_records
+                                                    .iter()
+                                                    .filter_map(|record| {
+                                                        record.variant_for_extension(&extension)
+                                                    })
+                                                    .map(|variant| variant.path.clone())
+                                                    .collect()
+                                            } else {
+                                                vec![variant_path.clone()]
+                                            };
+                                        let format_drag = InternalFileDrag::new(
+                                            format!(".{extension}"),
+                                            format_drag_paths,
+                                        );
+                                        let format_drag_for_mouse_down = format_drag.clone();
+                                        let table_for_format_drag = table.clone();
+                                        let format_delete_target =
+                                            self.format_delete_target(&record, &extension);
+                                        let chip_bg = if self.alt_down
+                                            && self.hovered_format_chip.as_ref()
+                                                == Some(&variant_path)
+                                        {
+                                            chip_delete_bg
+                                        } else {
+                                            cx.theme().muted
+                                        };
+                                        div()
                                     .id(SharedString::from(format!(
                                         "extension-chip:{}:{extension}",
                                         record.path.display()
@@ -2110,7 +2552,7 @@ impl FileTable {
                                                     this.start_pending_format_drag(
                                                         &record,
                                                         extension.clone(),
-                                                        event.position,
+                                                        format_drag_for_mouse_down.clone(),
                                                         cx,
                                                     );
                                                 }
@@ -2131,22 +2573,36 @@ impl FileTable {
                                             }
                                         }),
                                     )
-                                    .on_mouse_move(cx.listener(
-                                        |this, event: &MouseMoveEvent, window, cx| {
-                                            this.maybe_start_file_drag(event, window, cx);
-                                            cx.stop_propagation();
-                                        },
-                                    ))
+                                    .when(!self.alt_down, |chip| {
+                                        chip.on_drag(
+                                            format_drag,
+                                            move |drag, cursor_offset, window, cx| {
+                                                let _ = table_for_format_drag.update(
+                                                    cx,
+                                                    |this, cx| {
+                                                        this.begin_internal_file_drag(
+                                                            drag, window, cx,
+                                                        );
+                                                    },
+                                                );
+                                                cx.new(|_| {
+                                                    FileDragPreview::new(drag, cursor_offset)
+                                                })
+                                            },
+                                        )
+                                    })
                                     .on_mouse_up(
                                         MouseButton::Left,
-                                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                                            this.clear_pending_drag();
+                                        cx.listener(|this, _: &MouseUpEvent, window, cx| {
+                                            this.finish_local_file_drag(window, cx);
                                             cx.stop_propagation();
                                         }),
                                     )
-                            })),
-                    ),
-            );
+                                    },
+                                )),
+                        ),
+                )
+            });
 
         for (key, tag_width) in keys.iter().zip(tag_widths) {
             let group = SharedString::from(format!("cell:{}:{key}", path.display()));
@@ -2164,7 +2620,7 @@ impl FileTable {
                 .items_center()
                 .gap_1();
 
-            if let Some(values) = record.tags.get(key) {
+            if !preview_active && let Some(values) = record.tags.get(key) {
                 for value in values {
                     let (key, value, path) = (key.clone(), value.clone(), path.clone());
                     let tag_target = TagChipTarget {
@@ -2302,7 +2758,9 @@ impl FileTable {
                 }
             }
 
-            if Self::editing_is_add(self.editing.as_ref(), &path, key) {
+            if preview_active {
+                cell = cell.child(div());
+            } else if Self::editing_is_add(self.editing.as_ref(), &path, key) {
                 cell = cell.child(
                     div()
                         .h_flex()
@@ -2623,6 +3081,17 @@ impl Render for FileTable {
 
         let table = div()
             .track_focus(&self.focus_handle)
+            .capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                if event.button == MouseButton::Left {
+                    this.finish_local_file_drag(window, cx);
+                }
+            }))
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, window, cx| {
+                    this.finish_local_file_drag(window, cx);
+                }),
+            )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 match event.keystroke.key.as_str() {
                     "escape" => {
@@ -2679,6 +3148,31 @@ impl Render for FileTable {
         });
         table
     }
+}
+
+fn category_for_native_drag_end(
+    end: native_drag::DragEnd,
+    window_bounds: Bounds<Pixels>,
+) -> Option<Category> {
+    if !end.released {
+        return None;
+    }
+
+    let local_x = end.screen_x as f32 - window_bounds.left().as_f32();
+    let local_y = window_bounds.bottom().as_f32() - end.screen_y as f32;
+    let left = TITLEBAR_LEFT_OFFSET.as_f32();
+    let available_width = window_bounds.size.width.as_f32() - left;
+    if local_x < left
+        || local_y < 0.0
+        || local_y > TITLEBAR_HEIGHT.as_f32()
+        || available_width <= 0.0
+    {
+        return None;
+    }
+
+    let category_width = available_width / Category::ALL.len() as f32;
+    let index = ((local_x - left) / category_width).floor() as usize;
+    Category::ALL.get(index).copied()
 }
 
 impl RenameTarget {
@@ -2748,11 +3242,327 @@ fn unique_format_variants(record: &FileRecord) -> Vec<&crate::model::FileVariant
         .collect()
 }
 
+struct PreviewWaveformElement {
+    id: ElementId,
+    table: Entity<FileTable>,
+    path: PathBuf,
+    waveform: Option<WaveformBinary256>,
+    playhead_ratio: Option<f32>,
+}
+
+struct PreviewWaveformPrepaintState {
+    hitbox: Hitbox,
+}
+
+#[derive(Clone, Copy)]
+enum PreviewScrubAction {
+    Begin,
+    Continue,
+    End,
+}
+
+impl IntoElement for PreviewWaveformElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for PreviewWaveformElement {
+    type RequestLayoutState = ();
+    type PrepaintState = PreviewWaveformPrepaintState;
+
+    fn id(&self) -> Option<ElementId> {
+        Some(self.id.clone())
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        (
+            window.request_layout(
+                Style {
+                    size: size(relative(1.).into(), relative(1.).into()),
+                    ..Style::default()
+                },
+                [],
+                cx,
+            ),
+            (),
+        )
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        _cx: &mut App,
+    ) -> Self::PrepaintState {
+        PreviewWaveformPrepaintState {
+            hitbox: window.insert_hitbox(bounds, HitboxBehavior::Normal),
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        _cx: &mut App,
+    ) {
+        paint_preview_waveform(bounds, self.waveform, self.playhead_ratio, window);
+        let hitbox = prepaint.hitbox.clone();
+        window.set_cursor_style(CursorStyle::PointingHand, &hitbox);
+
+        window.on_mouse_event({
+            let table = self.table.clone();
+            let path = self.path.clone();
+            let hitbox = hitbox.clone();
+            move |event: &MouseDownEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble
+                    || event.button != MouseButton::Left
+                    || !event.modifiers.platform
+                    || !hitbox.is_hovered(window)
+                {
+                    return;
+                }
+                scrub_preview_from_position(
+                    &table,
+                    &path,
+                    event.position,
+                    bounds,
+                    PreviewScrubAction::Begin,
+                    cx,
+                );
+                cx.stop_propagation();
+                window.prevent_default();
+            }
+        });
+
+        window.on_mouse_event({
+            let table = self.table.clone();
+            let path = self.path.clone();
+            move |event: &MouseMoveEvent, phase, _, cx| {
+                if phase != DispatchPhase::Bubble || !event.dragging() || !event.modifiers.platform
+                {
+                    return;
+                }
+                scrub_preview_from_position(
+                    &table,
+                    &path,
+                    event.position,
+                    bounds,
+                    PreviewScrubAction::Continue,
+                    cx,
+                );
+                cx.stop_propagation();
+            }
+        });
+
+        window.on_mouse_event({
+            let table = self.table.clone();
+            let path = self.path.clone();
+            move |event: &MouseUpEvent, phase, _, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                scrub_preview_from_position(
+                    &table,
+                    &path,
+                    event.position,
+                    bounds,
+                    PreviewScrubAction::End,
+                    cx,
+                );
+            }
+        });
+    }
+}
+
+fn paint_preview_waveform(
+    bounds: Bounds<Pixels>,
+    waveform: Option<WaveformBinary256>,
+    playhead_ratio: Option<f32>,
+    window: &mut Window,
+) {
+    let row_width = bounds.size.width.as_f32().max(1.);
+    let color = white();
+
+    if let Some(waveform) = waveform {
+        let row_height = bounds.size.height.as_f32().max(1.);
+        let bar_gap = 1.;
+        let bar_width = ((row_width - bar_gap * (WAVEFORM_BAR_COUNT - 1) as f32)
+            / WAVEFORM_BAR_COUNT as f32)
+            .max(1.);
+
+        for (ix, value) in waveform.into_iter().enumerate() {
+            let height = if value == 0 {
+                1.
+            } else {
+                ((value as f32 / 255.) * row_height).max(1.)
+            };
+            let x = bounds.left().as_f32() + ix as f32 * (bar_width + bar_gap);
+            let y = bounds.bottom().as_f32() - height;
+            window.paint_quad(fill(
+                Bounds::new(point(px(x), px(y)), size(px(bar_width), px(height))),
+                color,
+            ));
+        }
+    }
+
+    if let Some(ratio) = playhead_ratio {
+        let x = bounds.left().as_f32() + row_width * ratio.clamp(0., 1.);
+        window.paint_quad(fill(
+            Bounds::new(point(px(x), bounds.top()), size(px(2.), bounds.size.height)),
+            color,
+        ));
+    }
+}
+
+fn scrub_preview_from_position(
+    table: &Entity<FileTable>,
+    path: &Path,
+    position: Point<Pixels>,
+    bounds: Bounds<Pixels>,
+    action: PreviewScrubAction,
+    cx: &mut App,
+) {
+    let ratio = ((position.x.as_f32() - bounds.left().as_f32())
+        / bounds.size.width.as_f32().max(1.))
+    .clamp(0., 1.);
+    cx.update_entity(table, |table, cx| match action {
+        PreviewScrubAction::Begin => {
+            table.begin_preview_scrub(path.to_path_buf(), ratio, cx);
+        }
+        PreviewScrubAction::Continue => {
+            table.continue_preview_scrub(path, ratio, cx);
+        }
+        PreviewScrubAction::End => {
+            table.end_preview_scrub(path, cx);
+        }
+    });
+}
+
 fn debug_table_interaction(details: impl FnOnce() -> String) {
     let enabled = std::env::var("LOWCAT_DEBUG")
         .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
     if enabled {
         eprintln!("[lowcat:table] {}", details());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cmd_preview_does_not_activate_during_row_editing() {
+        let path = PathBuf::from("/tmp/preview.wav");
+
+        assert_eq!(
+            FileTable::preview_path_for_state(true, Some(&path), false),
+            Some(path.clone())
+        );
+        assert_eq!(
+            FileTable::preview_path_for_state(true, Some(&path), true),
+            None
+        );
+    }
+
+    #[test]
+    fn preview_scrub_commits_only_when_taken_for_release_path() {
+        let path = PathBuf::from("/tmp/preview.wav");
+        let mut scrub = Some(PreviewScrub::new(path.clone(), 0.2));
+
+        assert!(scrub.as_mut().unwrap().update(&path, 0.7));
+        assert_eq!(scrub.as_ref().map(|scrub| scrub.ratio), Some(0.7));
+        assert_eq!(
+            PreviewScrub::take_ratio_for_path(&mut scrub, Path::new("/tmp/other.wav")),
+            None
+        );
+        assert!(scrub.is_some());
+        assert_eq!(
+            PreviewScrub::take_ratio_for_path(&mut scrub, &path),
+            Some(0.7)
+        );
+        assert!(scrub.is_none());
+    }
+
+    #[test]
+    fn internal_drag_payload_updates_for_mouse_down_selection() {
+        let drag =
+            InternalFileDrag::new("first".to_string(), vec![PathBuf::from("/tmp/first.wav")]);
+        let drag_value = drag.clone();
+
+        drag.replace(
+            "selected".to_string(),
+            vec![
+                PathBuf::from("/tmp/first.wav"),
+                PathBuf::from("/tmp/second.wav"),
+            ],
+        );
+
+        let data = drag_value.snapshot();
+        assert_eq!(data.label, "selected");
+        assert_eq!(data.paths.len(), 2);
+        assert!(drag.same_gesture(&drag_value));
+    }
+
+    #[test]
+    fn native_drag_release_maps_to_category_tabs_but_cancel_does_not() {
+        let bounds = Bounds::new(point(px(100.), px(200.)), size(px(500.), px(400.)));
+        let first_tab = native_drag::DragEnd {
+            screen_x: 200.,
+            screen_y: 590.,
+            released: true,
+        };
+        let second_tab = native_drag::DragEnd {
+            screen_x: 450.,
+            screen_y: 590.,
+            released: true,
+        };
+        let canceled = native_drag::DragEnd {
+            released: false,
+            ..first_tab
+        };
+
+        assert_eq!(
+            category_for_native_drag_end(first_tab, bounds),
+            Some(Category::Music)
+        );
+        assert_eq!(
+            category_for_native_drag_end(second_tab, bounds),
+            Some(Category::Sfx)
+        );
+        assert_eq!(category_for_native_drag_end(canceled, bounds), None);
+    }
+
+    #[test]
+    fn native_drag_session_rejects_overlap_and_reopens_after_finish() {
+        let session = NativeDragSession::default();
+
+        assert!(session.try_start());
+        assert!(session.is_active());
+        assert!(!session.try_start());
+
+        session.finish();
+
+        assert!(session.try_start());
     }
 }

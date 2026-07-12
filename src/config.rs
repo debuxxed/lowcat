@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env, fs, io,
     path::{Path, PathBuf},
     str::FromStr,
@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{AudioFormat, Category};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
     category_folders: CategoryFolders,
@@ -19,6 +19,23 @@ pub struct Settings {
     hidden_tag_groups: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     hidden_tag_columns: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "IntersectionTags::is_empty")]
+    intersection_tags: IntersectionTags,
+    #[serde(default = "default_preview_volume")]
+    preview_volume: f32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            category_folders: CategoryFolders::default(),
+            download_format: None,
+            hidden_tag_groups: BTreeSet::new(),
+            hidden_tag_columns: BTreeSet::new(),
+            intersection_tags: IntersectionTags::default(),
+            preview_volume: default_preview_volume(),
+        }
+    }
 }
 
 impl Settings {
@@ -62,6 +79,14 @@ impl Settings {
         self.download_format = Some(format.extension().to_string());
     }
 
+    pub fn preview_volume(&self) -> f32 {
+        self.preview_volume.clamp(0., 1.)
+    }
+
+    pub fn set_preview_volume(&mut self, volume: f32) {
+        self.preview_volume = volume.clamp(0., 1.);
+    }
+
     pub fn hidden_tag_groups(&self) -> BTreeSet<String> {
         self.hidden_tag_groups.clone()
     }
@@ -77,6 +102,50 @@ impl Settings {
     pub fn set_hidden_tag_columns(&mut self, keys: BTreeSet<String>) {
         self.hidden_tag_columns = keys;
     }
+
+    pub fn intersection_tags(&self, category: Category) -> BTreeMap<String, BTreeSet<String>> {
+        self.intersection_tags.for_category(category).clone()
+    }
+
+    pub fn set_intersection_tags(
+        &mut self,
+        category: Category,
+        tags: BTreeMap<String, BTreeSet<String>>,
+    ) {
+        *self.intersection_tags.for_category_mut(category) = tags;
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct IntersectionTags {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    music: BTreeMap<String, BTreeSet<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    sfx: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl IntersectionTags {
+    fn is_empty(&self) -> bool {
+        self.music.is_empty() && self.sfx.is_empty()
+    }
+
+    fn for_category(&self, category: Category) -> &BTreeMap<String, BTreeSet<String>> {
+        match category {
+            Category::Music => &self.music,
+            Category::Sfx => &self.sfx,
+        }
+    }
+
+    fn for_category_mut(&mut self, category: Category) -> &mut BTreeMap<String, BTreeSet<String>> {
+        match category {
+            Category::Music => &mut self.music,
+            Category::Sfx => &mut self.sfx,
+        }
+    }
+}
+
+fn default_preview_volume() -> f32 {
+    1.
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

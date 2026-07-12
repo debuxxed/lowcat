@@ -1,11 +1,13 @@
 use gpui::{
-    Anchor, Context, Entity, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, SharedString,
-    StatefulInteractiveElement, Styled, Window, anchored, deferred, div, prelude::FluentBuilder,
-    px, relative,
+    Anchor, AppContext as _, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, ScrollDelta,
+    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Window, anchored, deferred,
+    div, prelude::FluentBuilder, px, relative,
 };
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Selectable, Sizable, StyledExt, button::Button,
+    ActiveTheme as _, Icon, IconName, Selectable, Sizable, StyledExt,
+    button::Button,
+    slider::{Slider, SliderEvent, SliderState},
     tooltip::Tooltip,
 };
 
@@ -28,6 +30,7 @@ pub struct SettingsMenu {
     previous_focus: Option<FocusHandle>,
     active_submenu: Option<SettingsSubmenu>,
     hovered_priority: Option<AudioFormat>,
+    volume_slider: Entity<SliderState>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,6 +40,22 @@ enum SettingsSubmenu {
 
 impl SettingsMenu {
     pub fn new(library: Entity<Library>, cx: &mut Context<Self>) -> Self {
+        let preview_volume = library.read(cx).preview_volume();
+        let volume_slider = cx.new(|_| {
+            SliderState::new()
+                .min(0.)
+                .max(1.)
+                .step(0.01)
+                .default_value(preview_volume)
+        });
+        cx.subscribe(&volume_slider, |this, _, event: &SliderEvent, cx| {
+            if let SliderEvent::Change(value) = event {
+                this.library.update(cx, |library, cx| {
+                    library.set_preview_volume(value.end(), cx);
+                });
+            }
+        })
+        .detach();
         cx.observe(&library, |_, _, cx| cx.notify()).detach();
 
         Self {
@@ -47,6 +66,7 @@ impl SettingsMenu {
             previous_focus: None,
             active_submenu: None,
             hovered_priority: None,
+            volume_slider,
         }
     }
 
@@ -125,6 +145,28 @@ impl SettingsMenu {
             cx.notify();
         }
     }
+
+    fn adjust_volume_from_scroll(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let delta = volume_scroll_delta(event.delta);
+        if delta == 0. {
+            return;
+        }
+
+        let current = self.library.read(cx).preview_volume();
+        let volume = (current + delta).clamp(0., 1.);
+        if volume != current {
+            self.volume_slider
+                .update(cx, |slider, cx| slider.set_value(volume, window, cx));
+            self.library
+                .update(cx, |library, cx| library.set_preview_volume(volume, cx));
+        }
+        cx.stop_propagation();
+    }
 }
 
 impl Render for SettingsMenu {
@@ -163,6 +205,7 @@ impl Render for SettingsMenu {
             let behavior = settings_library.read(cx).convert_conflict_behavior();
             let overwrite_enabled = behavior == ConvertConflictBehavior::Overwrite;
             let overwrite_library = settings_library.clone();
+            let volume = settings_library.read(cx).preview_volume();
             let main_menu = div()
                 .id("library-settings-panel")
                 .track_focus(&settings_focus)
@@ -179,6 +222,33 @@ impl Render for SettingsMenu {
                         cx.notify();
                     }
                 }))
+                .child(
+                    menu_row()
+                        .id("preview-volume")
+                        .cursor_default()
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .whitespace_nowrap()
+                                .child("Volume"),
+                        )
+                        .child(
+                            div()
+                                .h_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_3()
+                                .on_scroll_wheel(cx.listener(Self::adjust_volume_from_scroll))
+                                .child(Slider::new(&self.volume_slider).flex_1().min_w_0())
+                                .child(
+                                    div()
+                                        .w(px(44.))
+                                        .flex_shrink_0()
+                                        .text_right()
+                                        .child(format!("{:.0}%", volume * 100.)),
+                                ),
+                        ),
+                )
                 .child(
                     menu_row()
                         .id("settings-format-priority")
@@ -421,6 +491,13 @@ fn menu_row() -> gpui::Div {
         .cursor_pointer()
 }
 
+fn volume_scroll_delta(delta: ScrollDelta) -> f32 {
+    match delta {
+        ScrollDelta::Lines(point) => point.y * 0.05,
+        ScrollDelta::Pixels(point) => (point.y.as_f32() * 0.002).clamp(-0.1, 0.1),
+    }
+}
+
 fn menu_affordance(child: Option<impl IntoElement>) -> gpui::Div {
     let row = div()
         .w(px(MENU_AFFORDANCE_PX))
@@ -447,6 +524,7 @@ fn menu_metrics(window: &mut Window, priority: &[AudioFormat]) -> MenuMetrics {
         text_row_width(window, "Format priority") + menu_row_chrome(px(MENU_AFFORDANCE_PX));
     let overwrite_row_width = text_row_width(window, "Overwrite existing target")
         + menu_row_chrome(px(MENU_AFFORDANCE_PX));
+    let volume_row_width = text_row_width(window, "Volume") + menu_row_chrome(px(150.));
     let priority_rows = priority
         .iter()
         .map(|format| {
@@ -465,7 +543,11 @@ fn menu_metrics(window: &mut Window, priority: &[AudioFormat]) -> MenuMetrics {
     );
 
     MenuMetrics {
-        main_menu_width: widest_width([format_priority_row_width, overwrite_row_width]),
+        main_menu_width: widest_width([
+            format_priority_row_width,
+            overwrite_row_width,
+            volume_row_width,
+        ]),
         priority_menu_width,
     }
 }
@@ -517,6 +599,18 @@ mod tests {
         assert_eq!(
             widest_width([format_priority_row_width, overwrite_row_width]),
             overwrite_row_width
+        );
+    }
+
+    #[test]
+    fn volume_scroll_supports_wheel_lines_and_touchpad_pixels() {
+        assert_eq!(
+            volume_scroll_delta(ScrollDelta::Lines(Point::new(0., 1.))),
+            0.05
+        );
+        assert_eq!(
+            volume_scroll_delta(ScrollDelta::Pixels(Point::new(px(0.), px(-25.)))),
+            -0.05
         );
     }
 }

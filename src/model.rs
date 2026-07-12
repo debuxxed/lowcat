@@ -6,6 +6,8 @@ use std::str::FromStr;
 pub const TAG_GENRE: &str = "GENRE";
 pub const TAG_MOOD: &str = "MOOD";
 pub const TAG_TYPE: &str = "TYPE";
+pub const WAVEFORM_BAR_COUNT: usize = 256;
+pub type WaveformBinary256 = [u8; WAVEFORM_BAR_COUNT];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Category {
@@ -85,6 +87,15 @@ impl FileRecord {
         self.variant_for_extension(extension).is_some()
     }
 
+    pub fn primary_variant(&self) -> Option<&FileVariant> {
+        self.variants.first()
+    }
+
+    pub fn primary_waveform(&self) -> Option<&WaveformBinary256> {
+        self.primary_variant()
+            .and_then(|variant| variant.waveform.as_ref())
+    }
+
     pub fn conversion_targets(&self) -> Vec<AudioFormat> {
         AudioFormat::ALL
             .into_iter()
@@ -100,6 +111,7 @@ pub struct FileVariant {
     pub size: u64,
     pub modified: i64,
     pub first_seen_at: i64,
+    pub waveform: Option<WaveformBinary256>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -250,7 +262,36 @@ pub fn normalize_tag_key(key: &str) -> Option<String> {
 
 pub fn normalize_tag_value(value: &str) -> Option<String> {
     let value = value.trim();
-    (!value.is_empty()).then(|| value.to_string())
+    if value.is_empty() {
+        return None;
+    }
+
+    let mut parts = value.split('/').map(str::trim);
+    let parent = parts.next()?;
+    if parent.is_empty() {
+        return None;
+    }
+    let child = parts.next();
+    if parts.next().is_some() || child.is_some_and(str::is_empty) {
+        return None;
+    }
+
+    Some(match child {
+        Some(child) => format!("{parent}/{child}"),
+        None => parent.to_string(),
+    })
+}
+
+pub(crate) fn split_subtag(value: &str) -> Option<(&str, &str)> {
+    let (parent, child) = value.split_once('/')?;
+    (!parent.is_empty() && !child.is_empty() && !child.contains('/')).then_some((parent, child))
+}
+
+pub(crate) fn tag_value_matches_filter(value: &str, filter: &str) -> bool {
+    value == filter
+        || value
+            .strip_prefix(filter)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 pub fn tag_label(key: &str) -> &str {
@@ -265,20 +306,31 @@ pub fn tag_label(key: &str) -> &str {
 /// A record matches iff its name fuzzy-matches `search` (case-insensitive
 /// ordered characters) AND, for every key with checked values, the record's
 /// values for that key contain all of them.
+#[cfg(test)]
 pub fn record_matches(
     record: &FileRecord,
     search: &str,
     selected: &BTreeMap<String, BTreeSet<String>>,
+) -> bool {
+    record_matches_scoped(record, search, selected, true)
+}
+
+pub(crate) fn record_matches_scoped(
+    record: &FileRecord,
+    search: &str,
+    selected: &BTreeMap<String, BTreeSet<String>>,
+    include_tags: bool,
 ) -> bool {
     let filename_match = fuzzy_search_match(&record.name, search)
         || record
             .variants
             .iter()
             .any(|variant| fuzzy_search_match(&variant.extension, search))
-        || record.tags.iter().any(|(key, values)| {
-            fuzzy_search_match(key, search)
-                || values.iter().any(|value| fuzzy_search_match(value, search))
-        });
+        || (include_tags
+            && record.tags.iter().any(|(key, values)| {
+                fuzzy_search_match(key, search)
+                    || values.iter().any(|value| fuzzy_search_match(value, search))
+            }));
     if !filename_match {
         return false;
     }
@@ -293,7 +345,11 @@ pub fn record_matches(
                 .find_map(|(tag_key, values)| tag_key.eq_ignore_ascii_case(key).then_some(values))
         }) {
             Some(values) => {
-                if !wanted.iter().all(|w| values.contains(w)) {
+                if !wanted.iter().all(|wanted| {
+                    values
+                        .iter()
+                        .any(|value| tag_value_matches_filter(value, wanted))
+                }) {
                     return false;
                 }
             }
@@ -312,9 +368,18 @@ pub(crate) fn fuzzy_search_match(text: &str, search: &str) -> bool {
         .all(|query_ch| text_chars.any(|text_ch| text_ch == query_ch))
 }
 
+#[cfg(test)]
 pub(crate) fn record_search_sort_key(
     record: &FileRecord,
     search: &str,
+) -> (u8, usize, usize, String, String) {
+    record_search_sort_key_scoped(record, search, true)
+}
+
+pub(crate) fn record_search_sort_key_scoped(
+    record: &FileRecord,
+    search: &str,
+    include_tags: bool,
 ) -> (u8, usize, usize, String, String) {
     let lower_name = record.name.to_lowercase();
     if search.is_empty() {
@@ -329,10 +394,12 @@ pub(crate) fn record_search_sort_key(
             4,
         );
     }
-    for (key, values) in &record.tags {
-        merge_search_sort_key(&mut best, search_sort_key_for_text(key, search), 4);
-        for value in values {
-            merge_search_sort_key(&mut best, search_sort_key_for_text(value, search), 4);
+    if include_tags {
+        for (key, values) in &record.tags {
+            merge_search_sort_key(&mut best, search_sort_key_for_text(key, search), 4);
+            for value in values {
+                merge_search_sort_key(&mut best, search_sort_key_for_text(value, search), 4);
+            }
         }
     }
 
@@ -435,6 +502,7 @@ mod tests {
                 size: 0,
                 modified: 0,
                 first_seen_at: 0,
+                waveform: None,
             }],
             tags: tags
                 .iter()
@@ -497,6 +565,30 @@ mod tests {
         let r = rec("pulse.flac", &[("Genre", &["Ambient"])]);
         assert!(record_matches(&r, "genre", &BTreeMap::new()));
         assert!(record_matches(&r, "ambient", &BTreeMap::new()));
+    }
+
+    #[test]
+    fn normalizes_one_level_subtags() {
+        assert_eq!(
+            normalize_tag_value(" shitpost / comedy "),
+            Some("shitpost/comedy".into())
+        );
+        assert_eq!(normalize_tag_value("shitpost"), Some("shitpost".into()));
+        assert_eq!(normalize_tag_value("shitpost/comedy/meme"), None);
+        assert_eq!(normalize_tag_value("shitpost/"), None);
+        assert_eq!(normalize_tag_value("/comedy"), None);
+    }
+
+    #[test]
+    fn parent_filter_matches_its_subtags() {
+        let r = rec("a.ogg", &[("Use", &["shitpost/comedy"])]);
+        assert!(record_matches(&r, "", &sel(&[("Use", &["shitpost"])])));
+        assert!(record_matches(
+            &r,
+            "",
+            &sel(&[("Use", &["shitpost/comedy"])])
+        ));
+        assert!(!record_matches(&r, "", &sel(&[("Use", &["shit"])])));
     }
 
     #[test]

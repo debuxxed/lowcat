@@ -9,6 +9,12 @@ Install the Cargo subcommand once:
 cargo install cargo-packager
 ```
 
+Install CMake so the bundled Opus decoder can be compiled:
+
+```sh
+brew install cmake
+```
+
 Build a normal release binary:
 
 ```sh

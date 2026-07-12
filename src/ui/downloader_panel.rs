@@ -29,13 +29,6 @@ impl DownloaderPanel {
             format_menu_position: None,
         }
     }
-
-    fn paste_download(&mut self, category: Category, cx: &mut Context<Self>) {
-        let clipboard_text = cx.read_from_clipboard().and_then(|item| item.text());
-        self.library.update(cx, |lib, cx| {
-            lib.download_from_clipboard(category, clipboard_text, cx);
-        });
-    }
 }
 
 impl Render for DownloaderPanel {
@@ -63,8 +56,6 @@ impl Render for DownloaderPanel {
                     .min_w_0()
                     .gap_2()
                     .child(self.render_format_button(download_format, running_category, cx))
-                    .child(self.render_category_button(Category::Music, running_category, cx))
-                    .child(self.render_category_button(Category::Sfx, running_category, cx))
                     .child(render_download_details(state.clone(), cx)),
             )
             .child(render_download_progress(state, cx));
@@ -192,28 +183,6 @@ impl DownloaderPanel {
             )
             .with_priority(1),
         )
-    }
-
-    fn render_category_button(
-        &self,
-        category: Category,
-        running_category: Option<Category>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let selected = running_category == Some(category);
-        Button::new(format!("download-paste-{}", category.label()))
-            .xsmall()
-            .compact()
-            .when(selected, |button| button.primary())
-            .icon(IconName::ArrowDown)
-            .label(category.label())
-            .tooltip(SharedString::from(format!("Paste {}", category.label())))
-            .selected(selected)
-            .loading(selected)
-            .disabled(running_category.is_some() && !selected)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.paste_download(category, cx);
-            }))
     }
 }
 

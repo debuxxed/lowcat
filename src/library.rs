@@ -15,6 +15,7 @@ use crate::model::{
     AudioFormat, Category, CategoryState, ConvertConflictBehavior, FileRecord, FolderTagAssignment,
     default_format_priority, fuzzy_search_match, normalize_tag_key, tag_label,
 };
+use crate::preview_player::{PreviewPlayer, PreviewPosition};
 
 #[path = "config.rs"]
 mod config;
@@ -27,11 +28,13 @@ pub struct Library {
     settings_path: PathBuf,
     format_priority: Vec<AudioFormat>,
     download_format: AudioFormat,
+    preview_volume: f32,
     convert_conflict_behavior: ConvertConflictBehavior,
     filters_open: bool,
-    tag_search: String,
     hidden_tag_keys: BTreeSet<String>,
     hidden_tag_column_keys: BTreeSet<String>,
+    intersection_tags: BTreeMap<Category, BTreeMap<String, BTreeSet<String>>>,
+    tag_intersections: BTreeMap<Category, BTreeMap<(String, String), BTreeSet<(String, String)>>>,
     downloader_open: bool,
     download_state: DownloadState,
     download_cancel: Option<DownloadCancel>,
@@ -40,6 +43,13 @@ pub struct Library {
     import_progress: Option<ImportProgress>,
     last_focus_rescan: Option<Instant>,
     focus_rescan_in_flight: bool,
+    waveform_cache_in_flight: bool,
+    waveform_cache_skipped_paths: BTreeSet<PathBuf>,
+    waveform_priority_cache_in_flight: BTreeSet<PathBuf>,
+    preview_player: Option<PreviewPlayer>,
+    preview_current_path: Option<PathBuf>,
+    preview_last_stopped: Option<PreviewPosition>,
+    preview_playhead_watch_running: bool,
 }
 
 #[derive(Clone)]
@@ -65,6 +75,7 @@ struct ImportBatchResult {
     category: Category,
     imported: bool,
     moved_from: Option<Category>,
+    moved_files: Vec<(PathBuf, PathBuf)>,
 }
 
 struct ConvertBatchResult {
@@ -83,6 +94,12 @@ struct DownloadBatchResult {
     result: Result<DownloadOutput, DownloadError>,
 }
 
+struct WaveformCacheBatchResult {
+    processed: usize,
+    changed: bool,
+    skipped_paths: Vec<PathBuf>,
+}
+
 enum ImportProgressEvent {
     Start { file_name: String },
     Progress(f32),
@@ -90,19 +107,19 @@ enum ImportProgressEvent {
 }
 
 impl Library {
-    #[allow(dead_code)]
-    pub fn new() -> Self {
-        Self::new_with_settings_path(config::settings_path())
-    }
-
     pub fn new_for_app(cx: &mut Context<Self>) -> Self {
         let mut this = Self::new_uninitialized(config::settings_path());
+        let mut preview_player = PreviewPlayer::new(this.preview_volume);
+        if let Err(error) = preview_player.warm_up() {
+            eprintln!("lowcat preview player warm-up failed error={error}");
+        }
+        this.preview_player = Some(preview_player);
         this.init_cached();
         this.start_initial_rescan(cx);
         this
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn new_with_settings_path(settings_path: PathBuf) -> Self {
         let mut this = Self::new_uninitialized(settings_path);
         this.init();
@@ -120,8 +137,13 @@ impl Library {
             .convert_conflict_behavior()
             .unwrap_or(ConvertConflictBehavior::AddCopy);
         let download_format = settings.download_format();
+        let preview_volume = settings.preview_volume();
         let hidden_tag_keys = settings.hidden_tag_groups();
         let hidden_tag_column_keys = settings.hidden_tag_columns();
+        let intersection_tags = Category::ALL
+            .into_iter()
+            .map(|category| (category, settings.intersection_tags(category)))
+            .collect();
         Self {
             backend,
             active: Category::Music,
@@ -130,11 +152,13 @@ impl Library {
             settings_path,
             format_priority,
             download_format,
+            preview_volume,
             convert_conflict_behavior,
             filters_open: false,
-            tag_search: String::new(),
             hidden_tag_keys,
             hidden_tag_column_keys,
+            intersection_tags,
+            tag_intersections: BTreeMap::new(),
             downloader_open: false,
             download_state: DownloadState::Idle,
             download_cancel: None,
@@ -143,6 +167,13 @@ impl Library {
             import_progress: None,
             last_focus_rescan: None,
             focus_rescan_in_flight: false,
+            waveform_cache_in_flight: false,
+            waveform_cache_skipped_paths: BTreeSet::new(),
+            waveform_priority_cache_in_flight: BTreeSet::new(),
+            preview_player: None,
+            preview_current_path: None,
+            preview_last_stopped: None,
+            preview_playhead_watch_running: false,
         }
     }
 
@@ -154,7 +185,40 @@ impl Library {
         &self.states[&self.active]
     }
 
-    #[allow(dead_code)]
+    pub(crate) fn tag_panel_schema(&self) -> BTreeMap<String, Vec<String>> {
+        let state = self.active_state();
+        if state.selected.is_empty() {
+            return state.schema.clone();
+        }
+
+        let present: BTreeMap<&str, BTreeSet<&str>> = state
+            .results
+            .iter()
+            .flat_map(|record| &record.tags)
+            .fold(BTreeMap::new(), |mut present, (key, values)| {
+                present
+                    .entry(key.as_str())
+                    .or_default()
+                    .extend(values.iter().map(String::as_str));
+                present
+            });
+
+        state
+            .schema
+            .iter()
+            .filter_map(|(key, values)| {
+                let present_values = present.get(key.as_str())?;
+                let values: Vec<_> = values
+                    .iter()
+                    .filter(|value| present_values.contains(value.as_str()))
+                    .cloned()
+                    .collect();
+                (!values.is_empty()).then(|| (key.clone(), values))
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
     pub fn category_folder(&self, category: Category) -> Option<&Path> {
         self.settings.category_folder(category)
     }
@@ -169,8 +233,8 @@ impl Library {
         self.filters_open
     }
 
-    pub fn tag_search(&self) -> &str {
-        &self.tag_search
+    pub fn search(&self) -> &str {
+        &self.active_state().search
     }
 
     pub fn tag_group_is_visible(&self, key: &str) -> bool {
@@ -179,6 +243,70 @@ impl Library {
 
     pub fn hidden_tag_column_keys(&self) -> BTreeSet<String> {
         self.hidden_tag_column_keys.clone()
+    }
+
+    pub fn tag_shows_on_intersection(&self, key: &str, value: &str) -> bool {
+        self.intersection_tags
+            .get(&self.active)
+            .and_then(|tags| tags.get(key))
+            .is_some_and(|values| values.contains(value))
+    }
+
+    pub fn tag_is_visible_in_panel(&self, key: &str, value: &str) -> bool {
+        if !self.search().is_empty() || !self.tag_shows_on_intersection(key, value) {
+            return true;
+        }
+        let Some(intersections) = self
+            .tag_intersections
+            .get(&self.active)
+            .and_then(|by_tag| by_tag.get(&(key.to_string(), value.to_string())))
+        else {
+            return true;
+        };
+        self.active_state()
+            .selected
+            .iter()
+            .any(|(selected_key, values)| {
+                values.iter().any(|selected_value| {
+                    intersections.contains(&(selected_key.clone(), selected_value.clone()))
+                })
+            })
+    }
+
+    pub fn toggle_tag_intersection_visibility(
+        &mut self,
+        key: &str,
+        value: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let category = self.active;
+        let mut tags = self
+            .intersection_tags
+            .get(&category)
+            .cloned()
+            .unwrap_or_default();
+        let values = tags.entry(key.to_string()).or_default();
+        if !values.remove(value) {
+            values.insert(value.to_string());
+        }
+        if values.is_empty() {
+            tags.remove(key);
+        }
+        self.save_intersection_tags(category, tags);
+        cx.notify();
+    }
+
+    fn save_intersection_tags(
+        &mut self,
+        category: Category,
+        tags: BTreeMap<String, BTreeSet<String>>,
+    ) {
+        let mut settings = self.settings.clone();
+        settings.set_intersection_tags(category, tags.clone());
+        if settings.save(&self.settings_path).is_ok() {
+            self.settings = settings;
+            self.intersection_tags.insert(category, tags);
+        }
     }
 
     pub fn downloader_open(&self) -> bool {
@@ -210,6 +338,7 @@ impl Library {
         if self.filters_open {
             self.downloader_open = false;
         }
+        let _ = self.refresh_search_results(self.active);
         cx.notify();
     }
 
@@ -218,6 +347,7 @@ impl Library {
             return false;
         }
         self.filters_open = false;
+        let _ = self.refresh_search_results(self.active);
         cx.notify();
         true
     }
@@ -225,7 +355,11 @@ impl Library {
     pub fn toggle_downloader(&mut self, cx: &mut Context<Self>) {
         self.downloader_open = !self.downloader_open;
         if self.downloader_open {
+            let filters_were_open = self.filters_open;
             self.filters_open = false;
+            if filters_were_open {
+                let _ = self.refresh_search_results(self.active);
+            }
         }
         debug_downloader_interaction(|| format!("panel_open={}", self.downloader_open));
         cx.notify();
@@ -234,6 +368,7 @@ impl Library {
     pub fn set_category(&mut self, category: Category, cx: &mut Context<Self>) {
         if self.active != category {
             self.active = category;
+            let _ = self.refresh_search_results(category);
             debug_library_interaction(|| {
                 let results = self.active_state().results.len();
                 format!("category={} results={results}", category.label())
@@ -255,9 +390,7 @@ impl Library {
             let state = self.states.entry(category).or_default();
             state.search = search.clone();
         }
-        for category in Category::ALL {
-            let _ = self.refresh_category_state(category);
-        }
+        let _ = self.refresh_search_results(self.active);
         debug_library_interaction(|| {
             let active = self.active;
             let results = self.active_state().results.len();
@@ -268,20 +401,6 @@ impl Library {
             )
         });
         cx.notify();
-    }
-
-    pub fn set_tag_search(&mut self, search: String, cx: &mut Context<Self>) {
-        self.tag_search = search;
-        cx.notify();
-    }
-
-    pub fn clear_tag_search(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.tag_search.is_empty() {
-            return false;
-        }
-        self.tag_search.clear();
-        cx.notify();
-        true
     }
 
     pub fn clear_search(&mut self, cx: &mut Context<Self>) -> bool {
@@ -333,25 +452,45 @@ impl Library {
     }
 
     pub fn single_tag_search_match(&self) -> Option<(String, String)> {
-        let include_hidden_groups = !self.tag_search.is_empty();
+        let search = self.search();
+        let include_hidden_groups = !search.is_empty();
         let matches: Vec<(String, String)> = self
-            .active_state()
-            .schema
+            .tag_panel_schema()
             .iter()
             .flat_map(|(key, values)| {
-                values
-                    .iter()
+                let mut candidates = BTreeSet::new();
+                for value in values {
+                    if let Some((parent, child)) = crate::model::split_subtag(value) {
+                        if tag_matches_search(parent, search) {
+                            candidates.insert(parent.to_string());
+                        }
+                        if tag_matches_search(child, search)
+                            || (search.contains('/') && tag_matches_search(value, search))
+                        {
+                            candidates.insert(value.clone());
+                        }
+                    } else if tag_matches_search(value, search) {
+                        candidates.insert(value.clone());
+                    }
+                }
+                candidates
+                    .into_iter()
                     .filter(|_| include_hidden_groups || self.tag_group_is_visible(key))
-                    .filter(|value| tag_matches_search(value, &self.tag_search))
-                    .map(move |value| (key.clone(), value.clone()))
+                    .map(move |value| (key.clone(), value))
+                    .collect::<Vec<_>>()
             })
             .collect();
 
-        let exact_search = self.tag_search.trim();
+        let exact_search = search.trim();
         if !exact_search.is_empty() {
             let mut exact_matches = matches
                 .iter()
-                .filter(|(_, value)| tag_exactly_matches_search(value, exact_search))
+                .filter(|(_, value)| {
+                    tag_exactly_matches_search(value, exact_search)
+                        || crate::model::split_subtag(value).is_some_and(|(_, child)| {
+                            tag_exactly_matches_search(child, exact_search)
+                        })
+                })
                 .cloned();
             if let Some(first) = exact_matches.next() {
                 return exact_matches.next().is_none().then_some(first);
@@ -367,7 +506,7 @@ impl Library {
         let Some((key, value)) = self.single_tag_search_match() else {
             return false;
         };
-        self.tag_search.clear();
+        self.set_search(String::new(), cx);
         self.toggle_value(&key, &value, cx);
         true
     }
@@ -849,6 +988,28 @@ impl Library {
         cx.notify();
     }
 
+    pub fn preview_volume(&self) -> f32 {
+        self.preview_volume
+    }
+
+    pub fn set_preview_volume(&mut self, volume: f32, cx: &mut Context<Self>) {
+        let volume = volume.clamp(0., 1.);
+        if self.preview_volume == volume {
+            return;
+        }
+
+        let mut settings = self.settings.clone();
+        settings.set_preview_volume(volume);
+        if settings.save(&self.settings_path).is_ok() {
+            self.settings = settings;
+            self.preview_volume = volume;
+            if let Some(player) = self.preview_player.as_mut() {
+                player.set_volume(volume);
+            }
+        }
+        cx.notify();
+    }
+
     pub fn begin_internal_file_drag(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.begin_internal_file_drag_files(vec![path], cx);
     }
@@ -903,6 +1064,7 @@ impl Library {
                     category,
                     imported: false,
                     moved_from: internal_origin,
+                    moved_files: Vec::new(),
                 },
                 cx,
             );
@@ -910,15 +1072,18 @@ impl Library {
         };
         let import_task = cx.background_spawn(async move {
             let mut imported = false;
+            let mut moved_files = Vec::new();
             for path in paths {
-                if import_to_folder(&folder, &path, |_| {}).is_ok() {
+                if let Ok(destination) = import_to_folder(&folder, &path, |_| {}) {
                     imported = true;
+                    moved_files.push((path, destination));
                 }
             }
             ImportBatchResult {
                 category,
                 imported,
                 moved_from: internal_origin,
+                moved_files,
             }
         });
 
@@ -1036,6 +1201,7 @@ impl Library {
             cx.notify();
             return;
         }
+        self.stop_preview_if_paths_match(&paths, cx);
 
         let category = self.active;
         let file_count = paths.len();
@@ -1072,30 +1238,83 @@ impl Library {
         self.settings = settings;
         self.backend.set_category_folder(category, path)?;
         self.refresh_category_state(category)?;
+        self.maybe_start_waveform_cache(cx);
         cx.notify();
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub fn refresh_category(
+    pub fn play_preview_from_start(&mut self, path: PathBuf, cx: &mut Context<Self>) -> bool {
+        self.play_preview_from_offset(path, Duration::ZERO, cx)
+    }
+
+    pub fn play_preview_from_ratio(
         &mut self,
-        category: Category,
+        path: PathBuf,
+        ratio: f32,
         cx: &mut Context<Self>,
-    ) -> io::Result<()> {
-        self.backend.refresh_category(category)?;
-        self.refresh_category_state(category)?;
-        cx.notify();
-        Ok(())
+    ) -> bool {
+        self.stop_active_preview();
+        self.ensure_preview_player();
+        let Some(player) = self.preview_player.as_mut() else {
+            return false;
+        };
+        match player.play_from_ratio(path.clone(), ratio) {
+            Ok(()) => {
+                let offset = player
+                    .current_position()
+                    .map_or(Duration::ZERO, |position| position.offset);
+                self.preview_started(path, offset, cx)
+            }
+            Err(error) => {
+                eprintln!(
+                    "lowcat preview play failed path={} error={error}",
+                    path.display()
+                );
+                self.preview_current_path = None;
+                false
+            }
+        }
     }
 
-    #[allow(dead_code)]
-    pub fn refresh_all(&mut self, cx: &mut Context<Self>) -> io::Result<()> {
-        self.backend.refresh_all()?;
-        for category in Category::ALL {
-            self.refresh_category_state(category)?;
+    pub fn toggle_preview_from_last_stopped(&mut self, cx: &mut Context<Self>) -> bool {
+        if let Some(player) = self.preview_player.as_mut()
+            && player.is_playing()
+        {
+            self.preview_last_stopped = player.pause_or_stop();
+            self.preview_current_path = None;
+            self.preview_playhead_watch_running = false;
+            cx.notify();
+            return true;
         }
+
+        let Some(position) = self.preview_last_stopped.clone() else {
+            return false;
+        };
+        self.play_preview_from_offset(position.path, position.offset, cx)
+    }
+
+    pub fn stop_preview(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(player) = self.preview_player.as_mut() else {
+            return false;
+        };
+        self.preview_last_stopped = player.stop();
+        self.preview_current_path = None;
+        self.preview_playhead_watch_running = false;
         cx.notify();
-        Ok(())
+        true
+    }
+
+    pub fn preview_playhead_ratio_for_path(&self, path: &Path) -> Option<f32> {
+        let player = self.preview_player.as_ref()?;
+        let position = player.current_position()?;
+        if !paths_equal(&position.path, path) {
+            return None;
+        }
+        let duration = player.current_duration()?;
+        if duration.is_zero() {
+            return None;
+        }
+        Some((position.offset.as_secs_f32() / duration.as_secs_f32()).clamp(0., 1.))
     }
 
     pub fn rescan_after_focus(&mut self, cx: &mut Context<Self>) {
@@ -1138,7 +1357,7 @@ impl Library {
         cx.notify();
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn init(&mut self) {
         for category in Category::ALL {
             if let Some(path) = self
@@ -1178,6 +1397,7 @@ impl Library {
 
     fn start_initial_rescan(&mut self, cx: &mut Context<Self>) {
         self.rescan_after_focus(cx);
+        self.maybe_start_waveform_cache(cx);
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -1237,6 +1457,7 @@ impl Library {
                 self.download_state = DownloadState::Idle;
                 let _ = self.backend.refresh_category(result.category);
                 let _ = self.refresh_category_state(result.category);
+                self.maybe_start_waveform_cache(cx);
                 debug_downloader_interaction(|| {
                     format!("download_finished category={}", result.category.label())
                 });
@@ -1264,7 +1485,26 @@ impl Library {
         self.import_progress = None;
         if result.imported {
             let _ = self.backend.refresh_category(result.category);
+            if let Some(origin) = result.moved_from
+                && origin != result.category
+            {
+                for (source, destination) in &result.moved_files {
+                    if let Err(error) = self.backend.copy_tags_between_categories(
+                        origin,
+                        result.category,
+                        source,
+                        destination,
+                    ) {
+                        eprintln!(
+                            "lowcat cross-category metadata move failed source={} destination={} error={error}",
+                            source.display(),
+                            destination.display()
+                        );
+                    }
+                }
+            }
             let _ = self.refresh_category_state(result.category);
+            self.maybe_start_waveform_cache(cx);
             if let Some(origin) = result.moved_from
                 && origin != result.category
             {
@@ -1319,13 +1559,37 @@ impl Library {
         };
         let schema_start = crate::perf::start();
         let schema = display_schema(self.backend.schema_for(category));
+        let all_records = display_records(self.backend.filter(category, "", &BTreeMap::new()));
+        let intersections = tag_intersections(&all_records);
+        let mut configured = self
+            .intersection_tags
+            .get(&category)
+            .cloned()
+            .unwrap_or_default();
+        configured.retain(|key, values| {
+            values.retain(|value| {
+                intersections
+                    .get(&(key.clone(), value.clone()))
+                    .is_some_and(|others| !others.is_empty())
+            });
+            !values.is_empty()
+        });
+        if self.intersection_tags.get(&category) != Some(&configured) {
+            self.save_intersection_tags(category, configured);
+        }
+        self.tag_intersections.insert(category, intersections);
         crate::perf::finish("library.schema", schema_start, || {
             format!("category={} keys={}", category.label(), schema.len())
         });
         reconcile_selected_filter_keys(&mut selected, &schema, renamed_key);
         reconcile_selected_filters(&mut selected, &schema, renamed_tag);
         let filter_start = crate::perf::start();
-        let results = display_records(self.backend.filter(category, &search, &selected));
+        let results = display_records(self.backend.filter_scoped(
+            category,
+            &search,
+            &selected,
+            self.filters_open,
+        ));
         crate::perf::finish("library.filter", filter_start, || {
             format!(
                 "category={} results={} search_len={} selected_keys={}",
@@ -1349,12 +1613,39 @@ impl Library {
         Ok(())
     }
 
+    fn refresh_search_results(&mut self, category: Category) -> io::Result<()> {
+        let total_start = crate::perf::start();
+        let (search, selected) = if let Some(state) = self.states.get(&category) {
+            (state.search.clone(), state.selected.clone())
+        } else {
+            (String::new(), BTreeMap::new())
+        };
+        let results = display_records(self.backend.filter_scoped(
+            category,
+            &search,
+            &selected,
+            self.filters_open,
+        ));
+        let results_len = results.len();
+        self.states.entry(category).or_default().results = results;
+        crate::perf::finish("library.refresh_search_results", total_start, || {
+            format!(
+                "category={} results={results_len} search_len={} selected_keys={}",
+                category.label(),
+                search.len(),
+                selected.len()
+            )
+        });
+        Ok(())
+    }
+
     fn finish_convert_unsupported(&mut self, result: ConvertBatchResult, cx: &mut Context<Self>) {
         self.importing = false;
         self.import_progress = None;
         if result.converted {
             let _ = self.backend.refresh_category(result.category);
             let _ = self.refresh_category_state(result.category);
+            self.maybe_start_waveform_cache(cx);
         }
         cx.notify();
     }
@@ -1382,6 +1673,7 @@ impl Library {
                 result.category.label()
             );
         }
+        self.stop_preview_if_missing(cx);
         cx.notify();
     }
 
@@ -1402,6 +1694,8 @@ impl Library {
                         );
                     }
                 }
+                self.stop_preview_if_missing(cx);
+                self.maybe_start_waveform_cache(cx);
             }
             Err(error) => {
                 eprintln!(
@@ -1411,6 +1705,257 @@ impl Library {
             }
         }
         cx.notify();
+    }
+
+    fn maybe_start_waveform_cache(&mut self, cx: &mut Context<Self>) {
+        const BATCH_SIZE: usize = 16;
+        if self.waveform_cache_in_flight {
+            return;
+        }
+        self.waveform_cache_in_flight = true;
+        let db_path = database_path_for_settings(&self.settings_path);
+        let skipped_paths = self.waveform_cache_skipped_paths.clone();
+        let fetch_limit = BATCH_SIZE + skipped_paths.len();
+        let task = cx.background_spawn(async move {
+            let backend = Backend::new(db_path)?;
+            let paths = backend.missing_waveform_cache_paths(fetch_limit)?;
+            let mut processed = 0usize;
+            let mut changed = false;
+            let mut skipped = Vec::new();
+            for path in paths {
+                if skipped_paths.contains(&path) {
+                    continue;
+                }
+                if processed >= BATCH_SIZE {
+                    break;
+                }
+                if !path.is_file() {
+                    skipped.push(path);
+                    continue;
+                }
+                processed += 1;
+                match crate::preview_waveform::generate_waveform_binary256(&path) {
+                    Ok(waveform) => {
+                        backend.set_preview_waveform(&path, waveform)?;
+                        changed = true;
+                    }
+                    Err(error) => {
+                        if lowcat_debug_enabled() {
+                            eprintln!(
+                                "[lowcat:preview] waveform failed path={} error={error}",
+                                path.display()
+                            );
+                        }
+                        skipped.push(path);
+                    }
+                }
+            }
+            Ok::<_, io::Error>(WaveformCacheBatchResult {
+                processed,
+                changed,
+                skipped_paths: skipped,
+            })
+        });
+
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |lib, cx| {
+                lib.finish_waveform_cache(result, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn maybe_start_priority_waveform_cache(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.waveform_priority_cache_in_flight.contains(&path) || !path.is_file() {
+            return;
+        }
+
+        self.waveform_cache_skipped_paths.remove(&path);
+        self.waveform_priority_cache_in_flight.insert(path.clone());
+        let db_path = database_path_for_settings(&self.settings_path);
+        let task = cx.background_spawn(async move {
+            let backend = Backend::new(db_path)?;
+            let result = crate::preview_waveform::generate_waveform_binary256(&path)
+                .and_then(|waveform| backend.set_preview_waveform(&path, waveform));
+            Ok::<_, io::Error>((path, result))
+        });
+
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |lib, cx| {
+                lib.finish_priority_waveform_cache(result, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn finish_priority_waveform_cache(
+        &mut self,
+        result: io::Result<(PathBuf, io::Result<()>)>,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok((path, Ok(()))) => {
+                self.waveform_priority_cache_in_flight.remove(&path);
+                for category in Category::ALL {
+                    let _ = self.refresh_category_state(category);
+                }
+                cx.notify();
+            }
+            Ok((path, Err(error))) => {
+                self.waveform_priority_cache_in_flight.remove(&path);
+                if lowcat_debug_enabled() {
+                    eprintln!(
+                        "[lowcat:preview] priority waveform failed path={} error={error}",
+                        path.display()
+                    );
+                }
+                cx.notify();
+            }
+            Err(error) => {
+                self.waveform_priority_cache_in_flight.clear();
+                eprintln!("lowcat priority waveform cache failed error={error}");
+                cx.notify();
+            }
+        }
+    }
+
+    fn finish_waveform_cache(
+        &mut self,
+        result: io::Result<WaveformCacheBatchResult>,
+        cx: &mut Context<Self>,
+    ) {
+        self.waveform_cache_in_flight = false;
+        match result {
+            Ok(result) => {
+                let skipped_count = result.skipped_paths.len();
+                self.waveform_cache_skipped_paths
+                    .extend(result.skipped_paths);
+                if result.changed {
+                    for category in Category::ALL {
+                        let _ = self.refresh_category_state(category);
+                    }
+                    cx.notify();
+                }
+                if result.processed >= 16 || skipped_count > 0 {
+                    self.maybe_start_waveform_cache(cx);
+                }
+            }
+            Err(error) => {
+                eprintln!("lowcat waveform cache failed error={error}");
+                cx.notify();
+            }
+        }
+    }
+
+    fn play_preview_from_offset(
+        &mut self,
+        path: PathBuf,
+        offset: Duration,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.stop_active_preview();
+        self.ensure_preview_player();
+        let Some(player) = self.preview_player.as_mut() else {
+            return false;
+        };
+        match player.play_from(path.clone(), offset) {
+            Ok(()) => self.preview_started(path, offset, cx),
+            Err(error) => {
+                eprintln!(
+                    "lowcat preview play failed path={} error={error}",
+                    path.display()
+                );
+                self.preview_current_path = None;
+                false
+            }
+        }
+    }
+
+    fn ensure_preview_player(&mut self) {
+        if self.preview_player.is_none() {
+            self.preview_player = Some(PreviewPlayer::new(self.preview_volume));
+        }
+    }
+
+    fn stop_active_preview(&mut self) {
+        if let Some(player) = self.preview_player.as_mut()
+            && player.is_playing()
+        {
+            self.preview_last_stopped = player.stop();
+        }
+    }
+
+    fn preview_started(&mut self, path: PathBuf, offset: Duration, cx: &mut Context<Self>) -> bool {
+        self.preview_current_path = Some(path.clone());
+        self.preview_last_stopped = Some(PreviewPosition { path, offset });
+        self.start_preview_playhead_watch(cx);
+        cx.notify();
+        true
+    }
+
+    fn start_preview_playhead_watch(&mut self, cx: &mut Context<Self>) {
+        if self.preview_playhead_watch_running {
+            return;
+        }
+        self.preview_playhead_watch_running = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(33))
+                    .await;
+                let should_continue = this
+                    .update(cx, |lib, cx| {
+                        let ended_position = lib
+                            .preview_player
+                            .as_mut()
+                            .and_then(|player| player.finish_if_ended());
+                        if let Some(position) = ended_position {
+                            lib.preview_last_stopped = Some(position);
+                            lib.preview_current_path = None;
+                            lib.preview_playhead_watch_running = false;
+                            cx.notify();
+                            return false;
+                        }
+                        let playing = lib
+                            .preview_player
+                            .as_ref()
+                            .is_some_and(|player| player.is_playing());
+                        if !playing {
+                            lib.preview_playhead_watch_running = false;
+                            return false;
+                        }
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !should_continue {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn stop_preview_if_paths_match(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        let Some(current_path) = self.preview_current_path.as_ref() else {
+            return;
+        };
+        if paths.iter().any(|path| paths_equal(path, current_path)) {
+            self.stop_preview(cx);
+        }
+    }
+
+    fn stop_preview_if_missing(&mut self, cx: &mut Context<Self>) {
+        let Some(current_path) = self.preview_current_path.as_ref() else {
+            return;
+        };
+        if !current_path.is_file() {
+            self.stop_preview(cx);
+        }
     }
 
     fn internal_drag_origin(&self, paths: &[PathBuf]) -> Option<Category> {
@@ -1479,6 +2024,34 @@ impl Library {
             values.retain(|existing| existing != &value);
         }
     }
+}
+
+fn tag_intersections(
+    records: &[FileRecord],
+) -> BTreeMap<(String, String), BTreeSet<(String, String)>> {
+    let mut intersections = BTreeMap::new();
+    for record in records {
+        let tags: BTreeSet<(String, String)> = record
+            .tags
+            .iter()
+            .flat_map(|(key, values)| {
+                values.iter().flat_map(move |value| {
+                    let mut identities = vec![(key.clone(), value.clone())];
+                    if let Some((parent, _)) = crate::model::split_subtag(value) {
+                        identities.push((key.clone(), parent.to_string()));
+                    }
+                    identities
+                })
+            })
+            .collect();
+        for tag in &tags {
+            intersections
+                .entry(tag.clone())
+                .or_insert_with(BTreeSet::new)
+                .extend(tags.iter().filter(|other| *other != tag).cloned());
+        }
+    }
+    intersections
 }
 
 fn database_path_for_settings(settings_path: &Path) -> PathBuf {
@@ -1582,7 +2155,11 @@ fn reconcile_selected_filters(
         let Some(available) = schema.get(key) else {
             return false;
         };
-        values.retain(|value| available.contains(value));
+        values.retain(|filter| {
+            available
+                .iter()
+                .any(|value| crate::model::tag_value_matches_filter(value, filter))
+        });
         !values.is_empty()
     });
 }
@@ -1603,21 +2180,21 @@ fn reconcile_selected_filter_keys(
 }
 
 fn debug_downloader_interaction(details: impl FnOnce() -> String) {
-    let enabled = std::env::var("LOWCAT_DEBUG")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
-    if enabled {
+    if lowcat_debug_enabled() {
         eprintln!("[lowcat:downloader] {}", details());
     }
 }
 
 fn debug_library_interaction(details: impl FnOnce() -> String) {
-    let enabled = std::env::var("LOWCAT_DEBUG")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
-    if enabled {
+    if lowcat_debug_enabled() {
         eprintln!("[lowcat:library] {}", details());
     }
+}
+
+fn lowcat_debug_enabled() -> bool {
+    std::env::var("LOWCAT_DEBUG")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -1702,6 +2279,52 @@ mod tests {
         let has_folder =
             library.read_with(cx, |lib, _| lib.category_folder(Category::Music).is_some());
         assert!(!has_folder);
+    }
+
+    #[gpui::test]
+    fn preview_toggle_without_last_stopped_returns_false(cx: &mut gpui::TestAppContext) {
+        let library = cx.new(|_| Library::new_with_settings_path(settings_path("preview-empty")));
+
+        let consumed = library.update(cx, |lib, cx| lib.toggle_preview_from_last_stopped(cx));
+
+        assert!(!consumed);
+    }
+
+    #[gpui::test]
+    fn priority_waveform_cache_fills_missing_visible_row(cx: &mut gpui::TestAppContext) {
+        let settings_path = settings_path("priority-waveform");
+        let (music_dir, _) = settings_with_folders(&settings_path);
+        let path = fixture(&music_dir, "needs-cache.wav", &[]);
+        let library = cx.new(|_| Library::new_with_settings_path(settings_path));
+
+        library.update(cx, |lib, _| {
+            lib.backend.clear_preview_waveform(&path).unwrap();
+            lib.refresh_category_state(Category::Music).unwrap();
+        });
+        let cached = library.read_with(cx, |lib, _| {
+            lib.active_state()
+                .results
+                .iter()
+                .find(|record| record.path == path)
+                .and_then(|record| record.primary_waveform())
+                .is_some()
+        });
+        assert!(!cached);
+
+        library.update(cx, |lib, cx| {
+            lib.maybe_start_priority_waveform_cache(path.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        let cached = library.read_with(cx, |lib, _| {
+            lib.active_state()
+                .results
+                .iter()
+                .find(|record| record.path == path)
+                .and_then(|record| record.primary_waveform())
+                .is_some()
+        });
+        assert!(cached);
     }
 
     #[gpui::test]
@@ -1909,6 +2532,19 @@ mod tests {
     }
 
     #[gpui::test]
+    fn preview_volume_defaults_to_full_and_persists(cx: &mut gpui::TestAppContext) {
+        let settings_path = settings_path("preview-volume");
+        let library = cx.new(|_| Library::new_with_settings_path(settings_path.clone()));
+
+        assert_eq!(library.read_with(cx, |lib, _| lib.preview_volume()), 1.);
+
+        library.update(cx, |lib, cx| lib.set_preview_volume(0.42, cx));
+
+        let restarted = cx.new(|_| Library::new_with_settings_path(settings_path));
+        assert_eq!(restarted.read_with(cx, |lib, _| lib.preview_volume()), 0.42);
+    }
+
+    #[gpui::test]
     fn tag_group_visibility_persists(cx: &mut gpui::TestAppContext) {
         let settings_path = settings_path("tag-group-visibility");
         let library = cx.new(|_| Library::new_with_settings_path(settings_path.clone()));
@@ -1968,8 +2604,14 @@ mod tests {
         let library = cx.new(|_| Library::new_with_settings_path(settings_path));
 
         library.update(cx, |lib, cx| lib.set_search("hit".to_string(), cx));
-        let music_count = library.read_with(cx, |lib, _| lib.active_state().results.len());
+        let (music_count, stale_sfx_count) = library.read_with(cx, |lib, _| {
+            (
+                lib.active_state().results.len(),
+                lib.states[&Category::Sfx].results.len(),
+            )
+        });
         assert_eq!(music_count, 1);
+        assert_eq!(stale_sfx_count, 2);
 
         library.update(cx, |lib, cx| lib.set_category(Category::Sfx, cx));
         let sfx_count = library.read_with(cx, |lib, _| lib.active_state().results.len());
@@ -1978,6 +2620,61 @@ mod tests {
         library.update(cx, |lib, cx| lib.set_category(Category::Music, cx));
         let music_count = library.read_with(cx, |lib, _| lib.active_state().results.len());
         assert_eq!(music_count, 1);
+    }
+
+    #[gpui::test]
+    fn unified_search_adds_tag_matches_only_while_filter_panel_is_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let settings_path = settings_path("unified-name-tag-search");
+        let (music_dir, _) = settings_with_folders(&settings_path);
+        fixture(&music_dir, "beat.flac", &[("GENRE", "Ambient")]);
+        fixture(&music_dir, "ambient-name.flac", &[]);
+        let library = cx.new(|_| Library::new_with_settings_path(settings_path));
+
+        library.update(cx, |lib, cx| lib.set_search("ambient".to_string(), cx));
+        let names = library.read_with(cx, |lib, _| {
+            lib.active_state()
+                .results
+                .iter()
+                .map(|record| record.name.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(names, vec!["ambient-name".to_string()]);
+
+        library.update(cx, |lib, cx| lib.toggle_filters(cx));
+        let (names, autocomplete) = library.read_with(cx, |lib, _| {
+            (
+                lib.active_state()
+                    .results
+                    .iter()
+                    .map(|record| record.name.clone())
+                    .collect::<Vec<_>>(),
+                lib.single_tag_search_match(),
+            )
+        });
+        assert_eq!(names, vec!["ambient-name".to_string(), "beat".to_string()]);
+        assert_eq!(
+            autocomplete,
+            Some(("genre".to_string(), "Ambient".to_string()))
+        );
+
+        let applied = library.update(cx, |lib, cx| lib.apply_single_tag_search_match(cx));
+        let (search, names, selected) = library.read_with(cx, |lib, _| {
+            (
+                lib.search().to_string(),
+                lib.active_state()
+                    .results
+                    .iter()
+                    .map(|record| record.name.clone())
+                    .collect::<Vec<_>>(),
+                lib.active_state().selected.clone(),
+            )
+        });
+        assert!(applied);
+        assert!(search.is_empty());
+        assert_eq!(names, vec!["beat".to_string()]);
+        assert_eq!(selected["genre"], BTreeSet::from(["Ambient".to_string()]));
     }
 
     #[gpui::test]
@@ -2006,6 +2703,13 @@ mod tests {
         let music_file = fixture(&music_dir, "move.flac", &[("GENRE", "Ambient")]);
         let library = cx.new(|_| Library::new_with_settings_path(settings_path));
 
+        library.update(cx, |lib, _| {
+            lib.backend
+                .add_tag(Category::Music, &music_file, "CUSTOM", "Favorite")
+                .unwrap();
+            lib.refresh_category_state(Category::Music).unwrap();
+        });
+
         library.update(cx, |lib, cx| {
             lib.begin_internal_file_drag(music_file.clone(), cx)
         });
@@ -2016,14 +2720,17 @@ mod tests {
 
         assert!(!music_file.exists());
         assert!(sfx_dir.join("move.flac").is_file());
-        let (music_count, sfx_count) = library.read_with(cx, |lib, _| {
+        let (music_count, sfx_count, sfx_tags) = library.read_with(cx, |lib, _| {
             (
                 lib.states[&Category::Music].results.len(),
                 lib.states[&Category::Sfx].results.len(),
+                lib.states[&Category::Sfx].results[0].tags.clone(),
             )
         });
         assert_eq!(music_count, 0);
         assert_eq!(sfx_count, 1);
+        assert_eq!(sfx_tags["genre"], vec!["Ambient"]);
+        assert_eq!(sfx_tags["custom"], vec!["Favorite"]);
     }
 
     #[gpui::test]
@@ -2057,6 +2764,32 @@ mod tests {
         library.update(cx, |lib, cx| lib.set_category(Category::Music, cx));
         let count = library.read_with(cx, |lib, _| lib.active_state().results.len());
         assert_eq!(count, 1);
+    }
+
+    #[gpui::test]
+    fn tag_panel_only_shows_values_present_in_filtered_results(cx: &mut gpui::TestAppContext) {
+        let settings_path = settings_path("filter-tag-panel-values");
+        let (music_dir, _) = settings_with_folders(&settings_path);
+        fixture(
+            &music_dir,
+            "dark.flac",
+            &[("GENRE", "Electronic"), ("MOOD", "Dark")],
+        );
+        fixture(
+            &music_dir,
+            "calm.flac",
+            &[("GENRE", "Ambient"), ("MOOD", "Calm")],
+        );
+        let library = cx.new(|_| Library::new_with_settings_path(settings_path));
+
+        let schema = library.read_with(cx, |lib, _| lib.tag_panel_schema());
+        assert_eq!(schema["genre"], vec!["Ambient", "Electronic"]);
+        assert_eq!(schema["mood"], vec!["Calm", "Dark"]);
+
+        library.update(cx, |lib, cx| lib.toggle_value("genre", "Electronic", cx));
+        let schema = library.read_with(cx, |lib, _| lib.tag_panel_schema());
+        assert_eq!(schema["genre"], vec!["Electronic"]);
+        assert_eq!(schema["mood"], vec!["Dark"]);
     }
 
     #[gpui::test]
@@ -2099,10 +2832,62 @@ mod tests {
         library.update(cx, |lib, cx| {
             lib.add_tag(path.clone(), "genre", "Hyper", cx)
         });
-        library.update(cx, |lib, cx| lib.set_tag_search("hype".to_string(), cx));
+        library.update(cx, |lib, cx| lib.set_search("hype".to_string(), cx));
 
         let single_match = library.read_with(cx, |lib, _| lib.single_tag_search_match());
         assert_eq!(single_match, Some(("mood".to_string(), "Hype".to_string())));
+    }
+
+    #[gpui::test]
+    fn tag_search_autocomplete_counts_collapsed_subtag_parent_once(cx: &mut gpui::TestAppContext) {
+        let settings_path = settings_path("tag-search-collapsed-subtags");
+        let (music_dir, _) = settings_with_folders(&settings_path);
+        let comedy = fixture(&music_dir, "comedy.flac", &[]);
+        let meme = fixture(&music_dir, "meme.flac", &[]);
+        let library = cx.new(|_| Library::new_with_settings_path(settings_path));
+
+        library.update(cx, |lib, cx| {
+            lib.add_tag(comedy, "use", "shitpost/comedy", cx);
+            lib.add_tag(meme, "use", "shitpost/meme", cx);
+            lib.set_search("shi".to_string(), cx);
+        });
+
+        let single_match = library.read_with(cx, |lib, _| lib.single_tag_search_match());
+        assert_eq!(
+            single_match,
+            Some(("use".to_string(), "shitpost".to_string()))
+        );
+    }
+
+    #[gpui::test]
+    fn tag_search_autocomplete_targets_subtag_before_and_after_parent_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let settings_path = settings_path("tag-search-subtag-match");
+        let (music_dir, _) = settings_with_folders(&settings_path);
+        let comedy = fixture(&music_dir, "comedy.flac", &[]);
+        let meme = fixture(&music_dir, "meme.flac", &[]);
+        let library = cx.new(|_| Library::new_with_settings_path(settings_path));
+
+        library.update(cx, |lib, cx| {
+            lib.add_tag(comedy, "use", "shitpost/comedy", cx);
+            lib.add_tag(meme, "use", "shitpost/meme", cx);
+            lib.set_search("com".to_string(), cx);
+        });
+        assert_eq!(
+            library.read_with(cx, |lib, _| lib.single_tag_search_match()),
+            Some(("use".to_string(), "shitpost/comedy".to_string()))
+        );
+
+        library.update(cx, |lib, cx| {
+            lib.set_search(String::new(), cx);
+            lib.toggle_value("use", "shitpost", cx);
+            lib.set_search("mem".to_string(), cx);
+        });
+        assert_eq!(
+            library.read_with(cx, |lib, _| lib.single_tag_search_match()),
+            Some(("use".to_string(), "shitpost/meme".to_string()))
+        );
     }
 
     #[test]
@@ -2156,6 +2941,53 @@ mod tests {
         assert!(selected_empty);
         assert!(!schema_values.contains(&"Hype".to_string()));
         assert_eq!(result_count, 1);
+    }
+
+    #[gpui::test]
+    fn intersection_tag_visibility_persists_and_clears_when_orphaned(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let settings_path = settings_path("intersection-visibility");
+        let (music_dir, _) = settings_with_folders(&settings_path);
+        let shared = fixture(&music_dir, "shared.flac", &[]);
+        let target_only = fixture(&music_dir, "target-only.flac", &[]);
+        let library = cx.new(|_| Library::new_with_settings_path(settings_path.clone()));
+
+        library.update(cx, |lib, cx| {
+            lib.add_tag(shared.clone(), "genre", "Hype", cx);
+            lib.add_tag(shared.clone(), "mood", "Dark", cx);
+            lib.add_tag(target_only, "genre", "Hype", cx);
+            lib.toggle_tag_intersection_visibility("genre", "Hype", cx);
+        });
+
+        assert!(library.read_with(cx, |lib, _| {
+            lib.tag_shows_on_intersection("genre", "Hype")
+                && !lib.tag_is_visible_in_panel("genre", "Hype")
+        }));
+
+        library.update(cx, |lib, cx| lib.set_search("Hype".to_string(), cx));
+        assert!(library.read_with(cx, |lib, _| {
+            lib.tag_is_visible_in_panel("genre", "Hype")
+        }));
+        library.update(cx, |lib, cx| lib.set_search(String::new(), cx));
+
+        library.update(cx, |lib, cx| lib.toggle_value("mood", "Dark", cx));
+        assert!(library.read_with(cx, |lib, _| {
+            lib.tag_is_visible_in_panel("genre", "Hype")
+        }));
+
+        let restarted = cx.new(|_| Library::new_with_settings_path(settings_path));
+        assert!(restarted.read_with(cx, |lib, _| {
+            lib.tag_shows_on_intersection("genre", "Hype")
+        }));
+
+        restarted.update(cx, |lib, cx| {
+            lib.remove_tag(shared, "mood", "Dark", cx);
+        });
+        assert!(restarted.read_with(cx, |lib, _| {
+            !lib.tag_shows_on_intersection("genre", "Hype")
+                && lib.tag_is_visible_in_panel("genre", "Hype")
+        }));
     }
 
     #[gpui::test]

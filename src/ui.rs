@@ -89,6 +89,9 @@ impl UI {
             if window.is_window_active() {
                 this.library
                     .update(cx, |lib, cx| lib.rescan_after_focus(cx));
+            } else {
+                this.table
+                    .update(cx, |table, cx| table.set_cmd_down(false, cx));
             }
         })
         .detach();
@@ -141,6 +144,7 @@ impl UI {
             event.keystroke.key.as_str(),
             "enter"
                 | "escape"
+                | "space"
                 | "shift"
                 | "control"
                 | "ctrl"
@@ -152,10 +156,9 @@ impl UI {
         )
     }
 
-    fn cancel_file_drag(&mut self, cx: &mut Context<Self>) {
+    fn cancel_file_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         self.table
-            .update(cx, |table, cx| table.cancel_file_drag(cx));
-        cx.notify();
+            .update(cx, |table, cx| table.cancel_file_drag(window, cx))
     }
 
     fn cancel_delete(&mut self, cx: &mut Context<Self>) -> bool {
@@ -210,6 +213,21 @@ impl UI {
         self.toolbar.read(cx).search_is_focused(window, cx)
             || self.table.read(cx).tag_editor_is_focused(window, cx)
             || self.table.read(cx).rename_input_is_focused(window, cx)
+    }
+
+    fn normal_search_is_focused(&self, window: &Window, cx: &App) -> bool {
+        self.toolbar.read(cx).normal_search_is_focused(window, cx)
+    }
+
+    fn play_cmd_hovered_preview_from_start(&mut self, cx: &mut Context<Self>) -> bool {
+        self.table.update(cx, |table, cx| {
+            table.play_cmd_hovered_preview_from_start(cx)
+        })
+    }
+
+    fn toggle_preview_from_last_stopped(&mut self, cx: &mut Context<Self>) -> bool {
+        self.library
+            .update(cx, |lib, cx| lib.toggle_preview_from_last_stopped(cx))
     }
 
     fn tag_editor_is_focused(&self, window: &Window, cx: &App) -> bool {
@@ -741,6 +759,9 @@ impl Render for UI {
                 });
                 this.table
                     .update(cx, |table, cx| table.set_alt_down(event.modifiers.alt, cx));
+                this.table.update(cx, |table, cx| {
+                    table.set_cmd_down(event.modifiers.platform, cx)
+                });
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.has_media_tool_problems() {
@@ -781,6 +802,10 @@ impl Render for UI {
                         cx.stop_propagation();
                         return;
                     }
+                    if this.cancel_file_drag(window, cx) {
+                        cx.stop_propagation();
+                        return;
+                    }
                     if this.cancel_search_if_no_selection(window, cx) {
                         cx.stop_propagation();
                         return;
@@ -789,12 +814,26 @@ impl Render for UI {
                         cx.stop_propagation();
                         return;
                     }
-                    this.cancel_file_drag(cx);
                     cx.stop_propagation();
                 } else if event.keystroke.key == "enter" {
                     if this.confirm_rename(window, cx) || this.confirm_delete(cx) {
                         cx.stop_propagation();
                     }
+                } else if event.keystroke.key == "space"
+                    && event.keystroke.modifiers.platform
+                    && this.play_cmd_hovered_preview_from_start(cx)
+                {
+                    cx.stop_propagation();
+                } else if event.keystroke.key == "space"
+                    && !event.keystroke.modifiers.control
+                    && !event.keystroke.modifiers.alt
+                    && !event.keystroke.modifiers.platform
+                    && !event.keystroke.modifiers.function
+                    && !event.keystroke.modifiers.shift
+                    && this.normal_search_is_focused(window, cx)
+                    && this.toggle_preview_from_last_stopped(cx)
+                {
+                    cx.stop_propagation();
                 } else if event.keystroke.modifiers.platform && event.keystroke.key == "f" {
                     this.library.update(cx, |lib, cx| {
                         lib.close_filters(cx);
@@ -1106,6 +1145,7 @@ fn render_media_tool_problem(problem: &MissingTool, cx: &mut Context<UI>) -> Any
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{Keystroke, Modifiers};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_link_path(extension: &str) -> PathBuf {
@@ -1153,6 +1193,21 @@ mod tests {
         assert!(dropped_download_link_text(&[first.clone(), second.clone()]).is_none());
         let _ = fs::remove_file(first);
         let _ = fs::remove_file(second);
+    }
+
+    #[test]
+    fn space_does_not_activate_search() {
+        let event = KeyDownEvent {
+            keystroke: Keystroke {
+                modifiers: Modifiers::default(),
+                key: "space".to_string(),
+                key_char: Some(" ".to_string()),
+            },
+            is_held: false,
+            prefer_character_input: false,
+        };
+
+        assert!(!UI::should_activate_search(&event));
     }
 }
 

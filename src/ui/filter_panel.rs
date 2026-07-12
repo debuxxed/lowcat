@@ -13,12 +13,15 @@ use gpui_component::{
 use crate::library::{
     Library, tag_matches_search, tag_search_group_sort_key, tag_search_match_sort_key,
 };
+use crate::model::split_subtag;
 use crate::ui::{CONTENT_PX, ROW_PANEL_HEIGHT};
 
 pub struct FilterPanel {
     library: Entity<Library>,
     tag_group_menu_position: Option<Point<Pixels>>,
     hovered_tag_group_menu_item: Option<TagGroupMenuHover>,
+    tag_menu: Option<(Point<Pixels>, String, String)>,
+    tag_menu_hovered: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -34,6 +37,8 @@ impl FilterPanel {
             library,
             tag_group_menu_position: None,
             hovered_tag_group_menu_item: None,
+            tag_menu: None,
+            tag_menu_hovered: false,
         }
     }
 
@@ -44,6 +49,8 @@ impl FilterPanel {
         cx: &mut Context<Self>,
     ) {
         window.prevent_default();
+        self.tag_menu = None;
+        self.tag_menu_hovered = false;
         self.tag_group_menu_position = Some(position);
         self.hovered_tag_group_menu_item = None;
         cx.notify();
@@ -59,7 +66,34 @@ impl FilterPanel {
     }
 
     pub(crate) fn cancel_tag_group_menu(&mut self, cx: &mut Context<Self>) -> bool {
-        self.close_tag_group_menu(cx)
+        let closed_group = self.close_tag_group_menu(cx);
+        let closed_tag = self.close_tag_menu(cx);
+        closed_group || closed_tag
+    }
+
+    fn open_tag_menu(
+        &mut self,
+        position: Point<Pixels>,
+        key: String,
+        value: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.prevent_default();
+        self.tag_group_menu_position = None;
+        self.hovered_tag_group_menu_item = None;
+        self.tag_menu = Some((position, key, value));
+        self.tag_menu_hovered = false;
+        cx.notify();
+    }
+
+    fn close_tag_menu(&mut self, cx: &mut Context<Self>) -> bool {
+        let closed = self.tag_menu.take().is_some() || self.tag_menu_hovered;
+        self.tag_menu_hovered = false;
+        if closed {
+            cx.notify();
+        }
+        closed
     }
 
     fn set_tag_group_menu_hovered(
@@ -294,6 +328,84 @@ impl FilterPanel {
             .into_any_element(),
         )
     }
+
+    fn render_tag_menu(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (position, key, value) = self.tag_menu.clone()?;
+        let window_size = window.bounds().size;
+        let checked = self
+            .library
+            .read(cx)
+            .tag_shows_on_intersection(&key, &value);
+        let row = Self::tag_group_menu_row("Show on intersection", checked)
+            .id("tag-menu-show-on-intersection")
+            .when(self.tag_menu_hovered, |el| {
+                el.bg(cx.theme().accent)
+                    .text_color(cx.theme().accent_foreground)
+            })
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if this.tag_menu_hovered != *hovered {
+                    this.tag_menu_hovered = *hovered;
+                    cx.notify();
+                }
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    window.prevent_default();
+                    this.library.update(cx, |lib, cx| {
+                        lib.toggle_tag_intersection_visibility(&key, &value, cx);
+                    });
+                    window.refresh();
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+
+        Some(
+            deferred(
+                anchored().child(
+                    div()
+                        .w(window_size.width)
+                        .h(window_size.height)
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.close_tag_menu(cx);
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, _, _, cx| {
+                                this.close_tag_menu(cx);
+                            }),
+                        )
+                        .child(
+                            anchored()
+                                .position(position)
+                                .snap_to_window_with_margin(px(8.))
+                                .anchor(Anchor::TopLeft)
+                                .child(
+                                    div()
+                                        .id("tag-menu")
+                                        .popover_style(cx)
+                                        .min_w(px(190.))
+                                        .p_1()
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .on_mouse_down(MouseButton::Right, |_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .child(row),
+                                ),
+                        ),
+                ),
+            )
+            .with_priority(2)
+            .into_any_element(),
+        )
+    }
 }
 
 impl Render for FilterPanel {
@@ -303,14 +415,15 @@ impl Render for FilterPanel {
             let library = self.library.read(cx);
             let state = library.active_state();
             (
-                state.schema.clone(),
+                library.tag_panel_schema(),
                 state.selected.clone(),
-                library.tag_search().to_string(),
+                library.search().to_string(),
                 library.single_tag_search_match(),
             )
         };
         let keys: Vec<String> = schema.keys().cloned().collect();
         let tag_group_menu = self.render_tag_group_menu(keys.clone(), window, cx);
+        let tag_menu = self.render_tag_menu(window, cx);
         let include_hidden_groups = !tag_search.is_empty();
 
         let mut panel = div()
@@ -339,9 +452,24 @@ impl Render for FilterPanel {
                 .map(|s| s.iter().cloned().collect())
                 .unwrap_or_default();
 
-            let mut matching_values: Vec<&String> = values
+            let root_values: std::collections::BTreeSet<String> = values
                 .iter()
-                .filter(|value| tag_matches_search(value, &tag_search))
+                .map(|value| {
+                    split_subtag(value)
+                        .map(|(parent, _)| parent.to_string())
+                        .unwrap_or_else(|| value.clone())
+                })
+                .collect();
+            let mut matching_values: Vec<String> = root_values
+                .into_iter()
+                .filter(|root| {
+                    tag_matches_search(root, &tag_search)
+                        || values.iter().any(|value| {
+                            split_subtag(value).is_some_and(|(parent, _)| parent == root)
+                                && tag_matches_search(value, &tag_search)
+                        })
+                })
+                .filter(|value| self.library.read(cx).tag_is_visible_in_panel(key, value))
                 .collect();
             if matching_values.is_empty() {
                 continue;
@@ -349,24 +477,74 @@ impl Render for FilterPanel {
             matching_values.sort_by_key(|value| tag_search_match_sort_key(value, &tag_search));
             let group_sort_key = tag_search_group_sort_key(
                 key,
-                matching_values.iter().map(|value| value.as_str()),
+                matching_values.iter().map(String::as_str),
                 &tag_search,
             );
-            matching_groups.push((group_sort_key, key, checked, matching_values));
+            matching_groups.push((group_sort_key, key, checked, matching_values, values));
         }
 
-        matching_groups.sort_by_key(|(sort_key, _, _, _)| sort_key.clone());
+        matching_groups.sort_by_key(|(sort_key, _, _, _, _)| sort_key.clone());
 
-        for (_, key, checked, matching_values) in matching_groups {
+        let mut rows = Vec::new();
+        for (_, key, checked, matching_values, raw_values) in matching_groups {
+            rows.push((
+                key.clone(),
+                key.clone(),
+                false,
+                checked.clone(),
+                matching_values,
+            ));
+            let mut expanded_parents: std::collections::BTreeSet<String> = checked
+                .iter()
+                .filter(|value| !value.contains('/'))
+                .cloned()
+                .collect();
+            if !tag_search.is_empty() {
+                expanded_parents.extend(raw_values.iter().filter_map(|value| {
+                    let (parent, child) = split_subtag(value)?;
+                    (tag_matches_search(child, &tag_search)
+                        || (tag_search.contains('/') && tag_matches_search(value, &tag_search)))
+                    .then(|| parent.to_string())
+                }));
+            }
+            for parent in expanded_parents {
+                let mut children: Vec<(String, String)> = raw_values
+                    .iter()
+                    .filter_map(|value| {
+                        let (candidate_parent, child) = split_subtag(value)?;
+                        (candidate_parent == parent
+                            && (tag_search.is_empty()
+                                || tag_matches_search(child, &tag_search)
+                                || (tag_search.contains('/')
+                                    && tag_matches_search(value, &tag_search)))
+                            && self.library.read(cx).tag_is_visible_in_panel(key, value))
+                        .then(|| (child.to_string(), value.clone()))
+                    })
+                    .collect();
+                children.sort_by_key(|(child, _)| tag_search_match_sort_key(child, &tag_search));
+                if !children.is_empty() {
+                    rows.push((
+                        key.clone(),
+                        parent,
+                        true,
+                        checked.clone(),
+                        children.into_iter().map(|(_, value)| value).collect(),
+                    ));
+                }
+            }
+        }
+
+        for (key, row_label, indented, checked, matching_values) in rows {
             let mut group = div()
                 .h_flex()
                 .flex_wrap()
                 .w_full()
                 .items_center()
                 .gap_1()
+                .when(indented, |group| group.pl_4())
                 .child(
                     div()
-                        .id(SharedString::from(format!("filter-key:{key}")))
+                        .id(SharedString::from(format!("filter-key:{key}:{row_label}")))
                         .h_flex()
                         .flex_shrink_0()
                         .items_center()
@@ -376,20 +554,25 @@ impl Render for FilterPanel {
                             div()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
-                                .child(SharedString::from(format!("{key}:"))),
+                                .child(SharedString::from(format!("{row_label}:"))),
                         ),
                 );
 
             for value in matching_values {
-                let is_active = checked.contains(value);
+                let is_active = checked.contains(&value);
                 let is_single_match =
                     single_match
                         .as_ref()
                         .is_some_and(|(match_key, match_value)| {
-                            match_key == key && match_value == value
+                            match_key == &key && match_value == &value
                         });
                 let key_owned = key.clone();
-                let value_owned = value.to_string();
+                let value_owned = value.clone();
+                let menu_key = key.clone();
+                let menu_value = value.clone();
+                let display_value = split_subtag(&value)
+                    .map(|(_, child)| child.to_string())
+                    .unwrap_or_else(|| value.clone());
                 let chip_border = if is_single_match {
                     cx.theme().success
                 } else if is_active {
@@ -404,7 +587,7 @@ impl Render for FilterPanel {
                         .compact()
                         .border_1()
                         .border_color(chip_border)
-                        .label(value.to_string())
+                        .label(display_value)
                         .selected(is_active)
                         .when(is_active, |button| button.primary())
                         .when(is_single_match, |button| {
@@ -412,9 +595,19 @@ impl Render for FilterPanel {
                                 Keystroke::parse("enter").expect("valid keystroke"),
                             ))
                         })
-                        .on_mouse_down(MouseButton::Right, |_, _, cx| {
-                            cx.stop_propagation();
-                        })
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                this.open_tag_menu(
+                                    event.position,
+                                    menu_key.clone(),
+                                    menu_value.clone(),
+                                    window,
+                                    cx,
+                                );
+                                cx.stop_propagation();
+                            }),
+                        )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let key = key_owned.clone();
                             let value = value_owned.clone();
@@ -435,6 +628,8 @@ impl Render for FilterPanel {
                 schema.values().map(Vec::len).sum::<usize>()
             )
         });
-        panel.when_some(tag_group_menu, |panel, menu| panel.child(menu))
+        panel
+            .when_some(tag_group_menu, |panel, menu| panel.child(menu))
+            .when_some(tag_menu, |panel, menu| panel.child(menu))
     }
 }

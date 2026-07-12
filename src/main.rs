@@ -8,7 +8,10 @@ mod library;
 mod macos_url_drop;
 mod media_tools;
 mod model;
+mod opus_source;
 mod perf;
+mod preview_player;
+mod preview_waveform;
 mod ui;
 
 use std::borrow::Cow;
