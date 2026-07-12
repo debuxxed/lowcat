@@ -215,19 +215,10 @@ impl UI {
             || self.table.read(cx).rename_input_is_focused(window, cx)
     }
 
-    fn normal_search_is_focused(&self, window: &Window, cx: &App) -> bool {
-        self.toolbar.read(cx).normal_search_is_focused(window, cx)
-    }
-
     fn play_cmd_hovered_preview_from_start(&mut self, cx: &mut Context<Self>) -> bool {
         self.table.update(cx, |table, cx| {
             table.play_cmd_hovered_preview_from_start(cx)
         })
-    }
-
-    fn toggle_preview_from_last_stopped(&mut self, cx: &mut Context<Self>) -> bool {
-        self.library
-            .update(cx, |lib, cx| lib.toggle_preview_from_last_stopped(cx))
     }
 
     fn tag_editor_is_focused(&self, window: &Window, cx: &App) -> bool {
@@ -824,16 +815,6 @@ impl Render for UI {
                     && this.play_cmd_hovered_preview_from_start(cx)
                 {
                     cx.stop_propagation();
-                } else if event.keystroke.key == "space"
-                    && !event.keystroke.modifiers.control
-                    && !event.keystroke.modifiers.alt
-                    && !event.keystroke.modifiers.platform
-                    && !event.keystroke.modifiers.function
-                    && !event.keystroke.modifiers.shift
-                    && this.normal_search_is_focused(window, cx)
-                    && this.toggle_preview_from_last_stopped(cx)
-                {
-                    cx.stop_propagation();
                 } else if event.keystroke.modifiers.platform && event.keystroke.key == "f" {
                     this.library.update(cx, |lib, cx| {
                         lib.close_filters(cx);
@@ -1196,7 +1177,7 @@ mod tests {
     }
 
     #[test]
-    fn space_does_not_activate_search() {
+    fn space_is_left_for_focused_search_input() {
         let event = KeyDownEvent {
             keystroke: Keystroke {
                 modifiers: Modifiers::default(),

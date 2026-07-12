@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::{StreamExt as _, channel::mpsc};
@@ -13,7 +14,8 @@ use crate::downloader::{
 };
 use crate::model::{
     AudioFormat, Category, CategoryState, ConvertConflictBehavior, FileRecord, FolderTagAssignment,
-    default_format_priority, fuzzy_search_match, normalize_tag_key, tag_label,
+    default_format_priority, fuzzy_search_match, normalize_tag_key, record_matches_scoped,
+    record_search_sort_key_scoped, tag_label,
 };
 use crate::preview_player::{PreviewPlayer, PreviewPosition};
 
@@ -50,11 +52,15 @@ pub struct Library {
     preview_current_path: Option<PathBuf>,
     preview_last_stopped: Option<PreviewPosition>,
     preview_playhead_watch_running: bool,
+    table_revision: u64,
+    filter_panel_revision: u64,
+    search_generation: u64,
 }
 
 #[derive(Clone)]
 pub enum LibraryEvent {
     TagEdited { path: PathBuf },
+    PreviewAdvanced,
 }
 
 impl EventEmitter<LibraryEvent> for Library {}
@@ -174,6 +180,9 @@ impl Library {
             preview_current_path: None,
             preview_last_stopped: None,
             preview_playhead_watch_running: false,
+            table_revision: 0,
+            filter_panel_revision: 0,
+            search_generation: 0,
         }
     }
 
@@ -237,6 +246,23 @@ impl Library {
         &self.active_state().search
     }
 
+    pub(crate) fn table_revision(&self) -> u64 {
+        self.table_revision
+    }
+
+    pub(crate) fn filter_panel_revision(&self) -> u64 {
+        self.filter_panel_revision
+    }
+
+    fn bump_results_revision(&mut self) {
+        self.table_revision = self.table_revision.wrapping_add(1);
+        self.filter_panel_revision = self.filter_panel_revision.wrapping_add(1);
+    }
+
+    fn bump_filter_panel_revision(&mut self) {
+        self.filter_panel_revision = self.filter_panel_revision.wrapping_add(1);
+    }
+
     pub fn tag_group_is_visible(&self, key: &str) -> bool {
         !self.hidden_tag_keys.contains(key)
     }
@@ -293,6 +319,7 @@ impl Library {
             tags.remove(key);
         }
         self.save_intersection_tags(category, tags);
+        self.bump_filter_panel_revision();
         cx.notify();
     }
 
@@ -386,11 +413,66 @@ impl Library {
     }
 
     pub fn set_search(&mut self, search: String, cx: &mut Context<Self>) {
+        self.search_generation = self.search_generation.wrapping_add(1);
+        self.set_search_query(&search);
+        let _ = self.refresh_search_results(self.active);
+        self.log_search(&search);
+        cx.notify();
+    }
+
+    pub fn set_search_async(&mut self, search: String, cx: &mut Context<Self>) {
+        self.search_generation = self.search_generation.wrapping_add(1);
+        let generation = self.search_generation;
+        self.set_search_query(&search);
+        let category = self.active;
+        let source_revision = self.table_revision;
+        let (records, selected) = {
+            let state = &self.states[&category];
+            (state.all_records.clone(), state.selected.clone())
+        };
+        let include_tags = self.filters_open;
+        let search_for_task = search.clone();
+        let task = cx.background_spawn(async move {
+            let start = crate::perf::start();
+            let results =
+                filter_cached_records(&records, &search_for_task, &selected, include_tags);
+            crate::perf::finish("library.search.background", start, || {
+                format!(
+                    "results={} search_len={} selected_keys={}",
+                    results.len(),
+                    search_for_task.len(),
+                    selected.len()
+                )
+            });
+            results
+        });
+        cx.spawn(async move |this, cx| {
+            let results = task.await;
+            this.update(cx, |library, cx| {
+                if library.search_generation != generation
+                    || library.table_revision != source_revision
+                    || library.states[&category].search != search
+                {
+                    return;
+                }
+                library.states.entry(category).or_default().results = results;
+                library.bump_results_revision();
+                library.log_search(&search);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn set_search_query(&mut self, search: &str) {
         for category in Category::ALL {
             let state = self.states.entry(category).or_default();
-            state.search = search.clone();
+            state.search = search.to_string();
         }
-        let _ = self.refresh_search_results(self.active);
+    }
+
+    fn log_search(&self, search: &str) {
         debug_library_interaction(|| {
             let active = self.active;
             let results = self.active_state().results.len();
@@ -400,7 +482,6 @@ impl Library {
                 active.label()
             )
         });
-        cx.notify();
     }
 
     pub fn clear_search(&mut self, cx: &mut Context<Self>) -> bool {
@@ -426,6 +507,7 @@ impl Library {
         if settings.save(&self.settings_path).is_ok() {
             self.settings = settings;
             self.hidden_tag_keys = keys;
+            self.bump_filter_panel_revision();
         }
         cx.notify();
     }
@@ -452,10 +534,17 @@ impl Library {
     }
 
     pub fn single_tag_search_match(&self) -> Option<(String, String)> {
+        let schema = self.tag_panel_schema();
+        self.single_tag_search_match_in(&schema)
+    }
+
+    pub(crate) fn single_tag_search_match_in(
+        &self,
+        schema: &BTreeMap<String, Vec<String>>,
+    ) -> Option<(String, String)> {
         let search = self.search();
         let include_hidden_groups = !search.is_empty();
-        let matches: Vec<(String, String)> = self
-            .tag_panel_schema()
+        let matches: Vec<(String, String)> = schema
             .iter()
             .flat_map(|(key, values)| {
                 let mut candidates = BTreeSet::new();
@@ -1276,23 +1365,6 @@ impl Library {
         }
     }
 
-    pub fn toggle_preview_from_last_stopped(&mut self, cx: &mut Context<Self>) -> bool {
-        if let Some(player) = self.preview_player.as_mut()
-            && player.is_playing()
-        {
-            self.preview_last_stopped = player.pause_or_stop();
-            self.preview_current_path = None;
-            self.preview_playhead_watch_running = false;
-            cx.notify();
-            return true;
-        }
-
-        let Some(position) = self.preview_last_stopped.clone() else {
-            return false;
-        };
-        self.play_preview_from_offset(position.path, position.offset, cx)
-    }
-
     pub fn stop_preview(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(player) = self.preview_player.as_mut() else {
             return false;
@@ -1300,6 +1372,7 @@ impl Library {
         self.preview_last_stopped = player.stop();
         self.preview_current_path = None;
         self.preview_playhead_watch_running = false;
+        cx.emit(LibraryEvent::PreviewAdvanced);
         cx.notify();
         true
     }
@@ -1584,12 +1657,7 @@ impl Library {
         reconcile_selected_filter_keys(&mut selected, &schema, renamed_key);
         reconcile_selected_filters(&mut selected, &schema, renamed_tag);
         let filter_start = crate::perf::start();
-        let results = display_records(self.backend.filter_scoped(
-            category,
-            &search,
-            &selected,
-            self.filters_open,
-        ));
+        let results = filter_cached_records(&all_records, &search, &selected, self.filters_open);
         crate::perf::finish("library.filter", filter_start, || {
             format!(
                 "category={} results={} search_len={} selected_keys={}",
@@ -1602,6 +1670,7 @@ impl Library {
         let state = self.states.entry(category).or_default();
         state.selected = selected;
         state.schema = schema;
+        state.all_records = Arc::new(all_records);
         state.results = results;
         crate::perf::finish("library.refresh_category_state", total_start, || {
             format!(
@@ -1610,24 +1679,25 @@ impl Library {
                 state.results.len()
             )
         });
+        self.bump_results_revision();
         Ok(())
     }
 
     fn refresh_search_results(&mut self, category: Category) -> io::Result<()> {
         let total_start = crate::perf::start();
-        let (search, selected) = if let Some(state) = self.states.get(&category) {
-            (state.search.clone(), state.selected.clone())
+        let (search, selected, all_records) = if let Some(state) = self.states.get(&category) {
+            (
+                state.search.clone(),
+                state.selected.clone(),
+                state.all_records.clone(),
+            )
         } else {
-            (String::new(), BTreeMap::new())
+            (String::new(), BTreeMap::new(), Arc::default())
         };
-        let results = display_records(self.backend.filter_scoped(
-            category,
-            &search,
-            &selected,
-            self.filters_open,
-        ));
+        let results = filter_cached_records(&all_records, &search, &selected, self.filters_open);
         let results_len = results.len();
         self.states.entry(category).or_default().results = results;
+        self.bump_results_revision();
         crate::perf::finish("library.refresh_search_results", total_start, || {
             format!(
                 "category={} results={results_len} search_len={} selected_keys={}",
@@ -1893,6 +1963,7 @@ impl Library {
         self.preview_current_path = Some(path.clone());
         self.preview_last_stopped = Some(PreviewPosition { path, offset });
         self.start_preview_playhead_watch(cx);
+        cx.emit(LibraryEvent::PreviewAdvanced);
         cx.notify();
         true
     }
@@ -1917,6 +1988,7 @@ impl Library {
                             lib.preview_last_stopped = Some(position);
                             lib.preview_current_path = None;
                             lib.preview_playhead_watch_running = false;
+                            cx.emit(LibraryEvent::PreviewAdvanced);
                             cx.notify();
                             return false;
                         }
@@ -1928,7 +2000,7 @@ impl Library {
                             lib.preview_playhead_watch_running = false;
                             return false;
                         }
-                        cx.notify();
+                        cx.emit(LibraryEvent::PreviewAdvanced);
                         true
                     })
                     .unwrap_or(false);
@@ -1968,9 +2040,15 @@ impl Library {
 
     fn load_category_state(&self, category: Category) -> CategoryState {
         let schema = display_schema(self.backend.schema_for(category));
-        let results = display_records(self.backend.filter(category, "", &BTreeMap::new()));
+        let all_records = Arc::new(display_records(self.backend.filter(
+            category,
+            "",
+            &BTreeMap::new(),
+        )));
+        let results = all_records.as_ref().clone();
         CategoryState {
             schema,
+            all_records,
             results,
             ..Default::default()
         }
@@ -2052,6 +2130,21 @@ fn tag_intersections(
         }
     }
     intersections
+}
+
+fn filter_cached_records(
+    records: &[FileRecord],
+    search: &str,
+    selected: &BTreeMap<String, BTreeSet<String>>,
+    include_tags: bool,
+) -> Vec<FileRecord> {
+    let mut results: Vec<_> = records
+        .iter()
+        .filter(|record| record_matches_scoped(record, search, selected, include_tags))
+        .cloned()
+        .collect();
+    results.sort_by_key(|record| record_search_sort_key_scoped(record, search, include_tags));
+    results
 }
 
 fn database_path_for_settings(settings_path: &Path) -> PathBuf {
@@ -2279,15 +2372,6 @@ mod tests {
         let has_folder =
             library.read_with(cx, |lib, _| lib.category_folder(Category::Music).is_some());
         assert!(!has_folder);
-    }
-
-    #[gpui::test]
-    fn preview_toggle_without_last_stopped_returns_false(cx: &mut gpui::TestAppContext) {
-        let library = cx.new(|_| Library::new_with_settings_path(settings_path("preview-empty")));
-
-        let consumed = library.update(cx, |lib, cx| lib.toggle_preview_from_last_stopped(cx));
-
-        assert!(!consumed);
     }
 
     #[gpui::test]
@@ -2620,6 +2704,35 @@ mod tests {
         library.update(cx, |lib, cx| lib.set_category(Category::Music, cx));
         let music_count = library.read_with(cx, |lib, _| lib.active_state().results.len());
         assert_eq!(music_count, 1);
+    }
+
+    #[gpui::test]
+    fn async_search_discards_stale_results(cx: &mut gpui::TestAppContext) {
+        let settings_path = settings_path("async-search-generation");
+        let (music_dir, _) = settings_with_folders(&settings_path);
+        fixture(&music_dir, "first.flac", &[]);
+        fixture(&music_dir, "second.flac", &[]);
+        let library = cx.new(|_| Library::new_with_settings_path(settings_path));
+
+        library.update(cx, |library, cx| {
+            library.set_search_async("first".to_string(), cx);
+            library.set_search_async("second".to_string(), cx);
+        });
+        cx.run_until_parked();
+
+        let (search, names) = library.read_with(cx, |library, _| {
+            (
+                library.search().to_string(),
+                library
+                    .active_state()
+                    .results
+                    .iter()
+                    .map(|record| record.name.clone())
+                    .collect::<Vec<_>>(),
+            )
+        });
+        assert_eq!(search, "second");
+        assert_eq!(names, vec!["second".to_string()]);
     }
 
     #[gpui::test]

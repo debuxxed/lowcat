@@ -1,12 +1,12 @@
 mod native_drag;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
 use futures::{StreamExt as _, channel::mpsc};
@@ -57,11 +57,11 @@ pub(super) struct InternalFileDrag {
 #[derive(Clone)]
 struct InternalFileDragData {
     label: String,
-    paths: Vec<PathBuf>,
+    paths: Arc<Vec<PathBuf>>,
 }
 
 impl InternalFileDrag {
-    fn new(label: String, paths: Vec<PathBuf>) -> Self {
+    fn new_shared(label: String, paths: Arc<Vec<PathBuf>>) -> Self {
         Self {
             data: Arc::new(Mutex::new(InternalFileDragData { label, paths })),
         }
@@ -71,8 +71,10 @@ impl InternalFileDrag {
         *self
             .data
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            InternalFileDragData { label, paths };
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = InternalFileDragData {
+            label,
+            paths: Arc::new(paths),
+        };
     }
 
     fn snapshot(&self) -> InternalFileDragData {
@@ -87,7 +89,7 @@ impl InternalFileDrag {
     }
 
     pub(super) fn paths(&self) -> Vec<PathBuf> {
-        self.snapshot().paths
+        self.snapshot().paths.as_ref().clone()
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -174,10 +176,25 @@ impl NativeDragSession {
 }
 
 struct TagWidthCache {
+    revision: u64,
     keys: Vec<String>,
     editing: Option<TagEditCacheKey>,
     row_count: usize,
     widths: Vec<Pixels>,
+}
+
+struct SelectedRowsActions {
+    delete_target: Arc<DeleteTarget>,
+    rename_target: Arc<RenameTarget>,
+    conversion_actions: Arc<Vec<ConversionAction>>,
+    row_drag_paths: Arc<Vec<PathBuf>>,
+    format_drag_paths: BTreeMap<String, Arc<Vec<PathBuf>>>,
+}
+
+struct SelectedRowsActionsCache {
+    table_revision: u64,
+    selection_revision: u64,
+    actions: Arc<SelectedRowsActions>,
 }
 
 #[derive(Clone)]
@@ -331,6 +348,7 @@ pub struct FileTable {
     hovered_row: Option<PathBuf>,
     preview_active_row: Option<PathBuf>,
     preview_scrub: Option<PreviewScrub>,
+    preview_playhead_bits: Arc<AtomicU32>,
     hovered_tag_chip: Option<TagChipTarget>,
     hovered_tag_key: Option<String>,
     hovered_format_chip: Option<PathBuf>,
@@ -346,6 +364,8 @@ pub struct FileTable {
     native_drag_session: NativeDragSession,
     selected: BTreeSet<PathBuf>,
     selection_anchor: Option<PathBuf>,
+    selection_revision: u64,
+    selected_rows_actions_cache: Option<SelectedRowsActionsCache>,
     hidden_tag_keys: BTreeSet<String>,
     column_visibility_menu_position: Option<Point<Pixels>>,
     hovered_column_visibility: Option<ColumnVisibilityHover>,
@@ -357,6 +377,18 @@ pub struct FileTable {
 }
 
 impl FileTable {
+    fn store_preview_playhead(bits: &AtomicU32, ratio: Option<f32>) {
+        bits.store(
+            ratio.map_or(u32::MAX, |ratio| ratio.clamp(0., 1.).to_bits()),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn load_preview_playhead(bits: &AtomicU32) -> Option<f32> {
+        let bits = bits.load(Ordering::Relaxed);
+        (bits != u32::MAX).then(|| f32::from_bits(bits))
+    }
+
     fn editing_cache_key(editing: Option<&TagEdit>) -> Option<TagEditCacheKey> {
         match editing {
             Some(TagEdit::Add { path, key }) => Some(TagEditCacheKey::Add {
@@ -448,22 +480,33 @@ impl FileTable {
     }
 
     pub fn new(library: Entity<Library>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        cx.observe(&library, |this, _, cx| {
-            this.tag_width_cache = None;
-            cx.notify();
-        })
-        .detach();
-        cx.subscribe(&library, |this, _, event: &LibraryEvent, cx| match event {
-            LibraryEvent::TagEdited { path } => {
-                this.tag_width_cache = None;
-                this.hovered_tag_chip = None;
-                this.hovered_tag_key = None;
-                if this.hovered_row.as_ref() == Some(path) {
-                    this.hovered_delete_row = Some(path.clone());
+        cx.observe(&library, |_, _, cx| cx.notify()).detach();
+        cx.subscribe_in(
+            &library,
+            window,
+            |this, library, event: &LibraryEvent, window, cx| match event {
+                LibraryEvent::TagEdited { path } => {
+                    this.tag_width_cache = None;
+                    this.hovered_tag_chip = None;
+                    this.hovered_tag_key = None;
+                    if this.hovered_row.as_ref() == Some(path) {
+                        this.hovered_delete_row = Some(path.clone());
+                    }
+                    cx.notify();
                 }
-                cx.notify();
-            }
-        })
+                LibraryEvent::PreviewAdvanced => {
+                    let ratio = this.preview_active_row.as_deref().and_then(|path| {
+                        this.preview_scrub
+                            .as_ref()
+                            .filter(|scrub| scrub.path == path)
+                            .map(|scrub| scrub.ratio)
+                            .or_else(|| library.read(cx).preview_playhead_ratio_for_path(path))
+                    });
+                    Self::store_preview_playhead(&this.preview_playhead_bits, ratio);
+                    window.refresh();
+                }
+            },
+        )
         .detach();
 
         let tag_input = cx.new(|cx| InputState::new(window, cx));
@@ -525,6 +568,7 @@ impl FileTable {
             hovered_row: None,
             preview_active_row: None,
             preview_scrub: None,
+            preview_playhead_bits: Arc::new(AtomicU32::new(u32::MAX)),
             hovered_tag_chip: None,
             hovered_tag_key: None,
             hovered_format_chip: None,
@@ -540,6 +584,8 @@ impl FileTable {
             native_drag_session: NativeDragSession::default(),
             selected: BTreeSet::new(),
             selection_anchor: None,
+            selection_revision: 0,
+            selected_rows_actions_cache: None,
             hidden_tag_keys,
             column_visibility_menu_position: None,
             hovered_column_visibility: None,
@@ -601,8 +647,10 @@ impl FileTable {
         cx: &mut Context<Self>,
     ) -> (Vec<String>, Vec<Pixels>, usize) {
         let editing = Self::editing_cache_key(self.editing.as_ref());
-        let (keys, row_count, widths) = {
-            let state = self.library.read(cx).active_state();
+        let (revision, keys, row_count, widths) = {
+            let library = self.library.read(cx);
+            let revision = library.table_revision();
+            let state = library.active_state();
             let keys: Vec<String> = state
                 .schema
                 .keys()
@@ -613,6 +661,7 @@ impl FileTable {
             let row_count = state.results.len();
 
             if let Some(cache) = self.tag_width_cache.as_ref()
+                && cache.revision == revision
                 && cache.keys == keys
                 && cache.editing == editing
                 && cache.row_count == row_count
@@ -633,10 +682,11 @@ impl FileTable {
                 )
             });
 
-            (keys, row_count, widths)
+            (revision, keys, row_count, widths)
         };
 
         self.tag_width_cache = Some(TagWidthCache {
+            revision,
             keys: keys.clone(),
             editing,
             row_count,
@@ -1228,7 +1278,8 @@ impl FileTable {
 
     fn start_pending_row_drag(
         &mut self,
-        record: &FileRecord,
+        record_name: String,
+        record_path: &Path,
         drag: InternalFileDrag,
         cx: &mut Context<Self>,
     ) {
@@ -1238,15 +1289,18 @@ impl FileTable {
             return;
         }
         let state = self.library.read(cx);
-        let paths = self.selected_priority_paths(&state.active_state().results, &record.path);
+        let paths = self.selected_priority_paths(&state.active_state().results, record_path);
         let path_count = paths.len();
-        drag.replace(record.name.clone(), paths);
+        drag.replace(record_name, paths);
         self.pending_drag = Some(PendingFileDrag { drag });
         crate::perf::finish("table.pending_drag", start, || {
             format!("paths={path_count}")
         });
         debug_table_interaction(|| {
-            format!("pending row drag stem={} paths={path_count}", record.stem)
+            format!(
+                "pending row drag path={} paths={path_count}",
+                record_path.display()
+            )
         });
     }
 
@@ -1307,38 +1361,44 @@ impl FileTable {
         cx: &mut Context<Self>,
     ) {
         let start = crate::perf::start();
-        let paths: Vec<PathBuf> = self
-            .library
-            .read(cx)
-            .active_state()
-            .results
-            .iter()
-            .map(|record| record.path.clone())
-            .collect();
-
-        if extend
-            && let Some(anchor) = self.selection_anchor.as_ref()
-            && let (Some(anchor_ix), Some(path_ix)) = (
-                paths.iter().position(|candidate| candidate == anchor),
-                paths.iter().position(|candidate| candidate == &path),
-            )
-        {
-            let (start, end) = if anchor_ix <= path_ix {
-                (anchor_ix, path_ix)
+        let (row_count, extended_selection) = {
+            let library = self.library.read(cx);
+            let results = &library.active_state().results;
+            let selection = if extend {
+                self.selection_anchor.as_ref().and_then(|anchor| {
+                    let anchor_ix = results.iter().position(|record| &record.path == anchor)?;
+                    let path_ix = results.iter().position(|record| record.path == path)?;
+                    let (start, end) = if anchor_ix <= path_ix {
+                        (anchor_ix, path_ix)
+                    } else {
+                        (path_ix, anchor_ix)
+                    };
+                    Some(
+                        results[start..=end]
+                            .iter()
+                            .map(|record| record.path.clone())
+                            .collect(),
+                    )
+                })
             } else {
-                (path_ix, anchor_ix)
+                None
             };
-            self.selected = paths[start..=end].iter().cloned().collect();
+            (results.len(), selection)
+        };
+
+        if let Some(selection) = extended_selection {
+            self.selected = selection;
         } else {
             self.selected.clear();
             self.selected.insert(path.clone());
             self.selection_anchor = Some(path);
         }
+        self.invalidate_selected_rows_actions();
 
         self.focus_handle.focus(window, cx);
         cx.notify();
         crate::perf::finish("table.select_row", start, || {
-            format!("rows={} selected={}", paths.len(), self.selected.len())
+            format!("rows={row_count} selected={}", self.selected.len())
         });
     }
 
@@ -1396,71 +1456,147 @@ impl FileTable {
         vec![path.to_path_buf()]
     }
 
-    fn conversion_actions(
-        &self,
-        record: &FileRecord,
-        selected_records: &[FileRecord],
-    ) -> Vec<ConversionAction> {
-        if self.selected.len() > 1 && self.selected.contains(record.path.as_path()) {
-            return AudioFormat::ALL
+    fn record_conversion_actions(record: &FileRecord) -> Arc<Vec<ConversionAction>> {
+        Arc::new(
+            record
+                .conversion_targets()
                 .into_iter()
-                .filter_map(|target| {
-                    let mut sources = Vec::new();
-                    for selected in selected_records {
-                        if !selected.has_extension(target.extension()) {
-                            sources.push(selected.path.clone());
-                        }
-                    }
-                    (!sources.is_empty()).then_some(ConversionAction { target, sources })
+                .map(|target| ConversionAction {
+                    target,
+                    sources: vec![record.path.clone()],
                 })
-                .collect();
-        }
-
-        record
-            .conversion_targets()
-            .into_iter()
-            .map(|target| ConversionAction {
-                target,
-                sources: vec![record.path.clone()],
-            })
-            .collect()
+                .collect(),
+        )
     }
 
-    fn delete_target(&self, record: &FileRecord, selected_records: &[FileRecord]) -> DeleteTarget {
-        let records: Vec<&FileRecord> =
-            if self.selected.len() > 1 && self.selected.contains(record.path.as_path()) {
-                selected_records.iter().collect()
-            } else {
-                vec![record]
-            };
-
+    fn record_delete_target(record: &FileRecord) -> Arc<DeleteTarget> {
         let mut seen = BTreeSet::new();
-        let paths = records
+        let paths = record
+            .variants
+            .iter()
+            .map(|variant| variant.path.clone())
+            .filter(|path| seen.insert(path.clone()))
+            .collect();
+
+        Arc::new(DeleteTarget {
+            kind: DeleteKind::Rows,
+            row_count: 1,
+            paths,
+        })
+    }
+
+    fn record_rename_target(record: &FileRecord) -> Arc<RenameTarget> {
+        Arc::new(RenameTarget {
+            kind: RenameKind::Rows {
+                records: vec![row_rename_target(record)],
+            },
+        })
+    }
+
+    fn selected_rows_actions(records: &[&FileRecord]) -> Arc<SelectedRowsActions> {
+        let row_drag_paths = Arc::new(records.iter().map(|record| record.path.clone()).collect());
+        let mut seen = BTreeSet::new();
+        let delete_paths = records
             .iter()
             .flat_map(|record| record.variants.iter().map(|variant| variant.path.clone()))
             .filter(|path| seen.insert(path.clone()))
             .collect();
-
-        DeleteTarget {
+        let delete_target = Arc::new(DeleteTarget {
             kind: DeleteKind::Rows,
             row_count: records.len(),
-            paths,
-        }
+            paths: delete_paths,
+        });
+        let rename_target = Arc::new(RenameTarget {
+            kind: RenameKind::Rows {
+                records: records
+                    .iter()
+                    .map(|record| row_rename_target(record))
+                    .collect(),
+            },
+        });
+        let conversion_actions = Arc::new(
+            AudioFormat::ALL
+                .into_iter()
+                .filter_map(|target| {
+                    let sources: Vec<_> = records
+                        .iter()
+                        .filter(|record| !record.has_extension(target.extension()))
+                        .map(|record| record.path.clone())
+                        .collect();
+                    (!sources.is_empty()).then_some(ConversionAction { target, sources })
+                })
+                .collect(),
+        );
+        let extensions: BTreeSet<String> = records
+            .iter()
+            .flat_map(|record| {
+                record
+                    .variants
+                    .iter()
+                    .map(|variant| variant.extension.to_ascii_lowercase())
+            })
+            .collect();
+        let format_drag_paths = extensions
+            .into_iter()
+            .map(|extension| {
+                let paths = Arc::new(
+                    records
+                        .iter()
+                        .filter_map(|record| record.variant_for_extension(&extension))
+                        .map(|variant| variant.path.clone())
+                        .collect(),
+                );
+                (extension, paths)
+            })
+            .collect();
+
+        Arc::new(SelectedRowsActions {
+            delete_target,
+            rename_target,
+            conversion_actions,
+            row_drag_paths,
+            format_drag_paths,
+        })
     }
 
-    fn rename_target(&self, record: &FileRecord, selected_records: &[FileRecord]) -> RenameTarget {
-        let records: Vec<&FileRecord> =
-            if self.selected.len() > 1 && self.selected.contains(record.path.as_path()) {
-                selected_records.iter().collect()
-            } else {
-                vec![record]
-            };
+    fn invalidate_selected_rows_actions(&mut self) {
+        self.selection_revision = self.selection_revision.wrapping_add(1);
+        self.selected_rows_actions_cache = None;
+    }
 
-        RenameTarget {
-            kind: RenameKind::Rows {
-                records: records.into_iter().map(row_rename_target).collect(),
-            },
+    fn cached_selected_rows_actions(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<Arc<SelectedRowsActions>> {
+        if self.selected.len() <= 1 {
+            self.selected_rows_actions_cache = None;
+            return None;
         }
+
+        let table_revision = self.library.read(cx).table_revision();
+        if let Some(cache) = self.selected_rows_actions_cache.as_ref()
+            && cache.table_revision == table_revision
+            && cache.selection_revision == self.selection_revision
+        {
+            return Some(cache.actions.clone());
+        }
+
+        let actions = {
+            let library = self.library.read(cx);
+            let selected_records: Vec<_> = library
+                .active_state()
+                .results
+                .iter()
+                .filter(|record| self.selected.contains(record.path.as_path()))
+                .collect();
+            Self::selected_rows_actions(&selected_records)
+        };
+        self.selected_rows_actions_cache = Some(SelectedRowsActionsCache {
+            table_revision,
+            selection_revision: self.selection_revision,
+            actions: actions.clone(),
+        });
+        Some(actions)
     }
 
     fn format_delete_target(&self, record: &FileRecord, extension: &str) -> DeleteTarget {
@@ -1688,6 +1824,7 @@ impl FileTable {
                 });
                 self.selected.clear();
                 self.selection_anchor = None;
+                self.invalidate_selected_rows_actions();
             }
             RenameKind::TagAll { key, old_value } => {
                 if value != old_value {
@@ -1792,6 +1929,7 @@ impl FileTable {
 
         self.selection_anchor = paths.first().cloned();
         self.selected = selected;
+        self.invalidate_selected_rows_actions();
         self.focus_handle.focus(window, cx);
         cx.notify();
         debug_table_interaction(|| format!("select all visible rows={}", self.selected.len()));
@@ -1805,6 +1943,7 @@ impl FileTable {
 
         self.selected.clear();
         self.selection_anchor = None;
+        self.invalidate_selected_rows_actions();
         cx.notify();
         true
     }
@@ -1827,6 +1966,7 @@ impl FileTable {
         };
         self.selected.clear();
         self.selection_anchor = None;
+        self.invalidate_selected_rows_actions();
         self.hovered_row = None;
         self.hovered_tag_chip = None;
         self.hovered_tag_key = None;
@@ -1956,13 +2096,13 @@ impl FileTable {
             .is_some_and(|pending| pending.drag.same_gesture(drag));
         self.active_file_drag = Some(ActiveFileDrag {
             label: data.label.clone(),
-            paths: data.paths.clone(),
+            paths: data.paths.as_ref().clone(),
         });
         self.library.update(cx, |lib, cx| {
             if data.paths.len() == 1 {
                 lib.begin_internal_file_drag(data.paths[0].clone(), cx);
             } else {
-                lib.begin_internal_file_drag_files(data.paths.clone(), cx);
+                lib.begin_internal_file_drag_files(data.paths.as_ref().clone(), cx);
             }
         });
         debug_table_interaction(|| {
@@ -2072,25 +2212,15 @@ impl FileTable {
     ) -> Vec<AnyElement> {
         crate::perf::sample("table.rows.rate");
         let rows_start = crate::perf::start();
-        let (records, selected_records, total_rows, visible_start, visible_end) = {
+        let selected_actions = self.cached_selected_rows_actions(cx);
+        let (records, total_rows, visible_start, visible_end) = {
             let state = self.library.read(cx).active_state();
             let total_rows = state.results.len();
             let visible_start = range.start.min(total_rows);
             let visible_end = range.end.min(total_rows).max(visible_start);
-            let selected_records = if self.selected.len() > 1 {
-                state
-                    .results
-                    .iter()
-                    .filter(|record| self.selected.contains(record.path.as_path()))
-                    .cloned()
-                    .collect()
-            } else {
-                Vec::new()
-            };
 
             (
                 state.results[visible_start..visible_end].to_vec(),
-                selected_records,
                 total_rows,
                 visible_start,
                 visible_end,
@@ -2107,7 +2237,7 @@ impl FileTable {
                     &keys,
                     &tag_widths,
                     tag_key_action_width,
-                    &selected_records,
+                    selected_actions.as_ref(),
                     cx,
                 )
             })
@@ -2133,7 +2263,7 @@ impl FileTable {
         keys: &[String],
         tag_widths: &[Pixels],
         tag_key_action_width: Pixels,
-        selected_records: &[FileRecord],
+        selected_actions: Option<&Arc<SelectedRowsActions>>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let path = record.path.clone();
@@ -2149,8 +2279,19 @@ impl FileTable {
                 .or_else(|| self.library.read(cx).preview_playhead_ratio_for_path(&path))
         });
         let playhead_ratio = playhead_ratio.flatten();
-        let delete_target = self.delete_target(record, selected_records);
-        let rename_target = self.rename_target(record, selected_records);
+        if preview_active {
+            Self::store_preview_playhead(&self.preview_playhead_bits, playhead_ratio);
+        }
+        let multi_selection = selected
+            .then_some(selected_actions)
+            .flatten()
+            .filter(|_| self.selected.len() > 1);
+        let delete_target = multi_selection
+            .map(|actions| actions.delete_target.clone())
+            .unwrap_or_else(|| Self::record_delete_target(record));
+        let rename_target = multi_selection
+            .map(|actions| actions.rename_target.clone())
+            .unwrap_or_else(|| Self::record_rename_target(record));
         let row_hover_bg = if convertible {
             hsla(0.095, 1., 0.55, 0.2)
         } else {
@@ -2179,19 +2320,17 @@ impl FileTable {
         let open_path = record.path.clone();
         let open_preview_active = preview_active;
         let select_path = record.path.clone();
+        let pending_drag_name = record.name.clone();
         let hover_path = record.path.clone();
         let delete_click_target = delete_target.clone();
-        let conversion_actions = self.conversion_actions(record, selected_records);
+        let conversion_actions = multi_selection
+            .map(|actions| actions.conversion_actions.clone())
+            .unwrap_or_else(|| Self::record_conversion_actions(record));
         let table = cx.entity();
-        let row_drag_paths = if self.selected.len() > 1 && selected {
-            selected_records
-                .iter()
-                .map(|record| record.path.clone())
-                .collect()
-        } else {
-            vec![record.path.clone()]
-        };
-        let row_drag = InternalFileDrag::new(record.name.clone(), row_drag_paths);
+        let row_drag_paths = multi_selection
+            .map(|actions| actions.row_drag_paths.clone())
+            .unwrap_or_else(|| Arc::new(vec![record.path.clone()]));
+        let row_drag = InternalFileDrag::new_shared(record.name.clone(), row_drag_paths);
         let row_drag_for_mouse_down = row_drag.clone();
         let table_for_drag = table.clone();
         let table_for_context_menu = table.clone();
@@ -2235,7 +2374,7 @@ impl FileTable {
                         if event.modifiers.alt {
                             this.clear_pending_drag();
                             this.confirm_delete_target(
-                                delete_click_target.clone(),
+                                delete_click_target.as_ref().clone(),
                                 "opt-click",
                                 window,
                                 cx,
@@ -2246,18 +2385,12 @@ impl FileTable {
                         if event.modifiers.shift || !this.selected.contains(&select_path) {
                             this.select_row(select_path.clone(), event.modifiers.shift, window, cx);
                         }
-                        if event.click_count == 1 {
-                            let records = this.library.read(cx).active_state().results.clone();
-                            if let Some(record) =
-                                records.iter().find(|record| record.path == select_path)
-                            {
-                                this.start_pending_row_drag(
-                                    record,
-                                    row_drag_for_mouse_down.clone(),
-                                    cx,
-                                );
-                            }
-                        }
+                        this.start_pending_row_drag(
+                            pending_drag_name.clone(),
+                            &select_path,
+                            row_drag_for_mouse_down.clone(),
+                            cx,
+                        );
                     }
                 }),
             )
@@ -2385,7 +2518,7 @@ impl FileTable {
                             });
                         }));
                 }
-                for action in actions {
+                for action in actions.iter().cloned() {
                     let table = table.clone();
                     let target = action.target;
                     let label = SharedString::from(format!("Convert to {}", target.label()));
@@ -2404,7 +2537,7 @@ impl FileTable {
                 let rename_table = table.clone();
                 menu = menu.item(PopupMenuItem::new("Rename").on_click(move |_, _, cx| {
                     cx.update_entity(&rename_table, |this, _| {
-                        this.request_context_menu_rename(row_rename_target.clone());
+                        this.request_context_menu_rename(row_rename_target.as_ref().clone());
                     });
                 }));
                 let delete_table = table.clone();
@@ -2415,7 +2548,7 @@ impl FileTable {
                 };
                 menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
                     cx.update_entity(&delete_table, |this, _| {
-                        this.request_context_menu_delete(target.clone());
+                        this.request_context_menu_delete(target.as_ref().clone());
                     });
                 }));
                 menu
@@ -2426,7 +2559,7 @@ impl FileTable {
                     table: cx.entity(),
                     path: path.clone(),
                     waveform,
-                    playhead_ratio,
+                    playhead_bits: self.preview_playhead_bits.clone(),
                 }))
             })
             .when(!preview_active, |row| {
@@ -2460,19 +2593,17 @@ impl FileTable {
                                         let extension = variant.extension.clone();
                                         let label = extension.clone();
                                         let variant_path = variant.path.clone();
-                                        let format_drag_paths =
-                                            if self.selected.len() > 1 && selected {
-                                                selected_records
-                                                    .iter()
-                                                    .filter_map(|record| {
-                                                        record.variant_for_extension(&extension)
-                                                    })
-                                                    .map(|variant| variant.path.clone())
-                                                    .collect()
-                                            } else {
-                                                vec![variant_path.clone()]
-                                            };
-                                        let format_drag = InternalFileDrag::new(
+                                        let format_drag_paths = multi_selection
+                                            .and_then(|actions| {
+                                                actions
+                                                    .format_drag_paths
+                                                    .get(&extension.to_ascii_lowercase())
+                                            })
+                                            .cloned()
+                                            .unwrap_or_else(|| {
+                                                Arc::new(vec![variant_path.clone()])
+                                            });
+                                        let format_drag = InternalFileDrag::new_shared(
                                             format!(".{extension}"),
                                             format_drag_paths,
                                         );
@@ -3247,7 +3378,7 @@ struct PreviewWaveformElement {
     table: Entity<FileTable>,
     path: PathBuf,
     waveform: Option<WaveformBinary256>,
-    playhead_ratio: Option<f32>,
+    playhead_bits: Arc<AtomicU32>,
 }
 
 struct PreviewWaveformPrepaintState {
@@ -3325,7 +3456,12 @@ impl Element for PreviewWaveformElement {
         window: &mut Window,
         _cx: &mut App,
     ) {
-        paint_preview_waveform(bounds, self.waveform, self.playhead_ratio, window);
+        paint_preview_waveform(
+            bounds,
+            self.waveform,
+            FileTable::load_preview_playhead(&self.playhead_bits),
+            window,
+        );
         let hitbox = prepaint.hitbox.clone();
         window.set_cursor_style(CursorStyle::PointingHand, &hitbox);
 
@@ -3505,9 +3641,23 @@ mod tests {
     }
 
     #[test]
+    fn preview_playhead_atomic_round_trips_optional_ratio() {
+        let bits = AtomicU32::new(u32::MAX);
+        assert_eq!(FileTable::load_preview_playhead(&bits), None);
+
+        FileTable::store_preview_playhead(&bits, Some(1.5));
+        assert_eq!(FileTable::load_preview_playhead(&bits), Some(1.));
+
+        FileTable::store_preview_playhead(&bits, None);
+        assert_eq!(FileTable::load_preview_playhead(&bits), None);
+    }
+
+    #[test]
     fn internal_drag_payload_updates_for_mouse_down_selection() {
-        let drag =
-            InternalFileDrag::new("first".to_string(), vec![PathBuf::from("/tmp/first.wav")]);
+        let drag = InternalFileDrag::new_shared(
+            "first".to_string(),
+            Arc::new(vec![PathBuf::from("/tmp/first.wav")]),
+        );
         let drag_value = drag.clone();
 
         drag.replace(

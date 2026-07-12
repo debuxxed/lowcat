@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 
 pub const TAG_GENRE: &str = "GENRE";
 pub const TAG_MOOD: &str = "MOOD";
@@ -235,6 +236,7 @@ pub struct CategoryState {
     pub schema: BTreeMap<String, Vec<String>>,
     pub selected: BTreeMap<String, BTreeSet<String>>,
     pub search: String,
+    pub all_records: Arc<Vec<FileRecord>>,
     pub results: Vec<FileRecord>,
 }
 

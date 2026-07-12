@@ -119,10 +119,6 @@ impl PreviewPlayer {
             .ok_or_else(|| io::Error::other("audio output unavailable"))
     }
 
-    pub fn pause_or_stop(&mut self) -> Option<PreviewPosition> {
-        self.stop()
-    }
-
     pub fn stop(&mut self) -> Option<PreviewPosition> {
         let position = self.current_position();
         if let Some(active) = self.active.take() {

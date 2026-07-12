@@ -120,28 +120,6 @@ impl Backend {
             .unwrap_or_default()
     }
 
-    pub fn filter_scoped(
-        &self,
-        category: Category,
-        search: &str,
-        selected: &BTreeMap<String, BTreeSet<String>>,
-        include_tags: bool,
-    ) -> Vec<FileRecord> {
-        let category_folder = self.folders.get(&category).map(PathBuf::as_path);
-        self.db
-            .query_visible_rows_scoped(
-                category,
-                search,
-                selected,
-                include_tags,
-                &self
-                    .format_priority()
-                    .unwrap_or_else(|_| crate::model::default_format_priority()),
-                category_folder,
-            )
-            .unwrap_or_default()
-    }
-
     pub fn schema_for(&self, category: Category) -> BTreeMap<String, Vec<String>> {
         self.db.schema_for(category).unwrap_or_else(|_| {
             category

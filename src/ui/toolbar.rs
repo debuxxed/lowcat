@@ -1,7 +1,9 @@
+use std::time::Duration;
+
 use gpui::{
     App, AppContext, ClickEvent, Context, Entity, Focusable, InteractiveElement, IntoElement,
-    KeyDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window,
-    div, prelude::FluentBuilder, red, relative,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Task, Window, div,
+    prelude::FluentBuilder, red, relative,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Selectable, Sizable, StyledExt,
@@ -19,6 +21,8 @@ pub struct Toolbar {
     settings_menu: Entity<SettingsMenu>,
     hovered_chip: Option<String>,
     alt_down: bool,
+    pending_search: Option<String>,
+    search_task: Option<Task<()>>,
 }
 
 impl Toolbar {
@@ -29,7 +33,7 @@ impl Toolbar {
         cx.subscribe(&search_input, |this, state, event: &InputEvent, cx| {
             if let InputEvent::Change = event {
                 let value = state.read(cx).value().to_string();
-                this.library.update(cx, |lib, cx| lib.set_search(value, cx));
+                this.schedule_search(value, cx);
             }
         })
         .detach();
@@ -41,6 +45,39 @@ impl Toolbar {
             search_input,
             hovered_chip: None,
             alt_down: false,
+            pending_search: None,
+            search_task: None,
+        }
+    }
+
+    fn schedule_search(&mut self, value: String, cx: &mut Context<Self>) {
+        self.pending_search = Some(value.clone());
+        self.search_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(50))
+                .await;
+            this.update(cx, |this, cx| {
+                if this.pending_search.as_deref() != Some(value.as_str()) {
+                    return;
+                }
+                this.pending_search = None;
+                this.library
+                    .update(cx, |library, cx| library.set_search_async(value, cx));
+            })
+            .ok();
+        }));
+    }
+
+    fn cancel_pending_search(&mut self) {
+        self.pending_search = None;
+        self.search_task = None;
+    }
+
+    fn flush_pending_search(&mut self, cx: &mut Context<Self>) {
+        self.search_task = None;
+        if let Some(value) = self.pending_search.take() {
+            self.library
+                .update(cx, |library, cx| library.set_search(value, cx));
         }
     }
 
@@ -77,6 +114,7 @@ impl Toolbar {
             return false;
         }
 
+        self.cancel_pending_search();
         self.search_input
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.library
@@ -94,6 +132,7 @@ impl Toolbar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.cancel_pending_search();
         let cleared_filters = self.clear_filter_tags(cx);
         let search_input_had_value = !self.search_input.read(cx).value().is_empty();
         let cleared_search = self.library.update(cx, |lib, cx| lib.clear_search(cx));
@@ -115,6 +154,7 @@ impl Toolbar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.flush_pending_search(cx);
         let applied = self
             .library
             .update(cx, |lib, cx| lib.apply_single_tag_search_match(cx));
@@ -175,21 +215,6 @@ impl Render for Toolbar {
             .on_action(cx.listener(|this, _: &Enter, window, cx| {
                 if this.library.read(cx).filters_open()
                     && this.apply_single_tag_search_match(window, cx)
-                {
-                    cx.stop_propagation();
-                }
-            }))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if event.keystroke.key == "space"
-                    && !event.keystroke.modifiers.control
-                    && !event.keystroke.modifiers.alt
-                    && !event.keystroke.modifiers.platform
-                    && !event.keystroke.modifiers.function
-                    && !event.keystroke.modifiers.shift
-                    && !this.library.read(cx).filters_open()
-                    && this
-                        .library
-                        .update(cx, |lib, cx| lib.toggle_preview_from_last_stopped(cx))
                 {
                     cx.stop_propagation();
                 }

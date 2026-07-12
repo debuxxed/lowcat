@@ -129,10 +129,11 @@ impl Database {
         block_on(async {
             let category_key = category_key(category);
             let mut next_first_seen_at = current_unix_millis();
+            let mut tx = self.pool.begin().await?;
             let existing_rows =
                 sqlx::query("SELECT path, stem, size, modified FROM files WHERE category = ?")
                     .bind(category_key)
-                    .fetch_all(&self.pool)
+                    .fetch_all(&mut *tx)
                     .await?;
             let mut existing = BTreeMap::new();
             let mut existing_stems = BTreeSet::new();
@@ -152,6 +153,14 @@ impl Database {
             for record in records {
                 let path = record.path.to_string_lossy().to_string();
                 seen.insert(path.clone());
+                let existing_fingerprint = existing.get(&path);
+                let changed = existing_fingerprint.is_none_or(|(size, modified)| {
+                    *size != record.size || *modified != record.modified
+                });
+                if !changed {
+                    continue;
+                }
+
                 let search_text = format!(
                     "{} {} {} {}",
                     record.stem,
@@ -166,13 +175,8 @@ impl Database {
                         .join(" ")
                 )
                 .to_lowercase();
-                let changed = existing.get(&path).is_none_or(|(size, modified)| {
-                    *size != record.size || *modified != record.modified
-                });
-                if existing.contains_key(&path) {
-                    if changed {
-                        summary.updated += 1;
-                    }
+                if existing_fingerprint.is_some() {
+                    summary.updated += 1;
                 } else {
                     summary.added += 1;
                 }
@@ -200,27 +204,47 @@ impl Database {
                 .bind(record.modified)
                 .bind(next_first_seen_at)
                 .bind(search_text)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
                 next_first_seen_at += 1;
 
-                let tag_count: i64 = sqlx::query(
-                    "SELECT COUNT(*) AS count FROM tag_values WHERE category = ? AND stem = ?",
-                )
-                .bind(category_key)
-                .bind(&record.stem)
-                .fetch_one(&self.pool)
-                .await?
-                .get("count");
-                if !existing_stems.contains(&record.stem) && tag_count == 0 {
+                if !existing_stems.contains(&record.stem) {
+                    let tag_count: i64 = sqlx::query(
+                        "SELECT COUNT(*) AS count FROM tag_values WHERE category = ? AND stem = ?",
+                    )
+                    .bind(category_key)
+                    .bind(&record.stem)
+                    .fetch_one(&mut *tx)
+                    .await?
+                    .get("count");
+                    existing_stems.insert(record.stem.clone());
+                    if tag_count != 0 {
+                        continue;
+                    }
+
                     for (key, values) in record.tags {
                         let Some(key) = normalize_tag_key(&key) else {
                             continue;
                         };
-                        let key = canonical_existing_tag_key(&self.pool, category, &key)
-                            .await?
-                            .unwrap_or(key);
-                        ensure_tag_key(&self.pool, category, &key).await?;
+                        let key = sqlx::query(
+                            "SELECT key FROM tag_keys
+                             WHERE category = ? AND lower(key) = lower(?)
+                             ORDER BY key COLLATE NOCASE
+                             LIMIT 1",
+                        )
+                        .bind(category_key)
+                        .bind(&key)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                        .map(|row| row.get("key"))
+                        .unwrap_or(key);
+                        sqlx::query(
+                            "INSERT OR IGNORE INTO tag_keys(category, key) VALUES (?, ?)",
+                        )
+                        .bind(category_key)
+                        .bind(&key)
+                        .execute(&mut *tx)
+                        .await?;
                         for value in values {
                             let Some(value) = normalize_tag_value(&value) else {
                                 continue;
@@ -233,7 +257,7 @@ impl Database {
                             .bind(&record.stem)
                             .bind(&key)
                             .bind(value)
-                            .execute(&self.pool)
+                            .execute(&mut *tx)
                             .await?;
                         }
                     }
@@ -245,7 +269,7 @@ impl Database {
                     summary.removed += 1;
                     sqlx::query("DELETE FROM files WHERE path = ?")
                         .bind(path)
-                        .execute(&self.pool)
+                        .execute(&mut *tx)
                         .await?;
                 }
             }
@@ -259,8 +283,9 @@ impl Database {
                    )",
             )
             .bind(category_key)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+            tx.commit().await?;
 
             Ok::<_, sqlx::Error>(summary)
         })
@@ -1941,7 +1966,8 @@ mod tests {
             .unwrap();
         db.set_preview_waveform(&path, waveform(99)).unwrap();
 
-        db.sync_category(Category::Music, vec![record]).unwrap();
+        let summary = db.sync_category(Category::Music, vec![record]).unwrap();
+        assert_eq!(summary, SyncSummary::default());
 
         let rows = db
             .query_visible_rows(

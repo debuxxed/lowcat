@@ -22,6 +22,24 @@ pub struct FilterPanel {
     hovered_tag_group_menu_item: Option<TagGroupMenuHover>,
     tag_menu: Option<(Point<Pixels>, String, String)>,
     tag_menu_hovered: bool,
+    snapshot: Option<Arc<FilterPanelSnapshot>>,
+}
+
+struct FilterPanelSnapshot {
+    revision: u64,
+    keys: Vec<String>,
+    single_match: Option<(String, String)>,
+    rows: Vec<FilterRowSnapshot>,
+    schema_key_count: usize,
+    schema_value_count: usize,
+}
+
+struct FilterRowSnapshot {
+    key: String,
+    label: String,
+    indented: bool,
+    checked: Vec<String>,
+    values: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -39,6 +57,128 @@ impl FilterPanel {
             hovered_tag_group_menu_item: None,
             tag_menu: None,
             tag_menu_hovered: false,
+            snapshot: None,
+        }
+    }
+
+    fn build_snapshot(library: &Library) -> FilterPanelSnapshot {
+        let revision = library.filter_panel_revision();
+        let state = library.active_state();
+        let schema = library.tag_panel_schema();
+        let selected = state.selected.clone();
+        let tag_search = library.search().to_string();
+        let single_match = library.single_tag_search_match_in(&schema);
+        let keys = schema.keys().cloned().collect();
+        let include_hidden_groups = !tag_search.is_empty();
+
+        let mut matching_groups = Vec::new();
+        for (key, values) in &schema {
+            if !include_hidden_groups && !library.tag_group_is_visible(key) {
+                continue;
+            }
+
+            let checked: Vec<String> = selected
+                .get(key)
+                .map(|values| values.iter().cloned().collect())
+                .unwrap_or_default();
+            let root_values: BTreeSet<String> = values
+                .iter()
+                .map(|value| {
+                    split_subtag(value)
+                        .map(|(parent, _)| parent.to_string())
+                        .unwrap_or_else(|| value.clone())
+                })
+                .collect();
+            let children_by_parent: BTreeMap<&str, Vec<&str>> = values
+                .iter()
+                .filter_map(|value| split_subtag(value).map(|(parent, _)| (parent, value.as_str())))
+                .fold(BTreeMap::new(), |mut by_parent, (parent, value)| {
+                    by_parent.entry(parent).or_default().push(value);
+                    by_parent
+                });
+            let mut matching_values: Vec<String> = root_values
+                .into_iter()
+                .filter(|root| {
+                    tag_matches_search(root, &tag_search)
+                        || children_by_parent
+                            .get(root.as_str())
+                            .is_some_and(|children| {
+                                children
+                                    .iter()
+                                    .any(|value| tag_matches_search(value, &tag_search))
+                            })
+                })
+                .filter(|value| library.tag_is_visible_in_panel(key, value))
+                .collect();
+            if matching_values.is_empty() {
+                continue;
+            }
+            matching_values.sort_by_key(|value| tag_search_match_sort_key(value, &tag_search));
+            let group_sort_key = tag_search_group_sort_key(
+                key,
+                matching_values.iter().map(String::as_str),
+                &tag_search,
+            );
+            matching_groups.push((group_sort_key, key, checked, matching_values, values));
+        }
+        matching_groups.sort_by_key(|(sort_key, _, _, _, _)| sort_key.clone());
+
+        let mut rows = Vec::new();
+        for (_, key, checked, matching_values, raw_values) in matching_groups {
+            rows.push(FilterRowSnapshot {
+                key: key.clone(),
+                label: key.clone(),
+                indented: false,
+                checked: checked.clone(),
+                values: matching_values,
+            });
+            let mut expanded_parents: BTreeSet<String> = checked
+                .iter()
+                .filter(|value| !value.contains('/'))
+                .cloned()
+                .collect();
+            if !tag_search.is_empty() {
+                expanded_parents.extend(raw_values.iter().filter_map(|value| {
+                    let (parent, child) = split_subtag(value)?;
+                    (tag_matches_search(child, &tag_search)
+                        || (tag_search.contains('/') && tag_matches_search(value, &tag_search)))
+                    .then(|| parent.to_string())
+                }));
+            }
+            for parent in expanded_parents {
+                let mut children: Vec<(String, String)> = raw_values
+                    .iter()
+                    .filter_map(|value| {
+                        let (candidate_parent, child) = split_subtag(value)?;
+                        (candidate_parent == parent
+                            && (tag_search.is_empty()
+                                || tag_matches_search(child, &tag_search)
+                                || (tag_search.contains('/')
+                                    && tag_matches_search(value, &tag_search)))
+                            && library.tag_is_visible_in_panel(key, value))
+                        .then(|| (child.to_string(), value.clone()))
+                    })
+                    .collect();
+                children.sort_by_key(|(child, _)| tag_search_match_sort_key(child, &tag_search));
+                if !children.is_empty() {
+                    rows.push(FilterRowSnapshot {
+                        key: key.clone(),
+                        label: parent,
+                        indented: true,
+                        checked: checked.clone(),
+                        values: children.into_iter().map(|(_, value)| value).collect(),
+                    });
+                }
+            }
+        }
+
+        FilterPanelSnapshot {
+            revision,
+            keys,
+            single_match,
+            rows,
+            schema_key_count: schema.len(),
+            schema_value_count: schema.values().map(Vec::len).sum(),
         }
     }
 
@@ -411,20 +551,22 @@ impl FilterPanel {
 impl Render for FilterPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let render_start = crate::perf::start();
-        let (schema, selected, tag_search, single_match) = {
+        let revision = self.library.read(cx).filter_panel_revision();
+        if self
+            .snapshot
+            .as_ref()
+            .is_none_or(|snapshot| snapshot.revision != revision)
+        {
             let library = self.library.read(cx);
-            let state = library.active_state();
-            (
-                library.tag_panel_schema(),
-                state.selected.clone(),
-                library.search().to_string(),
-                library.single_tag_search_match(),
-            )
-        };
-        let keys: Vec<String> = schema.keys().cloned().collect();
-        let tag_group_menu = self.render_tag_group_menu(keys.clone(), window, cx);
+            self.snapshot = Some(Arc::new(Self::build_snapshot(&library)));
+        }
+        let snapshot = self
+            .snapshot
+            .as_ref()
+            .expect("filter snapshot was initialized")
+            .clone();
+        let tag_group_menu = self.render_tag_group_menu(snapshot.keys.clone(), window, cx);
         let tag_menu = self.render_tag_menu(window, cx);
-        let include_hidden_groups = !tag_search.is_empty();
 
         let mut panel = div()
             .v_flex()
@@ -441,107 +583,17 @@ impl Render for FilterPanel {
                 }),
             );
 
-        let mut matching_groups = Vec::new();
-        for (key, values) in &schema {
-            if !include_hidden_groups && !self.library.read(cx).tag_group_is_visible(key) {
-                continue;
-            }
-
-            let checked: Vec<String> = selected
-                .get(key)
-                .map(|s| s.iter().cloned().collect())
-                .unwrap_or_default();
-
-            let root_values: std::collections::BTreeSet<String> = values
-                .iter()
-                .map(|value| {
-                    split_subtag(value)
-                        .map(|(parent, _)| parent.to_string())
-                        .unwrap_or_else(|| value.clone())
-                })
-                .collect();
-            let mut matching_values: Vec<String> = root_values
-                .into_iter()
-                .filter(|root| {
-                    tag_matches_search(root, &tag_search)
-                        || values.iter().any(|value| {
-                            split_subtag(value).is_some_and(|(parent, _)| parent == root)
-                                && tag_matches_search(value, &tag_search)
-                        })
-                })
-                .filter(|value| self.library.read(cx).tag_is_visible_in_panel(key, value))
-                .collect();
-            if matching_values.is_empty() {
-                continue;
-            }
-            matching_values.sort_by_key(|value| tag_search_match_sort_key(value, &tag_search));
-            let group_sort_key = tag_search_group_sort_key(
-                key,
-                matching_values.iter().map(String::as_str),
-                &tag_search,
-            );
-            matching_groups.push((group_sort_key, key, checked, matching_values, values));
-        }
-
-        matching_groups.sort_by_key(|(sort_key, _, _, _, _)| sort_key.clone());
-
-        let mut rows = Vec::new();
-        for (_, key, checked, matching_values, raw_values) in matching_groups {
-            rows.push((
-                key.clone(),
-                key.clone(),
-                false,
-                checked.clone(),
-                matching_values,
-            ));
-            let mut expanded_parents: std::collections::BTreeSet<String> = checked
-                .iter()
-                .filter(|value| !value.contains('/'))
-                .cloned()
-                .collect();
-            if !tag_search.is_empty() {
-                expanded_parents.extend(raw_values.iter().filter_map(|value| {
-                    let (parent, child) = split_subtag(value)?;
-                    (tag_matches_search(child, &tag_search)
-                        || (tag_search.contains('/') && tag_matches_search(value, &tag_search)))
-                    .then(|| parent.to_string())
-                }));
-            }
-            for parent in expanded_parents {
-                let mut children: Vec<(String, String)> = raw_values
-                    .iter()
-                    .filter_map(|value| {
-                        let (candidate_parent, child) = split_subtag(value)?;
-                        (candidate_parent == parent
-                            && (tag_search.is_empty()
-                                || tag_matches_search(child, &tag_search)
-                                || (tag_search.contains('/')
-                                    && tag_matches_search(value, &tag_search)))
-                            && self.library.read(cx).tag_is_visible_in_panel(key, value))
-                        .then(|| (child.to_string(), value.clone()))
-                    })
-                    .collect();
-                children.sort_by_key(|(child, _)| tag_search_match_sort_key(child, &tag_search));
-                if !children.is_empty() {
-                    rows.push((
-                        key.clone(),
-                        parent,
-                        true,
-                        checked.clone(),
-                        children.into_iter().map(|(_, value)| value).collect(),
-                    ));
-                }
-            }
-        }
-
-        for (key, row_label, indented, checked, matching_values) in rows {
+        for row in &snapshot.rows {
+            let key = &row.key;
+            let row_label = &row.label;
+            let checked = &row.checked;
             let mut group = div()
                 .h_flex()
                 .flex_wrap()
                 .w_full()
                 .items_center()
                 .gap_1()
-                .when(indented, |group| group.pl_4())
+                .when(row.indented, |group| group.pl_4())
                 .child(
                     div()
                         .id(SharedString::from(format!("filter-key:{key}:{row_label}")))
@@ -558,19 +610,20 @@ impl Render for FilterPanel {
                         ),
                 );
 
-            for value in matching_values {
-                let is_active = checked.contains(&value);
+            for value in &row.values {
+                let is_active = checked.contains(value);
                 let is_single_match =
-                    single_match
+                    snapshot
+                        .single_match
                         .as_ref()
                         .is_some_and(|(match_key, match_value)| {
-                            match_key == &key && match_value == &value
+                            match_key == key && match_value == value
                         });
                 let key_owned = key.clone();
                 let value_owned = value.clone();
                 let menu_key = key.clone();
                 let menu_value = value.clone();
-                let display_value = split_subtag(&value)
+                let display_value = split_subtag(value)
                     .map(|(_, child)| child.to_string())
                     .unwrap_or_else(|| value.clone());
                 let chip_border = if is_single_match {
@@ -624,8 +677,7 @@ impl Render for FilterPanel {
         crate::perf::finish("filter_panel.render", render_start, || {
             format!(
                 "keys={} values={}",
-                schema.len(),
-                schema.values().map(Vec::len).sum::<usize>()
+                snapshot.schema_key_count, snapshot.schema_value_count
             )
         });
         panel
@@ -633,3 +685,7 @@ impl Render for FilterPanel {
             .when_some(tag_menu, |panel, menu| panel.child(menu))
     }
 }
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
