@@ -66,6 +66,9 @@ impl UI {
             columns = columns.child(column.on_drop(cx.listener(
                 move |this, paths: &ExternalPaths, _, cx| {
                     let paths = paths.paths().to_vec();
+                    crate::diagnostics::debug("drop-overlay", || {
+                        format!("category={} paths={paths:?}", category.label())
+                    });
                     if !this.download_dropped_link(category, &paths, cx) {
                         this.library
                             .update(cx, |lib, cx| lib.import_files(category, paths, cx));

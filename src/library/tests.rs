@@ -549,6 +549,52 @@ fn cross_category_internal_drop_moves_file(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+fn file_import_waits_for_focus_rescan_before_refresh(cx: &mut gpui::TestAppContext) {
+    let settings_path = settings_path("import-during-focus-rescan");
+    let (music_dir, _) = settings_with_folders(&settings_path);
+    let source_dir = category_dir("external-import");
+    let source = fixture(&source_dir, "dropped.flac", &[]);
+    let library = cx.new(|_| Library::new_with_settings_path(settings_path));
+
+    library.update(cx, |lib, cx| {
+        lib.focus_rescan_in_flight = true;
+        lib.import_files(Category::Music, vec![source], cx);
+    });
+    cx.run_until_parked();
+
+    let (importing, deferred, visible_count) = library.read_with(cx, |lib, _| {
+        (
+            lib.importing,
+            lib.deferred_import_result.is_some(),
+            lib.active_state().results.len(),
+        )
+    });
+    assert!(importing);
+    assert!(deferred);
+    assert_eq!(visible_count, 0);
+
+    library.update(cx, |lib, cx| {
+        lib.finish_focus_rescan(Ok(()), Instant::now(), cx);
+    });
+
+    let (importing, deferred, names) = library.read_with(cx, |lib, _| {
+        (
+            lib.importing,
+            lib.deferred_import_result.is_some(),
+            lib.active_state()
+                .results
+                .iter()
+                .map(|record| record.name.clone())
+                .collect::<Vec<_>>(),
+        )
+    });
+    assert!(!importing);
+    assert!(!deferred);
+    assert_eq!(names, vec!["dropped".to_string()]);
+    assert!(music_dir.join("dropped.flac").is_file());
+}
+
+#[gpui::test]
 fn toggling_a_value_filters_active_results(cx: &mut gpui::TestAppContext) {
     let settings_path = settings_path("filters");
     let (music_dir, sfx_dir) = settings_with_folders(&settings_path);

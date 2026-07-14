@@ -14,7 +14,7 @@ use crate::model::{AudioFormat, Category};
 
 use super::{ImportProgress, Library, database_path_for_settings, debug_downloader_interaction};
 
-struct ImportBatchResult {
+pub(super) struct ImportBatchResult {
     category: Category,
     imported: bool,
     moved_from: Option<Category>,
@@ -206,13 +206,36 @@ impl Library {
             );
             return;
         };
+        crate::diagnostics::debug("import", || {
+            format!(
+                "started category={} folder={} paths={paths:?}",
+                category.label(),
+                folder.display()
+            )
+        });
         let import_task = cx.background_spawn(async move {
             let mut imported = false;
             let mut moved_files = Vec::new();
             for path in paths {
-                if let Ok(destination) = import_to_folder(&folder, &path, |_| {}) {
-                    imported = true;
-                    moved_files.push((path, destination));
+                match import_to_folder(&folder, &path, |_| {}) {
+                    Ok(destination) => {
+                        crate::diagnostics::debug("import", || {
+                            format!(
+                                "moved source={} destination={}",
+                                path.display(),
+                                destination.display()
+                            )
+                        });
+                        imported = true;
+                        moved_files.push((path, destination));
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "lowcat import failed source={} destination_folder={} error={error}",
+                            path.display(),
+                            folder.display()
+                        );
+                    }
                 }
             }
             ImportBatchResult {
@@ -436,14 +459,32 @@ impl Library {
         cx.notify();
     }
 
-    fn finish_import(&mut self, result: ImportBatchResult, cx: &mut Context<Self>) {
+    pub(super) fn finish_import(&mut self, result: ImportBatchResult, cx: &mut Context<Self>) {
+        if self.focus_rescan_in_flight {
+            crate::diagnostics::debug("import", || {
+                format!(
+                    "deferring refresh until focus rescan finishes category={} imported={}",
+                    result.category.label(),
+                    result.imported
+                )
+            });
+            self.deferred_import_result = Some(result);
+            cx.notify();
+            return;
+        }
+
         self.importing = false;
         self.import_progress = None;
         let moved_from = result
             .moved_from
             .filter(|origin| *origin != result.category);
         if result.imported {
-            let _ = self.backend.refresh_category(result.category);
+            if let Err(error) = self.backend.refresh_category(result.category) {
+                eprintln!(
+                    "lowcat import refresh failed category={} error={error}",
+                    result.category.label()
+                );
+            }
             if let Some(origin) = moved_from {
                 for (source, destination) in &result.moved_files {
                     if let Err(error) = self.backend.copy_tags_between_categories(
@@ -461,6 +502,36 @@ impl Library {
                 }
             }
             self.refresh_category_state(result.category);
+            crate::diagnostics::debug("import", || {
+                let state = &self.states[&result.category];
+                let destinations = result
+                    .moved_files
+                    .iter()
+                    .map(|(_, destination)| destination)
+                    .collect::<Vec<_>>();
+                let indexed = state.all_records.iter().any(|record| {
+                    record
+                        .variants
+                        .iter()
+                        .any(|variant| destinations.iter().any(|path| *path == &variant.path))
+                });
+                let visible = state.results.iter().any(|record| {
+                    record
+                        .variants
+                        .iter()
+                        .any(|variant| destinations.iter().any(|path| *path == &variant.path))
+                });
+                format!(
+                    "refreshed category={} indexed={} visible={} all_records={} results={} search={:?} selected={:?}",
+                    result.category.label(),
+                    indexed,
+                    visible,
+                    state.all_records.len(),
+                    state.results.len(),
+                    state.search,
+                    state.selected
+                )
+            });
             self.maybe_start_waveform_cache(cx);
             if let Some(origin) = moved_from {
                 let _ = self.backend.refresh_category(origin);

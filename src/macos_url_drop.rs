@@ -5,7 +5,7 @@ use std::{
 };
 
 use cocoa::{
-    appkit::{NSPasteboardTypeString, NSStringPboardType, NSURLPboardType},
+    appkit::{NSFilenamesPboardType, NSPasteboardTypeString, NSStringPboardType, NSURLPboardType},
     base::{BOOL, NO, YES, id, nil},
     foundation::{NSArray, NSString, NSUInteger},
 };
@@ -13,18 +13,30 @@ use futures::channel::mpsc;
 use gpui::Window;
 use objc::{
     class, msg_send,
-    runtime::{Class, Imp, Object, Sel, class_addMethod},
+    runtime::{Class, Imp, Method, Object, Sel, method_setImplementation},
     sel, sel_impl,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 type NSDragOperation = NSUInteger;
 
-const NS_DRAG_OPERATION_NONE: NSDragOperation = 0;
 const NS_DRAG_OPERATION_COPY: NSDragOperation = 1;
 
 static INSTALL_METHODS: Once = Once::new();
+static ORIGINAL_DRAG_METHODS: OnceLock<OriginalDragMethods> = OnceLock::new();
 static URL_DROP_SENDER: OnceLock<Mutex<Option<mpsc::UnboundedSender<String>>>> = OnceLock::new();
+
+type DragOperationFn = extern "C" fn(&Object, Sel, id) -> NSDragOperation;
+type BoolDragFn = extern "C" fn(&Object, Sel, id) -> BOOL;
+type VoidDragFn = extern "C" fn(&Object, Sel, id);
+
+struct OriginalDragMethods {
+    entered: DragOperationFn,
+    updated: DragOperationFn,
+    exited: VoidDragFn,
+    perform: BoolDragFn,
+    conclude: VoidDragFn,
+}
 
 pub fn install(window: &mut Window) -> mpsc::UnboundedReceiver<String> {
     let (tx, rx) = mpsc::unbounded();
@@ -45,15 +57,20 @@ pub fn install(window: &mut Window) -> mpsc::UnboundedReceiver<String> {
         if view == nil {
             return rx;
         }
+        let native_window: id = msg_send![view, window];
+        if native_window == nil {
+            return rx;
+        }
 
-        let view_class = (&*view).class() as *const Class as *mut Class;
-        INSTALL_METHODS.call_once(|| install_view_drag_methods(view_class));
+        let window_class = (&*native_window).class();
+        INSTALL_METHODS.call_once(|| install_window_drag_methods(window_class));
         let public_url = NSString::alloc(nil).init_str("public.url");
         let public_text = NSString::alloc(nil).init_str("public.text");
         let public_utf8_text = NSString::alloc(nil).init_str("public.utf8-plain-text");
         let types = NSArray::arrayWithObjects(
             nil,
             &[
+                NSFilenamesPboardType,
                 public_url,
                 public_text,
                 public_utf8_text,
@@ -62,53 +79,72 @@ pub fn install(window: &mut Window) -> mpsc::UnboundedReceiver<String> {
                 NSStringPboardType,
             ],
         );
-        let _: () = msg_send![view, registerForDraggedTypes: types];
+        let _: () = msg_send![native_window, registerForDraggedTypes: types];
         let _: () = msg_send![public_url, release];
         let _: () = msg_send![public_text, release];
         let _: () = msg_send![public_utf8_text, release];
-        debug_url_drop(|| "registered url drag types".to_string());
+        debug_url_drop(|| {
+            format!(
+                "installed on window_class={} registered_types={}",
+                window_class.name(),
+                registered_drag_types(native_window)
+            )
+        });
     }
 
     rx
 }
 
-unsafe fn install_view_drag_methods(view_class: *mut Class) {
+unsafe fn install_window_drag_methods(window_class: &Class) {
     unsafe {
-        let dragging_return = c"Q@:@".as_ptr();
-        let void_return = c"v@:@".as_ptr();
-        let bool_return = c"c@:@".as_ptr();
-
-        let _ = class_addMethod(
-            view_class,
+        let entered = replace_method(
+            window_class,
             sel!(draggingEntered:),
             drag_operation_imp(dragging_entered),
-            dragging_return,
         );
-        let _ = class_addMethod(
-            view_class,
+        let updated = replace_method(
+            window_class,
             sel!(draggingUpdated:),
             drag_operation_imp(dragging_updated),
-            dragging_return,
         );
-        let _ = class_addMethod(
-            view_class,
+        let exited = replace_method(
+            window_class,
             sel!(draggingExited:),
             void_drag_imp(dragging_exited),
-            void_return,
         );
-        let _ = class_addMethod(
-            view_class,
+        let perform = replace_method(
+            window_class,
             sel!(performDragOperation:),
             bool_drag_imp(perform_drag_operation),
-            bool_return,
         );
-        let _ = class_addMethod(
-            view_class,
+        let conclude = replace_method(
+            window_class,
             sel!(concludeDragOperation:),
             void_drag_imp(conclude_drag_operation),
-            void_return,
         );
+        ORIGINAL_DRAG_METHODS
+            .set(OriginalDragMethods {
+                entered: mem::transmute::<Imp, DragOperationFn>(entered),
+                updated: mem::transmute::<Imp, DragOperationFn>(updated),
+                exited: mem::transmute::<Imp, VoidDragFn>(exited),
+                perform: mem::transmute::<Imp, BoolDragFn>(perform),
+                conclude: mem::transmute::<Imp, VoidDragFn>(conclude),
+            })
+            .unwrap_or_else(|_| panic!("native drag methods installed twice"));
     }
+}
+
+unsafe fn replace_method(window_class: &Class, selector: Sel, replacement: Imp) -> Imp {
+    let method = window_class
+        .instance_method(selector)
+        .expect("GPUI window must implement native drag destination methods");
+    unsafe { method_setImplementation(method as *const Method as *mut Method, replacement) }
+}
+
+fn original_drag_methods() -> &'static OriginalDragMethods {
+    ORIGINAL_DRAG_METHODS
+        .get()
+        .expect("native drag methods must be installed before dispatch")
 }
 
 fn drag_operation_imp(function: extern "C" fn(&Object, Sel, id) -> NSDragOperation) -> Imp {
@@ -123,35 +159,45 @@ fn void_drag_imp(function: extern "C" fn(&Object, Sel, id)) -> Imp {
     unsafe { mem::transmute(function) }
 }
 
-extern "C" fn dragging_entered(_: &Object, _: Sel, dragging_info: id) -> NSDragOperation {
+extern "C" fn dragging_entered(this: &Object, _: Sel, dragging_info: id) -> NSDragOperation {
     if dropped_youtube_url(dragging_info).is_some() {
         debug_url_drop(|| "entered youtube url drag".to_string());
         NS_DRAG_OPERATION_COPY
     } else {
         debug_url_drop(|| {
             format!(
-                "ignored non-youtube url drag {}",
+                "forwarded non-url drag {}",
                 pasteboard_debug_summary(dragging_info)
             )
         });
-        NS_DRAG_OPERATION_NONE
+        let operation =
+            (original_drag_methods().entered)(this, sel!(draggingEntered:), dragging_info);
+        debug_url_drop(|| format!("GPUI file drag entered operation={operation}"));
+        operation
     }
 }
 
-extern "C" fn dragging_updated(_: &Object, _: Sel, dragging_info: id) -> NSDragOperation {
+extern "C" fn dragging_updated(this: &Object, _: Sel, dragging_info: id) -> NSDragOperation {
     if dropped_youtube_url(dragging_info).is_some() {
         NS_DRAG_OPERATION_COPY
     } else {
-        NS_DRAG_OPERATION_NONE
+        (original_drag_methods().updated)(this, sel!(draggingUpdated:), dragging_info)
     }
 }
 
-extern "C" fn dragging_exited(_: &Object, _: Sel, _: id) {}
+extern "C" fn dragging_exited(this: &Object, _: Sel, dragging_info: id) {
+    if dropped_youtube_url(dragging_info).is_none() {
+        (original_drag_methods().exited)(this, sel!(draggingExited:), dragging_info);
+    }
+}
 
-extern "C" fn perform_drag_operation(_: &Object, _: Sel, dragging_info: id) -> BOOL {
+extern "C" fn perform_drag_operation(this: &Object, _: Sel, dragging_info: id) -> BOOL {
     let Some(url) = dropped_youtube_url(dragging_info) else {
-        debug_url_drop(|| "drop rejected without youtube url".to_string());
-        return NO;
+        debug_url_drop(|| "forwarded non-url drop".to_string());
+        let accepted =
+            (original_drag_methods().perform)(this, sel!(performDragOperation:), dragging_info);
+        debug_url_drop(|| format!("GPUI file drop accepted={accepted:?}"));
+        return accepted;
     };
     if let Some(sender) = URL_DROP_SENDER.get()
         && let Ok(sender) = sender.lock()
@@ -165,7 +211,11 @@ extern "C" fn perform_drag_operation(_: &Object, _: Sel, dragging_info: id) -> B
     NO
 }
 
-extern "C" fn conclude_drag_operation(_: &Object, _: Sel, _: id) {}
+extern "C" fn conclude_drag_operation(this: &Object, _: Sel, dragging_info: id) {
+    if dropped_youtube_url(dragging_info).is_none() {
+        (original_drag_methods().conclude)(this, sel!(concludeDragOperation:), dragging_info);
+    }
+}
 
 fn dropped_youtube_url(dragging_info: id) -> Option<String> {
     let candidates = unsafe {
@@ -289,6 +339,13 @@ fn pasteboard_debug_summary(dragging_info: id) -> String {
             .collect::<Vec<_>>()
             .join(" | ");
         format!("types={type_names} candidates={candidates}")
+    }
+}
+
+fn registered_drag_types(native_window: id) -> String {
+    unsafe {
+        let types: id = msg_send![native_window, registeredDraggedTypes];
+        ns_array_strings(types).join(",")
     }
 }
 

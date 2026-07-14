@@ -46,6 +46,7 @@ pub struct Library {
     import_progress: Option<ImportProgress>,
     last_focus_rescan: Option<Instant>,
     focus_rescan_in_flight: bool,
+    deferred_import_result: Option<transfers::ImportBatchResult>,
     waveform_cache_in_flight: bool,
     waveform_cache_skipped_paths: BTreeSet<PathBuf>,
     waveform_priority_cache_in_flight: BTreeSet<PathBuf>,
@@ -139,6 +140,7 @@ impl Library {
             import_progress: None,
             last_focus_rescan: None,
             focus_rescan_in_flight: false,
+            deferred_import_result: None,
             waveform_cache_in_flight: false,
             waveform_cache_skipped_paths: BTreeSet::new(),
             waveform_priority_cache_in_flight: BTreeSet::new(),
@@ -1189,6 +1191,12 @@ impl Library {
                     started_at.elapsed().as_millis()
                 );
             }
+        }
+        if let Some(result) = self.deferred_import_result.take() {
+            crate::diagnostics::debug("import", || {
+                "focus rescan finished; applying deferred import refresh".to_string()
+            });
+            self.finish_import(result, cx);
         }
         cx.notify();
     }
